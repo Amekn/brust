@@ -1,0 +1,11 @@
+[package]
+name = "brust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fasta = { path = "../fasta"}
+sam = { path = "../sam"}
+bam = { path = "../bam"}
+fastq = { path = "../fastq"}
+pod5 = { path = "../pod5"}
