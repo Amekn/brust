@@ -1,1 +1,0 @@
-/home/kang/project_biorust/brust/target/debug/brust: /home/kang/project_biorust/brust/bam/src/lib.rs /home/kang/project_biorust/brust/brust/src/main.rs /home/kang/project_biorust/brust/fasta/src/lib.rs /home/kang/project_biorust/brust/fastq/src/lib.rs /home/kang/project_biorust/brust/pod5/src/lib.rs /home/kang/project_biorust/brust/sam/src/lib.rs
