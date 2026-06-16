@@ -110,5 +110,9 @@ identify it.
 
 ## License
 
-Source-available for viewing only. See [LICENSE](LICENSE). The project may be
-released under a different license in the future.
+Licensed under either of:
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.

@@ -7,6 +7,6 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Kang Zhou"]
 repository = "https://github.com/Amekn/project_biorust"
-license-file = "../LICENSE"
+license = "MIT OR Apache-2.0"
 keywords = ["bioinformatics", "fasta", "fastq", "sam", "bam"]
 categories = ["science", "parser-implementations"]
