@@ -8,5 +8,5 @@ edition = "2024"
 authors = ["Kang Zhou"]
 repository = "https://github.com/Amekn/brust"
 license = "MIT OR Apache-2.0"
-keywords = ["bioinformatics", "fasta", "fastq", "sam", "bam"]
-categories = ["science", "parser-implementations"]
+keywords = ["bioinformatics", "fasta", "fastq", "sam", "bam", "pod5"]
+categories = ["bioinformatics"]

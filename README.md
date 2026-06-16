@@ -1,6 +1,6 @@
-# Brust
+# brust
 
-Brust is a Rust bioinformatics toolkit for reading, writing, validating, and
+brust is a Rust bioinformatics toolkit for reading, writing, validating, and
 converting common sequencing formats. The public crate is `brust`, which
 re-exports the format crates under one namespace:
 
@@ -114,5 +114,3 @@ Licensed under either of:
 
 - [Apache License, Version 2.0](LICENSE-APACHE)
 - [MIT License](LICENSE-MIT)
-
-at your option.
