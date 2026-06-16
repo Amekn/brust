@@ -1,11 +1,18 @@
 [package]
 name = "brust"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+description = "Public facade for Brust bioinformatics format readers, writers, and conversion helpers."
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-fasta = { path = "../fasta"}
-sam = { path = "../sam"}
-bam = { path = "../bam"}
-fastq = { path = "../fastq"}
-pod5 = { path = "../pod5"}
+brust-core = { path = "../brust-core" }
+fasta = { path = "../fasta" }
+sam = { path = "../sam" }
+bam = { path = "../bam" }
+fastq = { path = "../fastq" }
+pod5 = { path = "../pod5" }

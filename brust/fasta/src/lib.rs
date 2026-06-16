@@ -13,6 +13,7 @@
 //! rejects records whose IDs, descriptions, or sequences cannot be represented
 //! as valid FASTA lines.
 
+use brust_core::{Error, Format};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -86,17 +87,40 @@ impl<R: Read> FastaReader<R> {
 
                     self.line_number += 1;
 
+                    if line.trim_end().is_empty() {
+                        continue;
+                    }
+
                     if line.starts_with('>') {
                         break line;
                     }
+
+                    return Err(invalid_data_at_line(
+                        self.line_number,
+                        "FASTA data before first header line",
+                    ));
                 }
             }
         };
 
+        let header_line_number = self.line_number;
         let header = header_line.strip_prefix('>').unwrap().trim();
+        if header.is_empty() {
+            return Err(invalid_data_at_line(
+                header_line_number,
+                "FASTA record ID must be non-empty",
+            ));
+        }
+
         let mut parts = header.splitn(2, char::is_whitespace);
 
         let id = parts.next().unwrap_or("").to_string();
+        if id.is_empty() {
+            return Err(invalid_data_at_line(
+                header_line_number,
+                "FASTA record ID must be non-empty",
+            ));
+        }
         let description = parts
             .next()
             .map(str::trim)
@@ -121,7 +145,10 @@ impl<R: Read> FastaReader<R> {
                 break;
             }
 
-            sequence.push_str(line.trim_end());
+            let sequence_line = line.trim_end();
+            if !sequence_line.is_empty() {
+                sequence.push_str(sequence_line);
+            }
         }
 
         Ok(Some(FastaRecord::new(id, description, sequence)))
@@ -346,8 +373,14 @@ fn validate_fasta_record(record: &FastaRecord) -> io::Result<()> {
     Ok(())
 }
 
-fn invalid_data(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    Error::invalid(Format::Fasta, message).into()
+}
+
+fn invalid_data_at_line(line: usize, message: impl Into<String>) -> io::Error {
+    Error::invalid(Format::Fasta, message)
+        .with_line(line)
+        .into()
 }
 
 #[cfg(test)]
@@ -469,5 +502,28 @@ mod fasta_tests {
         let mut writer = FastaWriter::from_writer(&mut output);
 
         assert!(writer.write_record(&record).is_err());
+    }
+
+    #[test]
+    fn reader_rejects_empty_ids_with_line_number() {
+        let err = Fasta::from_reader(&b">\nACGT\n"[..]).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            "invalid FASTA at line 1: FASTA record ID must be non-empty"
+        );
+    }
+
+    #[test]
+    fn reader_skips_blank_lines_but_rejects_leading_junk() {
+        let fasta = Fasta::from_reader(&b"\n>seq1\nAC\n\nGT\n"[..]).unwrap();
+        assert_eq!(fasta.records[0].sequence, "ACGT");
+
+        let err = Fasta::from_reader(&b"junk\n>seq1\nACGT\n"[..]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid FASTA at line 1: FASTA data before first header line"
+        );
     }
 }

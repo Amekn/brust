@@ -1,11 +1,18 @@
 [package]
 name = "pod5"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+description = "POD5 reader, writer, signal extraction, and metadata summaries for Brust."
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 arrow-array = "58.3.0"
 arrow-ipc = "58.3.0"
 arrow-schema = "58.3.0"
+brust-core = { path = "../brust-core" }
 flatbuffers = "25.12.19"
 zstd = { version = "0.13", default-features = false }

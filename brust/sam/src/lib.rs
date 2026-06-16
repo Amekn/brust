@@ -14,6 +14,7 @@
 //! reparses them before emitting text, so the same validation is applied on
 //! output.
 
+use brust_core::{Error, Format};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -210,9 +211,59 @@ impl SamRecord {
         self.flag & flags::UNMAPPED != 0
     }
 
+    /// Returns `true` when the multi-segment template flag (`0x1`) is set.
+    pub fn has_multiple_segments(&self) -> bool {
+        self.flag & flags::MULTIPLE_SEGMENTS != 0
+    }
+
+    /// Returns `true` when the properly-aligned flag (`0x2`) is set.
+    pub fn is_properly_aligned(&self) -> bool {
+        self.flag & flags::PROPERLY_ALIGNED != 0
+    }
+
+    /// Returns `true` when the mate/next-segment-unmapped flag (`0x8`) is set.
+    pub fn is_next_unmapped(&self) -> bool {
+        self.flag & flags::NEXT_UNMAPPED != 0
+    }
+
     /// Returns `true` when the reverse-complemented flag (`0x10`) is set.
     pub fn is_reverse_complemented(&self) -> bool {
         self.flag & flags::REVERSE_COMPLEMENTED != 0
+    }
+
+    /// Returns `true` when the mate/next-segment reverse-complemented flag (`0x20`) is set.
+    pub fn is_next_reverse_complemented(&self) -> bool {
+        self.flag & flags::NEXT_REVERSE_COMPLEMENTED != 0
+    }
+
+    /// Returns `true` when this is the first segment in a template (`0x40`).
+    pub fn is_first_segment(&self) -> bool {
+        self.flag & flags::FIRST_SEGMENT != 0
+    }
+
+    /// Returns `true` when this is the last segment in a template (`0x80`).
+    pub fn is_last_segment(&self) -> bool {
+        self.flag & flags::LAST_SEGMENT != 0
+    }
+
+    /// Returns `true` when this is a secondary alignment (`0x100`).
+    pub fn is_secondary(&self) -> bool {
+        self.flag & flags::SECONDARY != 0
+    }
+
+    /// Returns `true` when this segment fails platform/vendor checks (`0x200`).
+    pub fn is_filtered(&self) -> bool {
+        self.flag & flags::FILTERED != 0
+    }
+
+    /// Returns `true` when this segment is marked duplicate (`0x400`).
+    pub fn is_duplicate(&self) -> bool {
+        self.flag & flags::DUPLICATE != 0
+    }
+
+    /// Returns `true` when this is a supplementary alignment (`0x800`).
+    pub fn is_supplementary(&self) -> bool {
+        self.flag & flags::SUPPLEMENTARY != 0
     }
 
     /// Returns the optional field matching `tag`, if present.
@@ -253,6 +304,13 @@ impl SamRecord {
             .filter(|op| matches!(op.op, 'M' | 'D' | 'N' | '=' | 'X'))
             .map(|op| u64::from(op.len))
             .sum())
+    }
+
+    /// Formats this record as one SAM alignment line without a trailing newline.
+    pub fn to_sam_line(&self) -> io::Result<String> {
+        let line = format_sam_record(self)?;
+        Self::parse(&line)?;
+        Ok(line)
     }
 }
 
@@ -335,7 +393,10 @@ impl<R: Read> SamReader<R> {
             line_number += 1;
 
             if line.starts_with('@') {
-                records.push(SamHeaderRecord::parse(line.trim_end_matches(['\r', '\n']))?);
+                records.push(
+                    SamHeaderRecord::parse(line.trim_end_matches(['\r', '\n']))
+                        .map_err(|error| context_line(error, line_number))?,
+                );
             } else {
                 pending_record = Some(line.clone());
                 break;
@@ -375,10 +436,15 @@ impl<R: Read> SamReader<R> {
         };
 
         if line.starts_with('@') {
-            return Err(invalid_data("header record found after alignment section"));
+            return Err(invalid_data_at_line(
+                self.line_number,
+                "header record found after alignment section",
+            ));
         }
 
-        SamRecord::parse(line.trim_end_matches(['\r', '\n'])).map(Some)
+        SamRecord::parse(line.trim_end_matches(['\r', '\n']))
+            .map_err(|error| context_line(error, self.line_number))
+            .map(Some)
     }
 
     /// Reads the next SAM alignment record.
@@ -1233,8 +1299,25 @@ fn is_printable_or_space_ascii(value: &str) -> bool {
     value.bytes().all(|byte| (32..=126).contains(&byte))
 }
 
-fn invalid_data(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    Error::invalid(Format::Sam, message).into()
+}
+
+fn invalid_data_at_line(line: usize, message: impl Into<String>) -> io::Error {
+    Error::invalid(Format::Sam, message).with_line(line).into()
+}
+
+fn context_line(error: io::Error, line: usize) -> io::Error {
+    if let Some(error) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<Error>())
+    {
+        return error.clone().with_line(line).into();
+    }
+
+    Error::invalid(Format::Sam, error.to_string())
+        .with_line(line)
+        .into()
 }
 
 #[cfg(test)]
@@ -1349,6 +1432,10 @@ mod sam_tests {
             sam.records[0].aux("NM"),
             Some(&SamOptionalValue::Integer(1))
         );
+        assert_eq!(
+            sam.records[0].to_sam_line().unwrap(),
+            String::from_utf8_lossy(input.split(|byte| *byte == b'\n').nth(2).unwrap()).to_string()
+        );
     }
 
     #[test]
@@ -1448,5 +1535,57 @@ mod sam_tests {
             Sam::from_reader(&b"@SQ\tSN:ref\tLN:0\nr1\t0\tref\t1\t60\t1M\t*\t0\t0\tA\tI\n"[..])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn malformed_alignment_errors_include_line_numbers() {
+        let err = Sam::from_reader(
+            &b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:10\nr1\t0\tref\t1\t60\t1M\t*\t0\t0\tA\n"[..],
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid SAM at line 3: SAM alignment line has fewer than 11 fields"
+        );
+    }
+
+    #[test]
+    fn flag_helpers_cover_sam_bits() {
+        let record = SamRecord::new(
+            "r001".to_string(),
+            flags::MULTIPLE_SEGMENTS
+                | flags::PROPERLY_ALIGNED
+                | flags::NEXT_UNMAPPED
+                | flags::NEXT_REVERSE_COMPLEMENTED
+                | flags::FIRST_SEGMENT
+                | flags::SECONDARY
+                | flags::FILTERED
+                | flags::DUPLICATE
+                | flags::SUPPLEMENTARY,
+            "*".to_string(),
+            0,
+            0,
+            "*".to_string(),
+            "*".to_string(),
+            0,
+            0,
+            "*".to_string(),
+            "*".to_string(),
+            Vec::new(),
+        );
+
+        assert!(record.has_multiple_segments());
+        assert!(record.is_properly_aligned());
+        assert!(!record.is_unmapped());
+        assert!(record.is_next_unmapped());
+        assert!(!record.is_reverse_complemented());
+        assert!(record.is_next_reverse_complemented());
+        assert!(record.is_first_segment());
+        assert!(!record.is_last_segment());
+        assert!(record.is_secondary());
+        assert!(record.is_filtered());
+        assert!(record.is_duplicate());
+        assert!(record.is_supplementary());
     }
 }

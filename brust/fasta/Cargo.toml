@@ -1,6 +1,13 @@
 [package]
 name = "fasta"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+description = "FASTA reader and writer primitives for Brust."
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
+brust-core = { path = "../brust-core" }

@@ -5,6 +5,7 @@
 //! `brust::fasta::FastaReader` or `brust::pod5::Pod5Reader`.
 
 pub use bam;
+pub use brust_core::{Diagnostic, Error, Format, Result};
 pub use fasta;
 pub use fastq;
 pub use pod5;

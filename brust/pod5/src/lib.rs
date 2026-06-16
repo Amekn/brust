@@ -30,6 +30,7 @@ use arrow_ipc::reader::FileReader;
 use arrow_ipc::writer::FileWriter;
 use arrow_ipc::{MessageHeader, root_as_footer, root_as_message};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use brust_core::{Error, Format};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -149,6 +150,63 @@ pub struct Pod5Reader<R: Read + Seek = File> {
 /// defaults.
 pub struct Pod5Writer<W: Write = File> {
     writer: W,
+}
+
+/// High-level counts and rollups for a POD5 payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pod5Summary {
+    /// Number of Reads table rows.
+    pub read_count: usize,
+    /// Number of Signal table rows.
+    pub signal_count: usize,
+    /// Number of Run Info rows.
+    pub run_info_count: usize,
+    /// Sum of `num_samples` across all reads.
+    pub total_samples: u64,
+    /// Per-channel read and sample counts.
+    pub channels: Vec<Pod5ChannelSummary>,
+    /// Per-run read and sample counts.
+    pub run_infos: Vec<Pod5RunInfoSummary>,
+}
+
+/// Per-channel POD5 summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pod5ChannelSummary {
+    /// One-indexed channel.
+    pub channel: u16,
+    /// Number of reads observed on this channel.
+    pub read_count: usize,
+    /// Sum of `num_samples` for reads on this channel.
+    pub sample_count: u64,
+}
+
+/// Per-run POD5 summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pod5RunInfoSummary {
+    /// Acquisition/run identifier.
+    pub acquisition_id: String,
+    /// User-supplied sample identifier.
+    pub sample_id: String,
+    /// User-supplied experiment name.
+    pub experiment_name: String,
+    /// Flow-cell identifier.
+    pub flow_cell_id: String,
+    /// Sequencing kit name.
+    pub sequencing_kit: String,
+    /// Samples per second.
+    pub sample_rate: u16,
+    /// MinKNOW/software string from the row.
+    pub software: String,
+    /// Number of reads referencing this run info row.
+    pub read_count: usize,
+    /// Sum of `num_samples` for reads referencing this run info row.
+    pub sample_count: u64,
+}
+
+/// Lazily decompresses and caches signal rows for a materialized [`Pod5`].
+pub struct Pod5SignalCache<'a> {
+    signals: &'a [Pod5Signal],
+    decoded_cache: RefCell<HashMap<u64, Vec<i16>>>,
 }
 
 /// POD5 wrapper and table metadata.
@@ -337,11 +395,97 @@ impl Pod5 {
 
     /// Finds a read by ID and returns its decompressed signal, if present.
     pub fn signal_by_read_id(&self, read_id: &str) -> io::Result<Option<Vec<i16>>> {
-        self.records
-            .iter()
-            .find(|record| record.read_id == read_id)
+        self.read_by_id(read_id)
             .map(|record| self.signal_for_record(record))
             .transpose()
+    }
+
+    /// Returns a read by ID, if present.
+    pub fn read_by_id(&self, read_id: &str) -> Option<&Pod5Record> {
+        self.records.iter().find(|record| record.read_id == read_id)
+    }
+
+    /// Builds a lookup map from read ID to read record.
+    pub fn read_lookup(&self) -> HashMap<&str, &Pod5Record> {
+        self.records
+            .iter()
+            .map(|record| (record.read_id.as_str(), record))
+            .collect()
+    }
+
+    /// Creates a reusable lazy signal decompression cache over this payload's
+    /// Signal table rows.
+    pub fn signal_cache(&self) -> Pod5SignalCache<'_> {
+        Pod5SignalCache::new(&self.signals)
+    }
+
+    /// Returns the sum of `num_samples` across all reads.
+    pub fn total_samples(&self) -> u64 {
+        self.records.iter().map(|record| record.num_samples).sum()
+    }
+
+    /// Returns per-channel read and sample summaries sorted by channel.
+    pub fn channel_summaries(&self) -> Vec<Pod5ChannelSummary> {
+        let mut counts = HashMap::<u16, (usize, u64)>::new();
+        for record in &self.records {
+            let entry = counts.entry(record.channel).or_default();
+            entry.0 += 1;
+            entry.1 += record.num_samples;
+        }
+
+        let mut summaries = counts
+            .into_iter()
+            .map(|(channel, (read_count, sample_count))| Pod5ChannelSummary {
+                channel,
+                read_count,
+                sample_count,
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by_key(|summary| summary.channel);
+        summaries
+    }
+
+    /// Returns per-run read and sample summaries in Run Info table order.
+    pub fn run_info_summaries(&self) -> Vec<Pod5RunInfoSummary> {
+        let mut counts = HashMap::<&str, (usize, u64)>::new();
+        for record in &self.records {
+            let entry = counts.entry(record.run_info.as_str()).or_default();
+            entry.0 += 1;
+            entry.1 += record.num_samples;
+        }
+
+        self.run_infos
+            .iter()
+            .map(|run_info| {
+                let (read_count, sample_count) = counts
+                    .get(run_info.acquisition_id.as_str())
+                    .copied()
+                    .unwrap_or_default();
+                Pod5RunInfoSummary {
+                    acquisition_id: run_info.acquisition_id.clone(),
+                    sample_id: run_info.sample_id.clone(),
+                    experiment_name: run_info.experiment_name.clone(),
+                    flow_cell_id: run_info.flow_cell_id.clone(),
+                    sequencing_kit: run_info.sequencing_kit.clone(),
+                    sample_rate: run_info.sample_rate,
+                    software: run_info.software.clone(),
+                    read_count,
+                    sample_count,
+                }
+            })
+            .collect()
+    }
+
+    /// Returns a high-level summary of reads, signals, runs, channels, and sample counts.
+    pub fn summary(&self) -> Pod5Summary {
+        Pod5Summary {
+            read_count: self.records.len(),
+            signal_count: self.signals.len(),
+            run_info_count: self.run_infos.len(),
+            total_samples: self.total_samples(),
+            channels: self.channel_summaries(),
+            run_infos: self.run_info_summaries(),
+        }
     }
 }
 
@@ -560,19 +704,24 @@ impl Pod5Record {
     /// `signal_rows` are interpreted as indices into the supplied `signals`
     /// slice.
     pub fn signal(&self, signals: &[Pod5Signal]) -> io::Result<Vec<i16>> {
-        let total = self
-            .signal_rows
-            .iter()
-            .filter_map(|&index| signals.get(index as usize))
-            .map(|signal| signal.samples as usize)
-            .sum();
+        let total = usize::try_from(self.num_samples)
+            .map_err(|_| invalid_data("POD5 read sample count exceeds usize"))?;
         let mut samples = Vec::with_capacity(total);
 
         for &index in &self.signal_rows {
             let signal = signals
                 .get(index as usize)
                 .ok_or_else(|| invalid_data("POD5 signal row index is out of bounds"))?;
+            if signal.read_id != self.read_id {
+                return Err(invalid_data("POD5 signal row read_id does not match read"));
+            }
             samples.extend(signal.decompress()?);
+        }
+
+        if samples.len() != total {
+            return Err(invalid_data(
+                "POD5 read num_samples does not match referenced signal rows",
+            ));
         }
 
         Ok(samples)
@@ -606,6 +755,63 @@ impl Pod5Signal {
     /// Existing VBZ payloads are decompressed before recompression.
     pub fn compress(&self) -> io::Result<Vec<u8>> {
         compress_vbz_signal(&self.decompress()?)
+    }
+}
+
+impl<'a> Pod5SignalCache<'a> {
+    /// Creates a cache over Signal table rows.
+    pub fn new(signals: &'a [Pod5Signal]) -> Self {
+        Self {
+            signals,
+            decoded_cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Decompresses one Signal row by zero-based row index, reusing cached
+    /// samples on subsequent calls.
+    pub fn signal_row(&self, row: u64) -> io::Result<Vec<i16>> {
+        if let Some(samples) = self.decoded_cache.borrow().get(&row) {
+            return Ok(samples.clone());
+        }
+
+        let signal = self
+            .signals
+            .get(row as usize)
+            .ok_or_else(|| invalid_data("POD5 signal row index is out of bounds"))?;
+        let samples = signal.decompress()?;
+        self.decoded_cache.borrow_mut().insert(row, samples.clone());
+        Ok(samples)
+    }
+
+    /// Decompresses and concatenates signal rows referenced by a read record.
+    pub fn signal_for_record(&self, record: &Pod5Record) -> io::Result<Vec<i16>> {
+        let total = usize::try_from(record.num_samples)
+            .map_err(|_| invalid_data("POD5 read sample count exceeds usize"))?;
+        let mut samples = Vec::with_capacity(total);
+
+        for &row in &record.signal_rows {
+            let signal = self
+                .signals
+                .get(row as usize)
+                .ok_or_else(|| invalid_data("POD5 signal row index is out of bounds"))?;
+            if signal.read_id != record.read_id {
+                return Err(invalid_data("POD5 signal row read_id does not match read"));
+            }
+            samples.extend(self.signal_row(row)?);
+        }
+
+        if samples.len() != total {
+            return Err(invalid_data(
+                "POD5 read num_samples does not match referenced signal rows",
+            ));
+        }
+
+        Ok(samples)
+    }
+
+    /// Returns the number of signal rows currently cached.
+    pub fn cached_row_count(&self) -> usize {
+        self.decoded_cache.borrow().len()
     }
 }
 
@@ -2124,6 +2330,10 @@ fn update_metadata(
     arrow_metadata: &std::collections::HashMap<String, String>,
     metadata: &mut Pod5Metadata,
 ) -> io::Result<()> {
+    if let Some(version) = arrow_metadata.get("MINKNOW:pod5_version") {
+        validate_pod5_version(version)?;
+    }
+
     merge_metadata(
         &mut metadata.file_identifier,
         arrow_metadata.get("MINKNOW:file_identifier"),
@@ -2139,6 +2349,21 @@ fn update_metadata(
         arrow_metadata.get("MINKNOW:pod5_version"),
         "MINKNOW:pod5_version",
     )?;
+
+    Ok(())
+}
+
+fn validate_pod5_version(version: &str) -> io::Result<()> {
+    let parts = version.split('.').collect::<Vec<_>>();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(invalid_data(format!(
+            "MINKNOW:pod5_version must be semantic major.minor.patch, got {version}"
+        )));
+    }
 
     Ok(())
 }
@@ -2455,8 +2680,8 @@ fn arrow_error(error: ArrowError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
-fn invalid_data(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    Error::invalid(Format::Pod5, message).into()
 }
 
 #[cfg(test)]
