@@ -1,14 +1,17 @@
-//! Minimal FASTA parsing primitives.
+//! FASTA reader and writer primitives.
 //!
-//! The crate exposes two ownership models:
+//! The crate exposes both streaming and materialized APIs:
 //!
-//! - [`FastaReader`] is a streaming parser over a FASTA byte stream. It owns
-//!   reader state and returns one [`FastaRecord`] at a time.
-//! - [`Fasta`] is a fully materialized FASTA payload containing all records. It
-//!   is [`Clone`] for deep-copy workflows.
+//! - [`FastaReader`] reads one [`FastaRecord`] at a time from any [`Read`]
+//!   source.
+//! - [`Fasta`] owns every parsed record and can be cloned or written back out.
 //!
-//! FASTA headers are split at the first whitespace character: the first token is
-//! the record ID, and the remaining text is stored as the optional description.
+//! Header lines are split at the first whitespace character. The first token
+//! after `>` becomes the record ID; the remaining header text becomes the
+//! optional description. Sequence lines are concatenated with line endings
+//! removed. The parser does not validate sequence alphabets; the writer only
+//! rejects records whose IDs, descriptions, or sequences cannot be represented
+//! as valid FASTA lines.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -16,22 +19,22 @@ use std::path::Path;
 
 /// Streaming FASTA parser over any readable byte stream.
 ///
-/// `FastaReader` owns the buffered reader and parser cursor, so it is not
-/// cloneable. Use [`FastaReader::read_all`] or [`Fasta::from_path`] when a
-/// deep-copyable, materialized representation is needed.
+/// `FastaReader` keeps the underlying reader and parser cursor in one place, so
+/// it is intentionally not cloneable. Use [`FastaReader::read_all`] or
+/// [`Fasta::from_path`] when a cloneable, in-memory representation is needed.
 pub struct FastaReader<R: Read = File> {
     reader: BufReader<R>,
-    // Header line already read while finishing the previous record.
+    // Header line consumed while finishing the previous record.
     pending_header: Option<String>,
-    // One-based line counter maintained for diagnostics.
+    // Number of lines consumed from the underlying reader.
     line_number: usize,
 }
 
 /// Streaming FASTA writer over any writable byte stream.
 ///
-/// `FastaWriter` writes one [`FastaRecord`] at a time. The default output uses
-/// one sequence line per record; call [`FastaWriter::set_line_width`] to wrap
-/// sequence lines at a fixed width.
+/// `FastaWriter` emits one [`FastaRecord`] at a time. By default it writes each
+/// sequence as a single line; call [`FastaWriter::set_line_width`] to wrap
+/// sequence output at a fixed width.
 pub struct FastaWriter<W: Write = File> {
     writer: W,
     line_width: Option<usize>,
@@ -62,11 +65,12 @@ impl<R: Read> FastaReader<R> {
         })
     }
 
-    /// Reads the next FASTA record.
+    /// Reads the next FASTA record from the stream.
     ///
-    /// Returns `Ok(None)` only when the stream is at EOF before another header
-    /// line begins. Sequence lines are concatenated and trailing line endings
-    /// are removed.
+    /// Lines before the next header are skipped. Returns `Ok(None)` when EOF is
+    /// reached before another header line begins. Sequence lines are
+    /// concatenated until the following header or EOF, with record line endings
+    /// removed.
     pub fn read_record(&mut self) -> io::Result<Option<FastaRecord>> {
         let header_line = match self.pending_header.take() {
             Some(header) => header,
@@ -106,7 +110,6 @@ impl<R: Read> FastaReader<R> {
             line.clear();
             let bytes = self.reader.read_line(&mut line)?;
 
-            // EOF reached
             if bytes == 0 {
                 break;
             }
@@ -136,7 +139,7 @@ impl<R: Read> FastaReader<R> {
         FastaRecords { reader: self }
     }
 
-    /// Consumes this reader and materializes the entire Fasta stream.
+    /// Consumes this reader and materializes the entire FASTA stream.
     pub fn read_all(mut self) -> io::Result<Fasta> {
         let mut records = Vec::new();
         while let Some(record) = self.read_record()? {
@@ -171,7 +174,7 @@ impl<W: Write> FastaWriter<W> {
         }
     }
 
-    /// Sets sequence line wrapping width.
+    /// Sets the sequence line wrapping width for future records.
     ///
     /// A width of `0` disables wrapping and writes each sequence on one line.
     pub fn set_line_width(&mut self, width: usize) {
@@ -179,6 +182,9 @@ impl<W: Write> FastaWriter<W> {
     }
 
     /// Writes one FASTA record.
+    ///
+    /// The record ID must be non-empty and contain no whitespace. IDs,
+    /// descriptions, and sequences must not contain line endings.
     pub fn write_record(&mut self, record: &FastaRecord) -> io::Result<()> {
         validate_fasta_record(record)?;
 
@@ -213,7 +219,9 @@ impl<W: Write> FastaWriter<W> {
         self.write_record(record)
     }
 
-    /// Writes all records from a materialized FASTA value.
+    /// Writes all records from a materialized FASTA file.
+    ///
+    /// Each record is validated by [`FastaWriter::write_record`].
     pub fn write_all(&mut self, fasta: &Fasta) -> io::Result<()> {
         for record in &fasta.records {
             self.write_record(record)?;
@@ -232,7 +240,7 @@ impl<W: Write> FastaWriter<W> {
     }
 }
 
-/// A fully materialized FASTA file.
+/// A fully materialized FASTA payload.
 ///
 /// `Fasta` owns all records from the stream, so cloning this type performs a
 /// deep copy of the parsed FASTA data.
@@ -271,8 +279,8 @@ impl Fasta {
 /// A FASTA sequence record.
 ///
 /// The ID is the first token after `>`, the description is the remaining header
-/// text after the first whitespace, and the sequence is stored without line
-/// endings.
+/// text after the first whitespace, and the sequence is stored as concatenated
+/// sequence lines without line endings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FastaRecord {
     /// Record identifier from the FASTA header.
