@@ -1,6 +1,13 @@
 [package]
 name = "sam"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+description = "SAM reader, writer, parser validation, and flag helpers for Brust."
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
+brust-core = { path = "../brust-core" }

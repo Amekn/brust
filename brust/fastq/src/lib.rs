@@ -13,6 +13,8 @@
 //! sequence length. The writer emits a canonical four-line record with a bare
 //! `+` separator and validates that sequence and quality lengths match.
 
+use brust_core::{Error, Format};
+use fasta::{Fasta, FastaRecord};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -69,19 +71,41 @@ impl<R: Read> FastqReader<R> {
     /// parsed sequence length.
     pub fn read_record(&mut self) -> io::Result<Option<FastqRecord>> {
         let mut line = String::new();
-        let byte = self.reader.read_line(&mut line)?;
-        if byte == 0 {
-            return Ok(None);
+        loop {
+            line.clear();
+            let byte = self.reader.read_line(&mut line)?;
+            if byte == 0 {
+                return Ok(None);
+            }
+            self.line_number += 1;
+            if line.trim_end().is_empty() {
+                continue;
+            }
+            break;
         }
-        self.line_number += 1;
 
+        let header_line_number = self.line_number;
         let header = line
             .strip_prefix('@')
-            .ok_or_else(|| invalid_data("FASTQ header line must start with @"))?
+            .ok_or_else(|| {
+                invalid_data_at_line(header_line_number, "FASTQ header line must start with @")
+            })?
             .trim();
+        if header.is_empty() {
+            return Err(invalid_data_at_line(
+                header_line_number,
+                "FASTQ record ID must be non-empty",
+            ));
+        }
         let mut parts = header.splitn(2, char::is_whitespace);
 
         let id = parts.next().unwrap_or("").to_string();
+        if id.is_empty() {
+            return Err(invalid_data_at_line(
+                header_line_number,
+                "FASTQ record ID must be non-empty",
+            ));
+        }
         let description = parts
             .next()
             .map(str::trim)
@@ -94,13 +118,23 @@ impl<R: Read> FastqReader<R> {
             line.clear();
             let byte = self.reader.read_line(&mut line)?;
             if byte == 0 {
-                return Err(invalid_data("FASTQ sequence ended before + separator"));
+                return Err(invalid_data_at_line(
+                    self.line_number,
+                    "FASTQ sequence ended before + separator",
+                ));
             }
             self.line_number += 1;
             if line.starts_with('+') {
                 break;
             }
-            sequence.push_str(line.trim_end());
+            let sequence_line = line.trim_end();
+            if sequence_line.is_empty() {
+                return Err(invalid_data_at_line(
+                    self.line_number,
+                    "FASTQ sequence line must not be blank",
+                ));
+            }
+            sequence.push_str(sequence_line);
         }
 
         let mut quality = String::new();
@@ -108,12 +142,29 @@ impl<R: Read> FastqReader<R> {
             line.clear();
             let byte = self.reader.read_line(&mut line)?;
             if byte == 0 {
-                return Err(invalid_data("FASTQ quality ended before sequence length"));
+                return Err(invalid_data_at_line(
+                    self.line_number,
+                    "FASTQ quality ended before sequence length",
+                ));
             }
             self.line_number += 1;
-            quality.push_str(line.trim_end());
+            let quality_line = line.trim_end();
+            if quality_line.is_empty() {
+                return Err(invalid_data_at_line(
+                    self.line_number,
+                    "FASTQ quality line must not be blank",
+                ));
+            }
+            quality.push_str(quality_line);
             if quality.len() > sequence.len() {
-                return Err(invalid_data("FASTQ quality length exceeds sequence length"));
+                return Err(invalid_data_at_line(
+                    self.line_number,
+                    format!(
+                        "FASTQ quality length exceeds sequence length ({} > {})",
+                        quality.len(),
+                        sequence.len()
+                    ),
+                ));
             }
             if quality.len() == sequence.len() {
                 break;
@@ -255,6 +306,17 @@ impl Fastq {
         writer.write_all(self)?;
         writer.flush()
     }
+
+    /// Converts this FASTQ payload to FASTA records, dropping quality scores.
+    pub fn to_fasta(&self) -> Fasta {
+        Fasta {
+            records: self
+                .records
+                .iter()
+                .map(FastqRecord::to_fasta_record)
+                .collect(),
+        }
+    }
 }
 
 /// A FASTQ sequence record.
@@ -283,6 +345,15 @@ impl FastqRecord {
             sequence,
             quality,
         }
+    }
+
+    /// Converts this FASTQ record to a FASTA record, dropping quality scores.
+    pub fn to_fasta_record(&self) -> FastaRecord {
+        FastaRecord::new(
+            self.id.clone(),
+            self.description.clone(),
+            self.sequence.clone(),
+        )
     }
 }
 
@@ -337,8 +408,14 @@ fn validate_fastq_record(record: &FastqRecord) -> io::Result<()> {
     Ok(())
 }
 
-fn invalid_data(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    Error::invalid(Format::Fastq, message).into()
+}
+
+fn invalid_data_at_line(line: usize, message: impl Into<String>) -> io::Error {
+    Error::invalid(Format::Fastq, message)
+        .with_line(line)
+        .into()
 }
 
 #[cfg(test)]
@@ -531,7 +608,37 @@ mod fastq_tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
             err.to_string(),
-            "FASTQ quality length exceeds sequence length"
+            "invalid FASTQ at line 4: FASTQ quality length exceeds sequence length (5 > 4)"
+        );
+    }
+
+    #[test]
+    fn reader_rejects_empty_ids_and_trailing_junk_with_line_numbers() {
+        let err = Fastq::from_reader(&b"@\nACGT\n+\nIIII\n"[..]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid FASTQ at line 1: FASTQ record ID must be non-empty"
+        );
+
+        let err = Fastq::from_reader(&b"@seq1\nACGT\n+\nIIII\njunk\n"[..]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid FASTQ at line 5: FASTQ header line must start with @"
+        );
+    }
+
+    #[test]
+    fn converts_fastq_records_to_fasta() {
+        let fastq = Fastq::from_reader(&b"@seq1 desc\nACGT\n+\nIIII\n"[..]).unwrap();
+        let fasta = fastq.to_fasta();
+
+        assert_eq!(
+            fasta.records,
+            vec![FastaRecord::new(
+                "seq1".to_string(),
+                Some("desc".to_string()),
+                "ACGT".to_string()
+            )]
         );
     }
 }

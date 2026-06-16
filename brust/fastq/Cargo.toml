@@ -1,6 +1,14 @@
 [package]
 name = "fastq"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+description = "FASTQ reader, writer, and FASTA conversion helpers for Brust."
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
+brust-core = { path = "../brust-core" }
+fasta = { path = "../fasta" }

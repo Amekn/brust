@@ -1,15 +1,12 @@
 [package]
-name = "bam"
+name = "brust-core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license-file.workspace = true
-description = "BAM and BGZF reader, writer, and SAM conversion helpers for Brust."
+description = "Shared error and result types for Brust bioinformatics format crates."
 keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-brust-core = { path = "../brust-core" }
-flate2 = "1.1.9"
-sam = { path = "../sam" }

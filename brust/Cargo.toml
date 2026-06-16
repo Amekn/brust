@@ -1,3 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["bam","brust", "fasta", "fastq", "pod5", "sam"]
+members = ["bam", "brust", "brust-core", "fasta", "fastq", "pod5", "sam"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Kang Zhou"]
+repository = "https://github.com/Amekn/project_biorust"
+license-file = "../LICENSE"
+keywords = ["bioinformatics", "fasta", "fastq", "sam", "bam"]
+categories = ["science", "parser-implementations"]
