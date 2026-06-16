@@ -11,8 +11,10 @@
 //! are zero-based and unmapped positions are represented as `-1`.
 
 use flate2::read::MultiGzDecoder;
+use flate2::write::DeflateEncoder;
+use flate2::{Compression, Crc};
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 
 /// A fully materialized BAM file.
@@ -40,6 +42,17 @@ pub struct BamReader<R: Read = File> {
     /// Reference sequence dictionary.
     pub refs: Vec<BamRef>,
     reader: BufReader<MultiGzDecoder<R>>,
+}
+
+/// Streaming BAM writer over any writable byte stream.
+///
+/// `BamWriter` writes BAM binary data in BGZF blocks. Use
+/// [`BamWriter::write_all`] for a materialized [`Bam`] value, or write a header
+/// and then stream records manually.
+pub struct BamWriter<W: Write = File> {
+    writer: W,
+    pending: Vec<u8>,
+    header_written: bool,
 }
 
 /// BAM header information.
@@ -803,6 +816,23 @@ impl Bam {
     pub fn from_reader<R: Read>(reader: R) -> io::Result<Self> {
         BamReader::from_reader(reader)?.read_all()
     }
+
+    /// Writes this BAM payload to a filesystem path.
+    pub fn to_path<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let writer = BamWriter::from_path(path)?;
+        self.write_with(writer)
+    }
+
+    /// Writes this BAM payload to a writable byte stream.
+    pub fn to_writer<W: Write>(&self, writer: W) -> io::Result<()> {
+        let writer = BamWriter::from_writer(writer);
+        self.write_with(writer)
+    }
+
+    fn write_with<W: Write>(&self, mut writer: BamWriter<W>) -> io::Result<()> {
+        writer.write_all(self)?;
+        writer.finish().map(|_| ())
+    }
 }
 
 impl BamReader<File> {
@@ -879,6 +909,117 @@ impl<R: Read> BamReader<R> {
             refs: self.refs,
             records,
         })
+    }
+}
+
+impl BamWriter<File> {
+    /// Creates or truncates a BAM file at a filesystem path.
+    pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = File::create(path)?;
+        Ok(Self::from_writer(file))
+    }
+
+    /// Creates or truncates a BAM file at a filesystem path.
+    ///
+    /// This is a convenience alias for [`BamWriter::from_path`].
+    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Self::from_path(path)
+    }
+}
+
+impl<W: Write> BamWriter<W> {
+    /// Creates a BAM writer from a writable byte stream.
+    pub fn from_writer(writer: W) -> Self {
+        Self {
+            writer,
+            pending: Vec::with_capacity(BGZF_MAX_UNCOMPRESSED_BLOCK),
+            header_written: false,
+        }
+    }
+
+    /// Writes the BAM header and reference dictionary.
+    pub fn write_header(&mut self, header: &BamHeader, refs: &[BamRef]) -> io::Result<()> {
+        if self.header_written {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BAM header has already been written",
+            ));
+        }
+        let mut data = Vec::new();
+        write_bam_header(&mut data, header, refs)?;
+        self.write_uncompressed(&data)?;
+        self.header_written = true;
+        Ok(())
+    }
+
+    /// Writes one BAM alignment record.
+    pub fn write_record(&mut self, record: &BamRecord) -> io::Result<()> {
+        if !self.header_written {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BAM header must be written before records",
+            ));
+        }
+        let mut data = Vec::new();
+        write_bam_record(&mut data, record)?;
+        self.write_uncompressed(&data)
+    }
+
+    /// Writes one BAM alignment record.
+    ///
+    /// This is a compatibility alias for [`BamWriter::write_record`].
+    pub fn write(&mut self, record: &BamRecord) -> io::Result<()> {
+        self.write_record(record)
+    }
+
+    /// Writes a materialized BAM payload.
+    pub fn write_all(&mut self, bam: &Bam) -> io::Result<()> {
+        if !self.header_written {
+            self.write_header(&bam.header, &bam.refs)?;
+        }
+        for record in &bam.records {
+            self.write_record(record)?;
+        }
+        Ok(())
+    }
+
+    /// Flushes pending BGZF blocks to the underlying writer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.flush_pending()?;
+        self.writer.flush()
+    }
+
+    /// Finishes the BGZF stream, writes the EOF block, and returns the wrapped byte stream.
+    pub fn finish(mut self) -> io::Result<W> {
+        self.flush_pending()?;
+        self.writer.write_all(BGZF_EOF_BLOCK)?;
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
+
+    fn write_uncompressed(&mut self, mut data: &[u8]) -> io::Result<()> {
+        while !data.is_empty() {
+            let available = BGZF_MAX_UNCOMPRESSED_BLOCK - self.pending.len();
+            let take = available.min(data.len());
+            self.pending.extend_from_slice(&data[..take]);
+            data = &data[take..];
+
+            if self.pending.len() == BGZF_MAX_UNCOMPRESSED_BLOCK {
+                self.flush_pending()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn flush_pending(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        write_bgzf_block(&mut self.writer, &self.pending)?;
+        self.pending.clear();
+        Ok(())
     }
 }
 
@@ -977,8 +1118,313 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool
     Ok(true)
 }
 
+const BGZF_MAX_UNCOMPRESSED_BLOCK: usize = 64 * 1024 - 256;
+const BGZF_EOF_BLOCK: &[u8; 28] = b"\x1f\x8b\x08\x04\x00\x00\x00\x00\x00\xff\x06\x00BC\x02\x00\x1b\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+
+fn write_bgzf_block<W: Write>(writer: &mut W, input: &[u8]) -> io::Result<()> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(input)?;
+    let compressed = encoder.finish()?;
+    let block_size = 18usize
+        .checked_add(compressed.len())
+        .and_then(|size| size.checked_add(8))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "BGZF block size overflow"))?;
+
+    if block_size > 64 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BGZF compressed block exceeds 64 KiB",
+        ));
+    }
+
+    let bsize = u16::try_from(block_size - 1)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "BGZF block size exceeds u16"))?;
+    let mut crc = Crc::new();
+    crc.update(input);
+
+    writer.write_all(&[
+        0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, b'B', b'C', 0x02,
+        0x00,
+    ])?;
+    writer.write_all(&bsize.to_le_bytes())?;
+    writer.write_all(&compressed)?;
+    writer.write_all(&crc.sum().to_le_bytes())?;
+    writer.write_all(&(input.len() as u32).to_le_bytes())
+}
+
+fn write_bam_header<W: Write>(
+    writer: &mut W,
+    header: &BamHeader,
+    refs: &[BamRef],
+) -> io::Result<()> {
+    if header.magic != [0x42, 0x41, 0x4D, 0x01] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid BAM magic bytes",
+        ));
+    }
+    if header.n_ref as usize != refs.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BAM header reference count does not match refs length",
+        ));
+    }
+
+    let text = header.text.as_bytes();
+    if header.l_text as usize > 0 && (header.l_text as usize) < text.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BAM header text length is smaller than text bytes",
+        ));
+    }
+    let l_text = if header.l_text == 0 {
+        text.len() as u32
+    } else {
+        header.l_text
+    };
+
+    writer.write_all(&header.magic)?;
+    writer.write_all(&l_text.to_le_bytes())?;
+    writer.write_all(text)?;
+    for _ in text.len()..l_text as usize {
+        writer.write_all(&[0])?;
+    }
+    writer.write_all(&header.n_ref.to_le_bytes())?;
+
+    for reference in refs {
+        write_bam_ref(writer, reference)?;
+    }
+
+    Ok(())
+}
+
+fn write_bam_ref<W: Write>(writer: &mut W, reference: &BamRef) -> io::Result<()> {
+    let name = reference.name.as_bytes();
+    if reference.l_name as usize > 0 && (reference.l_name as usize) < name.len() + 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BAM reference name length is smaller than name plus NUL",
+        ));
+    }
+    let l_name = if reference.l_name == 0 {
+        (name.len() + 1) as u32
+    } else {
+        reference.l_name
+    };
+
+    writer.write_all(&l_name.to_le_bytes())?;
+    writer.write_all(name)?;
+    writer.write_all(&[0])?;
+    for _ in name.len() + 1..l_name as usize {
+        writer.write_all(&[0])?;
+    }
+    writer.write_all(&reference.l_seq.to_le_bytes())
+}
+
+fn write_bam_record<W: Write>(writer: &mut W, record: &BamRecord) -> io::Result<()> {
+    let mut payload = Vec::new();
+    encode_bam_record_payload(record, &mut payload)?;
+
+    let block_size = payload.len() as u32;
+    if record.fixed.block_size != 0 && record.fixed.block_size != block_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BAM record block_size does not match encoded payload length",
+        ));
+    }
+
+    writer.write_all(&block_size.to_le_bytes())?;
+    writer.write_all(&payload)
+}
+
+fn encode_bam_record_payload(record: &BamRecord, payload: &mut Vec<u8>) -> io::Result<()> {
+    let fixed = &record.fixed;
+    let variable = &record.variable;
+    let read_name = variable.read_name.as_bytes();
+
+    if fixed.l_read_name as usize > 0 && (fixed.l_read_name as usize) < read_name.len() + 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BAM read name length is smaller than name plus NUL",
+        ));
+    }
+    if fixed.n_cigar_op as usize != variable.cigar.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BAM n_cigar_op does not match CIGAR vector length",
+        ));
+    }
+    if fixed.l_seq.div_ceil(2) as usize != variable.seq.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BAM packed sequence length does not match l_seq",
+        ));
+    }
+    if fixed.l_seq as usize != variable.qual.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BAM quality length does not match l_seq",
+        ));
+    }
+
+    let l_read_name = if fixed.l_read_name == 0 {
+        (read_name.len() + 1) as u8
+    } else {
+        fixed.l_read_name
+    };
+
+    payload.extend_from_slice(&fixed.ref_id.to_le_bytes());
+    payload.extend_from_slice(&fixed.pos.to_le_bytes());
+    payload.push(l_read_name);
+    payload.push(fixed.mapq);
+    payload.extend_from_slice(&fixed.bin.to_le_bytes());
+    payload.extend_from_slice(&fixed.n_cigar_op.to_le_bytes());
+    payload.extend_from_slice(&fixed.flag.to_le_bytes());
+    payload.extend_from_slice(&fixed.l_seq.to_le_bytes());
+    payload.extend_from_slice(&fixed.next_ref_id.to_le_bytes());
+    payload.extend_from_slice(&fixed.next_pos.to_le_bytes());
+    payload.extend_from_slice(&fixed.tlen.to_le_bytes());
+    payload.extend_from_slice(read_name);
+    payload.push(0);
+    for _ in read_name.len() + 1..l_read_name as usize {
+        payload.push(0);
+    }
+    for cigar in &variable.cigar {
+        payload.extend_from_slice(&cigar.to_le_bytes());
+    }
+    payload.extend_from_slice(&variable.seq);
+    payload.extend_from_slice(&variable.qual);
+    for auxiliary in &record.auxiliary {
+        encode_bam_auxiliary(auxiliary, payload)?;
+    }
+
+    Ok(())
+}
+
+fn encode_bam_auxiliary(auxiliary: &BamRecordAuxiliary, payload: &mut Vec<u8>) -> io::Result<()> {
+    let tag = auxiliary.tag.as_bytes();
+    if tag.len() != 2 || !tag.iter().all(u8::is_ascii_alphanumeric) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BAM auxiliary tag must contain two alphanumeric ASCII bytes",
+        ));
+    }
+    payload.extend_from_slice(tag);
+
+    match &auxiliary.value {
+        BamAuxValue::A(value) => {
+            payload.push(b'A');
+            payload.push(*value);
+        }
+        BamAuxValue::c(value) => {
+            payload.push(b'c');
+            payload.push(*value as u8);
+        }
+        BamAuxValue::C(value) => {
+            payload.push(b'C');
+            payload.push(*value);
+        }
+        BamAuxValue::s(value) => {
+            payload.push(b's');
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        BamAuxValue::S(value) => {
+            payload.push(b'S');
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        BamAuxValue::i(value) => {
+            payload.push(b'i');
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        BamAuxValue::I(value) => {
+            payload.push(b'I');
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        BamAuxValue::f(value) => {
+            payload.push(b'f');
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        BamAuxValue::Z(value) => encode_bam_aux_string(payload, b'Z', value)?,
+        BamAuxValue::H(value) => encode_bam_aux_string(payload, b'H', value)?,
+        BamAuxValue::B(value) => encode_bam_aux_array(payload, value)?,
+    }
+
+    Ok(())
+}
+
+fn encode_bam_aux_string(payload: &mut Vec<u8>, value_type: u8, value: &str) -> io::Result<()> {
+    if value.as_bytes().contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BAM auxiliary string must not contain NUL bytes",
+        ));
+    }
+    payload.push(value_type);
+    payload.extend_from_slice(value.as_bytes());
+    payload.push(0);
+    Ok(())
+}
+
+fn encode_bam_aux_array(payload: &mut Vec<u8>, value: &BamAuxArray) -> io::Result<()> {
+    payload.push(b'B');
+    match value {
+        BamAuxArray::c(values) => {
+            encode_bam_array_header(payload, b'c', values.len())?;
+            payload.extend(values.iter().map(|value| *value as u8));
+        }
+        BamAuxArray::C(values) => {
+            encode_bam_array_header(payload, b'C', values.len())?;
+            payload.extend_from_slice(values);
+        }
+        BamAuxArray::s(values) => {
+            encode_bam_array_header(payload, b's', values.len())?;
+            for value in values {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        BamAuxArray::S(values) => {
+            encode_bam_array_header(payload, b'S', values.len())?;
+            for value in values {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        BamAuxArray::i(values) => {
+            encode_bam_array_header(payload, b'i', values.len())?;
+            for value in values {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        BamAuxArray::I(values) => {
+            encode_bam_array_header(payload, b'I', values.len())?;
+            for value in values {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        BamAuxArray::f(values) => {
+            encode_bam_array_header(payload, b'f', values.len())?;
+            for value in values {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn encode_bam_array_header(payload: &mut Vec<u8>, subtype: u8, len: usize) -> io::Result<()> {
+    let len = u32::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BAM auxiliary array length exceeds u32",
+        )
+    })?;
+    payload.push(subtype);
+    payload.extend_from_slice(&len.to_le_bytes());
+    Ok(())
+}
+
 #[cfg(test)]
-mod unit_tests {
+mod bam_tests {
     use super::*;
     use std::collections::HashMap;
     use std::fs::File;
@@ -1203,6 +1649,47 @@ mod unit_tests {
         assert_eq!(bam.header.n_ref, 1);
         assert_eq!(bam.refs[0].name, "fc_reference");
         assert_eq!(bam.records.len(), 100);
+    }
+
+    #[test]
+    fn writer_round_trips_materialized_aligned_bam() {
+        let bam = Bam::from_path(fixture_path(ALIGNED_BAM)).expect("Bam should materialize");
+        let mut output = Vec::new();
+        bam.to_writer(&mut output).expect("Bam should write");
+        let round_tripped = Bam::from_reader(&output[..]).expect("written Bam should parse");
+
+        assert_eq!(&output[..4], b"\x1f\x8b\x08\x04");
+        assert_eq!(&output[12..16], b"BC\x02\x00");
+        assert!(output.ends_with(BGZF_EOF_BLOCK));
+        assert_eq!(round_tripped, bam);
+    }
+
+    #[test]
+    fn writer_round_trips_materialized_unaligned_bam() {
+        let bam = Bam::from_path(fixture_path(UNALIGNED_BAM)).expect("Bam should materialize");
+        let mut output = Vec::new();
+        bam.to_writer(&mut output).expect("Bam should write");
+        let round_tripped = Bam::from_reader(&output[..]).expect("written Bam should parse");
+
+        assert_eq!(round_tripped, bam);
+    }
+
+    #[test]
+    fn streaming_writer_round_trips_records() {
+        let bam = Bam::from_path(fixture_path(ALIGNED_BAM)).expect("Bam should materialize");
+        let mut writer = BamWriter::from_writer(Vec::new());
+        writer
+            .write_header(&bam.header, &bam.refs)
+            .expect("header should write");
+        for record in bam.records.iter().take(3) {
+            writer.write_record(record).expect("record should write");
+        }
+        let output = writer.finish().expect("writer should finish");
+        let round_tripped = Bam::from_reader(&output[..]).expect("written Bam should parse");
+
+        assert_eq!(round_tripped.header, bam.header);
+        assert_eq!(round_tripped.refs, bam.refs);
+        assert_eq!(round_tripped.records, bam.records[..3]);
     }
 
     #[test]
