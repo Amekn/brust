@@ -1,29 +1,32 @@
-//! Minimal SAM parsing primitives.
+//! SAM reader and writer primitives.
 //!
-//! The crate exposes two ownership models:
+//! The crate exposes both streaming and materialized APIs:
 //!
-//! - [`SamReader`] is a streaming parser over a SAM byte stream. It owns
-//!   reader state, parses the optional header up front, and returns one
-//!   [`SamRecord`] at a time.
-//! - [`Sam`] is a fully materialized SAM payload containing the header and all
-//!   alignment records. It is [`Clone`] for deep-copy workflows.
+//! - [`SamReader`] parses and validates the header during construction, then
+//!   reads one [`SamRecord`] at a time from the alignment section.
+//! - [`Sam`] owns the header and every parsed alignment record and can be cloned
+//!   or written back out.
 //!
-//! SAM alignment lines are tab-delimited and contain the 11 mandatory fields
-//! defined by SAM v1.6, followed by zero or more optional `TAG:TYPE:VALUE`
-//! fields.
+//! The parser supports SAM v1.6-style `@HD`, `@SQ`, `@RG`, `@PG`, and `@CO`
+//! header records, the 11 mandatory tab-delimited alignment fields, CIGAR
+//! parsing and length checks, and optional `TAG:TYPE:VALUE` fields for scalar,
+//! string, hex, and numeric-array values. The writer formats records and
+//! reparses them before emitting text, so the same validation is applied on
+//! output.
 
+use brust_core::{Error, Format};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 
-/// A fully materialized SAM file.
+/// A fully materialized SAM payload.
 ///
 /// `Sam` owns its header and all alignment records, so cloning this type
 /// performs a deep copy of the parsed SAM data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sam {
-    /// Optional SAM header section.
+    /// SAM header section.
     pub header: SamHeader,
     /// All alignment records loaded from the stream.
     pub records: Vec<SamRecord>,
@@ -31,29 +34,31 @@ pub struct Sam {
 
 /// Streaming SAM parser over any readable byte stream.
 ///
-/// `SamReader` owns the buffered reader and parser cursor, so it is not
-/// cloneable. Use [`SamReader::read_all`] or [`Sam::from_path`] when a
-/// deep-copyable, materialized representation is needed.
+/// Header records are consumed and validated before the first alignment record
+/// is returned. `SamReader` keeps the underlying reader and parser cursor in one
+/// place, so it is intentionally not cloneable. Use [`SamReader::read_all`] or
+/// [`Sam::from_path`] when a cloneable, in-memory representation is needed.
 pub struct SamReader<R: Read = File> {
     /// Header records parsed before the first alignment line.
     pub header: SamHeader,
     reader: BufReader<R>,
-    // Alignment line already read while parsing the header.
+    // First alignment line consumed while parsing the header.
     pending_record: Option<String>,
-    // One-based line counter maintained for diagnostics.
+    // Number of lines consumed from the underlying reader.
     line_number: usize,
 }
 
 /// Streaming SAM writer over any writable byte stream.
 ///
-/// `SamWriter` emits header records followed by alignment records. Use
-/// [`SamWriter::write_all`] for a materialized [`Sam`] value, or call
-/// [`SamWriter::write_header`] once before streaming records manually.
+/// `SamWriter` emits header records followed by alignment records. It validates
+/// headers before writing and validates alignment records by formatting and
+/// reparsing them. Use [`SamWriter::write_all`] for a materialized [`Sam`], or
+/// call [`SamWriter::write_header`] once before streaming records manually.
 pub struct SamWriter<W: Write = File> {
     writer: W,
 }
 
-/// SAM header section.
+/// SAM header section in file order.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SamHeader {
     /// All header records in file order.
@@ -65,7 +70,7 @@ pub struct SamHeader {
 pub struct SamHeaderRecord {
     /// Two-character record type without the leading `@`, such as `HD` or `SQ`.
     pub record_type: String,
-    /// `TAG:VALUE` fields for all non-comment header records.
+    /// `TAG:VALUE` fields for non-comment header records.
     pub fields: Vec<SamHeaderField>,
     /// Comment text for `@CO` header records.
     pub comment: Option<String>,
@@ -80,26 +85,26 @@ pub struct SamHeaderField {
     pub value: String,
 }
 
-/// A SAM alignment record.
+/// A SAM alignment record with parsed mandatory and optional fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SamRecord {
-    /// Query template name.
+    /// Query template name (`QNAME`).
     pub qname: String,
-    /// Bitwise SAM flag.
+    /// Bitwise SAM flag (`FLAG`).
     pub flag: u16,
-    /// Reference sequence name.
+    /// Reference sequence name (`RNAME`), or `*`.
     pub rname: String,
     /// One-based leftmost mapping position, or `0` when unavailable.
     pub pos: u32,
-    /// Mapping quality, with `255` representing unavailable.
+    /// Mapping quality (`MAPQ`), with `255` representing unavailable.
     pub mapq: u8,
     /// CIGAR string, or `*` when unavailable.
     pub cigar: String,
-    /// Reference name of the mate/next read.
+    /// Reference name of the mate/next read (`RNEXT`), `=`, or `*`.
     pub rnext: String,
     /// One-based position of the mate/next read, or `0` when unavailable.
     pub pnext: u32,
-    /// Observed template length.
+    /// Observed template length (`TLEN`).
     pub tlen: i32,
     /// Segment sequence, or `*` when not stored.
     pub seq: String,
@@ -154,7 +159,7 @@ pub enum SamOptionalArray {
     Float(Vec<f32>),
 }
 
-/// One CIGAR operation.
+/// One parsed CIGAR operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SamCigarOp {
     /// Operation length.
@@ -206,9 +211,59 @@ impl SamRecord {
         self.flag & flags::UNMAPPED != 0
     }
 
+    /// Returns `true` when the multi-segment template flag (`0x1`) is set.
+    pub fn has_multiple_segments(&self) -> bool {
+        self.flag & flags::MULTIPLE_SEGMENTS != 0
+    }
+
+    /// Returns `true` when the properly-aligned flag (`0x2`) is set.
+    pub fn is_properly_aligned(&self) -> bool {
+        self.flag & flags::PROPERLY_ALIGNED != 0
+    }
+
+    /// Returns `true` when the mate/next-segment-unmapped flag (`0x8`) is set.
+    pub fn is_next_unmapped(&self) -> bool {
+        self.flag & flags::NEXT_UNMAPPED != 0
+    }
+
     /// Returns `true` when the reverse-complemented flag (`0x10`) is set.
     pub fn is_reverse_complemented(&self) -> bool {
         self.flag & flags::REVERSE_COMPLEMENTED != 0
+    }
+
+    /// Returns `true` when the mate/next-segment reverse-complemented flag (`0x20`) is set.
+    pub fn is_next_reverse_complemented(&self) -> bool {
+        self.flag & flags::NEXT_REVERSE_COMPLEMENTED != 0
+    }
+
+    /// Returns `true` when this is the first segment in a template (`0x40`).
+    pub fn is_first_segment(&self) -> bool {
+        self.flag & flags::FIRST_SEGMENT != 0
+    }
+
+    /// Returns `true` when this is the last segment in a template (`0x80`).
+    pub fn is_last_segment(&self) -> bool {
+        self.flag & flags::LAST_SEGMENT != 0
+    }
+
+    /// Returns `true` when this is a secondary alignment (`0x100`).
+    pub fn is_secondary(&self) -> bool {
+        self.flag & flags::SECONDARY != 0
+    }
+
+    /// Returns `true` when this segment fails platform/vendor checks (`0x200`).
+    pub fn is_filtered(&self) -> bool {
+        self.flag & flags::FILTERED != 0
+    }
+
+    /// Returns `true` when this segment is marked duplicate (`0x400`).
+    pub fn is_duplicate(&self) -> bool {
+        self.flag & flags::DUPLICATE != 0
+    }
+
+    /// Returns `true` when this is a supplementary alignment (`0x800`).
+    pub fn is_supplementary(&self) -> bool {
+        self.flag & flags::SUPPLEMENTARY != 0
     }
 
     /// Returns the optional field matching `tag`, if present.
@@ -221,12 +276,15 @@ impl SamRecord {
 
     /// Parses this record's CIGAR string into operations.
     ///
-    /// Returns an empty vector when the CIGAR field is `*`.
+    /// Returns an empty vector when the CIGAR field is `*`. Non-empty CIGAR
+    /// strings are validated for operation lengths and clipping placement.
     pub fn cigar_ops(&self) -> io::Result<Vec<SamCigarOp>> {
         parse_cigar(&self.cigar)
     }
 
     /// Returns the query-consuming CIGAR length.
+    ///
+    /// Counts `M`, `I`, `S`, `=`, and `X` operations.
     pub fn query_len_from_cigar(&self) -> io::Result<u64> {
         Ok(self
             .cigar_ops()?
@@ -237,6 +295,8 @@ impl SamRecord {
     }
 
     /// Returns the reference-consuming CIGAR length.
+    ///
+    /// Counts `M`, `D`, `N`, `=`, and `X` operations.
     pub fn reference_len_from_cigar(&self) -> io::Result<u64> {
         Ok(self
             .cigar_ops()?
@@ -244,6 +304,13 @@ impl SamRecord {
             .filter(|op| matches!(op.op, 'M' | 'D' | 'N' | '=' | 'X'))
             .map(|op| u64::from(op.len))
             .sum())
+    }
+
+    /// Formats this record as one SAM alignment line without a trailing newline.
+    pub fn to_sam_line(&self) -> io::Result<String> {
+        let line = format_sam_record(self)?;
+        Self::parse(&line)?;
+        Ok(line)
     }
 }
 
@@ -267,7 +334,7 @@ impl Sam {
         SamReader::from_path(path)?.read_all()
     }
 
-    /// Materializes all records from a SAM byte stream.
+    /// Materializes a SAM byte stream into memory.
     pub fn from_reader<R: Read>(reader: R) -> io::Result<Self> {
         SamReader::from_reader(reader)?.read_all()
     }
@@ -306,8 +373,8 @@ impl<R: Read> SamReader<R> {
     /// Creates a streaming parser from a SAM byte stream.
     ///
     /// Header records are parsed immediately and are available in
-    /// [`SamReader::header`]. The first alignment line is held for the first
-    /// call to [`SamReader::read_record`].
+    /// [`SamReader::header`]. The first alignment line, if any, is held for the
+    /// first call to [`SamReader::read_record`].
     pub fn from_reader(reader: R) -> io::Result<Self> {
         let mut reader = BufReader::new(reader);
         let mut records = Vec::new();
@@ -326,7 +393,10 @@ impl<R: Read> SamReader<R> {
             line_number += 1;
 
             if line.starts_with('@') {
-                records.push(SamHeaderRecord::parse(line.trim_end_matches(['\r', '\n']))?);
+                records.push(
+                    SamHeaderRecord::parse(line.trim_end_matches(['\r', '\n']))
+                        .map_err(|error| context_line(error, line_number))?,
+                );
             } else {
                 pending_record = Some(line.clone());
                 break;
@@ -347,8 +417,8 @@ impl<R: Read> SamReader<R> {
     /// Reads the next SAM alignment record.
     ///
     /// Returns `Ok(None)` when the stream is at EOF before another alignment
-    /// line begins. Header records are consumed during construction and are not
-    /// returned by this method.
+    /// line begins. Header records are consumed during construction; a header
+    /// line encountered after the alignment section has started is rejected.
     pub fn read_record(&mut self) -> io::Result<Option<SamRecord>> {
         let line = match self.pending_record.take() {
             Some(line) => line,
@@ -366,10 +436,15 @@ impl<R: Read> SamReader<R> {
         };
 
         if line.starts_with('@') {
-            return Err(invalid_data("header record found after alignment section"));
+            return Err(invalid_data_at_line(
+                self.line_number,
+                "header record found after alignment section",
+            ));
         }
 
-        SamRecord::parse(line.trim_end_matches(['\r', '\n'])).map(Some)
+        SamRecord::parse(line.trim_end_matches(['\r', '\n']))
+            .map_err(|error| context_line(error, self.line_number))
+            .map(Some)
     }
 
     /// Reads the next SAM alignment record.
@@ -420,6 +495,9 @@ impl<W: Write> SamWriter<W> {
     }
 
     /// Writes a SAM header section.
+    ///
+    /// Validation enforces supported record types, required `@SQ`, `@RG`, and
+    /// `@PG` fields, duplicate checks, and `@HD` placement.
     pub fn write_header(&mut self, header: &SamHeader) -> io::Result<()> {
         header.validate()?;
         for record in &header.records {
@@ -431,6 +509,10 @@ impl<W: Write> SamWriter<W> {
     }
 
     /// Writes one SAM alignment record.
+    ///
+    /// The record is formatted to a SAM line and reparsed before any bytes are
+    /// written, ensuring writer output satisfies the same checks as parser
+    /// input.
     pub fn write_record(&mut self, record: &SamRecord) -> io::Result<()> {
         let line = format_sam_record(record)?;
         SamRecord::parse(&line)?;
@@ -466,7 +548,7 @@ impl<W: Write> SamWriter<W> {
     }
 }
 
-/// Iterator over records from a [`SamReader`].
+/// Iterator over alignment records from a [`SamReader`].
 pub struct SamRecords<'a, R: Read> {
     reader: &'a mut SamReader<R>,
 }
@@ -1217,8 +1299,25 @@ fn is_printable_or_space_ascii(value: &str) -> bool {
     value.bytes().all(|byte| (32..=126).contains(&byte))
 }
 
-fn invalid_data(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    Error::invalid(Format::Sam, message).into()
+}
+
+fn invalid_data_at_line(line: usize, message: impl Into<String>) -> io::Error {
+    Error::invalid(Format::Sam, message).with_line(line).into()
+}
+
+fn context_line(error: io::Error, line: usize) -> io::Error {
+    if let Some(error) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<Error>())
+    {
+        return error.clone().with_line(line).into();
+    }
+
+    Error::invalid(Format::Sam, error.to_string())
+        .with_line(line)
+        .into()
 }
 
 #[cfg(test)]
@@ -1333,6 +1432,10 @@ mod sam_tests {
             sam.records[0].aux("NM"),
             Some(&SamOptionalValue::Integer(1))
         );
+        assert_eq!(
+            sam.records[0].to_sam_line().unwrap(),
+            String::from_utf8_lossy(input.split(|byte| *byte == b'\n').nth(2).unwrap()).to_string()
+        );
     }
 
     #[test]
@@ -1432,5 +1535,57 @@ mod sam_tests {
             Sam::from_reader(&b"@SQ\tSN:ref\tLN:0\nr1\t0\tref\t1\t60\t1M\t*\t0\t0\tA\tI\n"[..])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn malformed_alignment_errors_include_line_numbers() {
+        let err = Sam::from_reader(
+            &b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:10\nr1\t0\tref\t1\t60\t1M\t*\t0\t0\tA\n"[..],
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid SAM at line 3: SAM alignment line has fewer than 11 fields"
+        );
+    }
+
+    #[test]
+    fn flag_helpers_cover_sam_bits() {
+        let record = SamRecord::new(
+            "r001".to_string(),
+            flags::MULTIPLE_SEGMENTS
+                | flags::PROPERLY_ALIGNED
+                | flags::NEXT_UNMAPPED
+                | flags::NEXT_REVERSE_COMPLEMENTED
+                | flags::FIRST_SEGMENT
+                | flags::SECONDARY
+                | flags::FILTERED
+                | flags::DUPLICATE
+                | flags::SUPPLEMENTARY,
+            "*".to_string(),
+            0,
+            0,
+            "*".to_string(),
+            "*".to_string(),
+            0,
+            0,
+            "*".to_string(),
+            "*".to_string(),
+            Vec::new(),
+        );
+
+        assert!(record.has_multiple_segments());
+        assert!(record.is_properly_aligned());
+        assert!(!record.is_unmapped());
+        assert!(record.is_next_unmapped());
+        assert!(!record.is_reverse_complemented());
+        assert!(record.is_next_reverse_complemented());
+        assert!(record.is_first_segment());
+        assert!(!record.is_last_segment());
+        assert!(record.is_secondary());
+        assert!(record.is_filtered());
+        assert!(record.is_duplicate());
+        assert!(record.is_supplementary());
     }
 }

@@ -1,15 +1,20 @@
-//! Minimal POD5 parsing primitives.
+//! POD5 reader, writer, and signal primitives.
 //!
-//! The crate exposes two ownership models:
+//! The crate exposes both cursor-style and materialized APIs:
 //!
-//! - [`Pod5Reader`] is a cursor over POD5 reads. It owns the parsed POD5
-//!   wrapper metadata and records, and returns one [`Pod5Record`] at a time.
-//! - [`Pod5`] is a fully materialized POD5 payload containing the header,
-//!   run-info rows, and read records. It is [`Clone`] for deep-copy workflows.
+//! - [`Pod5Reader`] reads POD5 and Arrow metadata during construction, then
+//!   returns one [`Pod5Record`] at a time from the Reads table without
+//!   materializing the whole POD5 file.
+//! - [`Pod5`] owns the parsed header, Run Info rows, Signal rows, and Reads
+//!   rows and can be cloned or written back out.
 //!
-//! POD5 files are a POD5 wrapper around Apache Arrow IPC/Feather V2 tables.
-//! This crate validates the POD5 container markers and reads the embedded
-//! Arrow Reads and Run Info tables through Arrow's IPC reader.
+//! POD5 files are a container around Apache Arrow IPC/Feather V2 tables.
+//! This crate validates wrapper magic, section markers, zero padding, required
+//! table presence, and Arrow schema shapes, then parses the embedded Reads,
+//! Signal, and Run Info tables through Arrow's IPC reader. Seekable readers use
+//! the POD5 footer to open embedded Arrow sections on demand. The writer emits
+//! a complete POD5 payload from the materialized representation and compresses
+//! uncompressed signal rows to VBZ.
 
 use arrow_array::builder::{
     FixedSizeBinaryBuilder, LargeBinaryBuilder, ListBuilder, MapBuilder, StringBuilder,
@@ -23,14 +28,18 @@ use arrow_array::{
 };
 use arrow_ipc::reader::FileReader;
 use arrow_ipc::writer::FileWriter;
+use arrow_ipc::{MessageHeader, root_as_footer, root_as_message};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use std::collections::HashMap;
+use brust_core::{Error, Format};
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 
-/// POD5 file signature at the start and end of every POD5 file.
+/// POD5 file signature stored at the start and end of each POD5 file.
 pub const POD5_MAGIC: &[u8; 8] = b"\x8bPOD\r\n\x1a\n";
 /// Marker at the start of the footer section.
 pub const POD5_FOOTER_MAGIC: &[u8; 8] = b"FOOTER\0\0";
@@ -96,7 +105,7 @@ type ParsedPod5 = (
     Vec<Pod5Record>,
 );
 
-/// A fully materialized POD5 file.
+/// A fully materialized POD5 payload.
 ///
 /// `Pod5` owns its header, run-info rows, and all parsed read records, so
 /// cloning this type performs a deep copy of the parsed POD5 data.
@@ -114,28 +123,90 @@ pub struct Pod5 {
 
 /// Cursor over POD5 read records.
 ///
-/// POD5 stores its data as embedded Arrow tables with a footer, so this reader
-/// materializes the table metadata during construction and then exposes the
-/// same `read_record`/`records` surface as the text-format crates.
-pub struct Pod5Reader<R: Read = File> {
+/// POD5 stores reads, signals, and run metadata as embedded Arrow tables with a
+/// footer. This reader parses metadata during construction and then exposes the
+/// same `read_record`/`records` surface as the streaming crates. The underlying
+/// byte stream must support seeking so the reader can use footer offsets to
+/// open embedded Arrow sections on demand.
+pub struct Pod5Reader<R: Read + Seek = File> {
     /// POD5 wrapper and table metadata.
     pub header: Pod5Header,
     /// Run Info table rows parsed during construction.
     pub run_infos: Vec<Pod5RunInfo>,
-    /// Signal table rows parsed during construction.
-    pub signals: Vec<Pod5Signal>,
-    records: Vec<Pod5Record>,
-    position: usize,
-    _reader: std::marker::PhantomData<R>,
+    shared: SharedReader<R>,
+    read_sections: Vec<Pod5Section>,
+    signal_sections: Vec<Pod5Section>,
+    read_section_index: usize,
+    read_reader: Option<FileReader<SectionReader<R>>>,
+    read_buffer: VecDeque<Pod5Record>,
+    signal_cursor: Pod5SignalCursor<R>,
 }
 
 /// POD5 file writer over any writable byte stream.
 ///
 /// POD5 is a container of Arrow IPC files plus a footer, so this writer emits a
 /// complete materialized [`Pod5`] value at a time rather than streaming
-/// individual reads.
+/// individual reads. Missing writer metadata is filled with deterministic
+/// defaults.
 pub struct Pod5Writer<W: Write = File> {
     writer: W,
+}
+
+/// High-level counts and rollups for a POD5 payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pod5Summary {
+    /// Number of Reads table rows.
+    pub read_count: usize,
+    /// Number of Signal table rows.
+    pub signal_count: usize,
+    /// Number of Run Info rows.
+    pub run_info_count: usize,
+    /// Sum of `num_samples` across all reads.
+    pub total_samples: u64,
+    /// Per-channel read and sample counts.
+    pub channels: Vec<Pod5ChannelSummary>,
+    /// Per-run read and sample counts.
+    pub run_infos: Vec<Pod5RunInfoSummary>,
+}
+
+/// Per-channel POD5 summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pod5ChannelSummary {
+    /// One-indexed channel.
+    pub channel: u16,
+    /// Number of reads observed on this channel.
+    pub read_count: usize,
+    /// Sum of `num_samples` for reads on this channel.
+    pub sample_count: u64,
+}
+
+/// Per-run POD5 summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pod5RunInfoSummary {
+    /// Acquisition/run identifier.
+    pub acquisition_id: String,
+    /// User-supplied sample identifier.
+    pub sample_id: String,
+    /// User-supplied experiment name.
+    pub experiment_name: String,
+    /// Flow-cell identifier.
+    pub flow_cell_id: String,
+    /// Sequencing kit name.
+    pub sequencing_kit: String,
+    /// Samples per second.
+    pub sample_rate: u16,
+    /// MinKNOW/software string from the row.
+    pub software: String,
+    /// Number of reads referencing this run info row.
+    pub read_count: usize,
+    /// Sum of `num_samples` for reads referencing this run info row.
+    pub sample_count: u64,
+}
+
+/// Lazily decompresses and caches signal rows for a materialized [`Pod5`].
+pub struct Pod5SignalCache<'a> {
+    signals: &'a [Pod5Signal],
+    decoded_cache: RefCell<HashMap<u64, Vec<i16>>>,
 }
 
 /// POD5 wrapper and table metadata.
@@ -143,9 +214,9 @@ pub struct Pod5Writer<W: Write = File> {
 pub struct Pod5Header {
     /// Leading POD5 magic bytes.
     pub magic: [u8; 8],
-    /// Per-file section marker used between embedded files.
+    /// Per-file section marker used between embedded sections.
     pub section_marker: [u8; 16],
-    /// Embedded Arrow/footer sections in file order.
+    /// Embedded Arrow and footer sections in file order.
     pub sections: Vec<Pod5Section>,
     /// `MINKNOW:file_identifier` Arrow schema metadata, when present.
     pub file_identifier: Option<String>,
@@ -160,11 +231,11 @@ pub struct Pod5Header {
 pub struct Pod5Section {
     /// Section kind inferred from the embedded Arrow schema or footer magic.
     pub kind: Pod5SectionKind,
-    /// Absolute byte offset of the section payload, just after the section marker.
+    /// Absolute byte offset just after the preceding section marker.
     pub offset: u64,
-    /// Unpadded payload length in bytes.
+    /// Arrow payload length, or FlatBuffers footer payload length for footer sections.
     pub length: u64,
-    /// Padded payload length up to the next section marker.
+    /// Padded section length up to the next section marker.
     pub padded_length: u64,
     /// Number of Arrow table rows in this section, or zero for the footer.
     pub row_count: usize,
@@ -185,7 +256,7 @@ pub enum Pod5SectionKind {
     Unknown,
 }
 
-/// A Run Info table row.
+/// Selected fields from a POD5 Run Info table row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pod5RunInfo {
     /// Acquisition/run identifier.
@@ -209,11 +280,11 @@ pub struct Pod5RunInfo {
 pub struct Pod5Record {
     /// Read UUID.
     pub read_id: String,
-    /// Signal table row indices referenced by this read.
+    /// Zero-based Signal table row indices referenced by this read.
     pub signal_rows: Vec<u64>,
     /// Read number.
     pub read_number: u32,
-    /// Samples recorded on this channel since run start to the first sample.
+    /// Sample offset on this channel at which the read starts.
     pub start_sample: u64,
     /// Current level in this well before the read.
     pub median_before: f32,
@@ -247,7 +318,7 @@ pub struct Pod5Record {
     pub end_reason: String,
     /// Whether the end reason was forced.
     pub end_reason_forced: bool,
-    /// Run Info acquisition identifier.
+    /// Run Info acquisition identifier referenced by this read.
     pub run_info: String,
 }
 
@@ -258,7 +329,7 @@ pub struct Pod5Signal {
     pub read_id: String,
     /// Number of decoded ADC samples in this row.
     pub samples: u32,
-    /// Signal payload, compressed or uncompressed depending on the table schema.
+    /// Signal payload, compressed or uncompressed depending on the parsed source.
     pub payload: Pod5SignalPayload,
 }
 
@@ -267,19 +338,37 @@ pub struct Pod5Signal {
 pub enum Pod5SignalPayload {
     /// VBZ-compressed signal bytes from the POD5 Signal table.
     Vbz(Vec<u8>),
-    /// Uncompressed int16 ADC samples.
+    /// Uncompressed int16 ADC samples. The writer compresses these rows to VBZ.
     Uncompressed(Vec<i16>),
 }
 
 impl Pod5 {
     /// Opens a POD5 file and materializes all records into memory.
+    ///
+    /// This uses the seek-based [`Pod5Reader`] internally, so the whole file is
+    /// not buffered before parsing. The returned [`Pod5`] still owns all parsed
+    /// reads and signal rows.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         Pod5Reader::from_path(path)?.read_all()
     }
 
-    /// Materializes all records from a POD5 byte stream.
+    /// Materializes a POD5 byte stream into memory.
+    ///
+    /// Non-seekable streams cannot use the POD5 footer for section offsets, so
+    /// this compatibility API buffers the input before parsing. Use
+    /// [`Pod5Reader::from_reader`] for seekable streaming reads.
     pub fn from_reader<R: Read>(reader: R) -> io::Result<Self> {
-        Pod5Reader::from_reader(reader)?.read_all()
+        let mut data = Vec::new();
+        let mut reader = reader;
+        reader.read_to_end(&mut data)?;
+        let (header, run_infos, signals, records) = parse_pod5(&data)?;
+
+        Ok(Self {
+            header,
+            run_infos,
+            signals,
+            records,
+        })
     }
 
     /// Writes this POD5 payload to a filesystem path.
@@ -296,18 +385,107 @@ impl Pod5 {
         writer.flush()
     }
 
-    /// Decompresses and concatenates signal rows referenced by `record`.
+    /// Decompresses and concatenates the signal rows referenced by `record`.
+    ///
+    /// Returns an error if any referenced Signal row index is out of bounds or a
+    /// compressed signal payload is malformed.
     pub fn signal_for_record(&self, record: &Pod5Record) -> io::Result<Vec<i16>> {
         record.signal(&self.signals)
     }
 
     /// Finds a read by ID and returns its decompressed signal, if present.
     pub fn signal_by_read_id(&self, read_id: &str) -> io::Result<Option<Vec<i16>>> {
-        self.records
-            .iter()
-            .find(|record| record.read_id == read_id)
+        self.read_by_id(read_id)
             .map(|record| self.signal_for_record(record))
             .transpose()
+    }
+
+    /// Returns a read by ID, if present.
+    pub fn read_by_id(&self, read_id: &str) -> Option<&Pod5Record> {
+        self.records.iter().find(|record| record.read_id == read_id)
+    }
+
+    /// Builds a lookup map from read ID to read record.
+    pub fn read_lookup(&self) -> HashMap<&str, &Pod5Record> {
+        self.records
+            .iter()
+            .map(|record| (record.read_id.as_str(), record))
+            .collect()
+    }
+
+    /// Creates a reusable lazy signal decompression cache over this payload's
+    /// Signal table rows.
+    pub fn signal_cache(&self) -> Pod5SignalCache<'_> {
+        Pod5SignalCache::new(&self.signals)
+    }
+
+    /// Returns the sum of `num_samples` across all reads.
+    pub fn total_samples(&self) -> u64 {
+        self.records.iter().map(|record| record.num_samples).sum()
+    }
+
+    /// Returns per-channel read and sample summaries sorted by channel.
+    pub fn channel_summaries(&self) -> Vec<Pod5ChannelSummary> {
+        let mut counts = HashMap::<u16, (usize, u64)>::new();
+        for record in &self.records {
+            let entry = counts.entry(record.channel).or_default();
+            entry.0 += 1;
+            entry.1 += record.num_samples;
+        }
+
+        let mut summaries = counts
+            .into_iter()
+            .map(|(channel, (read_count, sample_count))| Pod5ChannelSummary {
+                channel,
+                read_count,
+                sample_count,
+            })
+            .collect::<Vec<_>>();
+        summaries.sort_by_key(|summary| summary.channel);
+        summaries
+    }
+
+    /// Returns per-run read and sample summaries in Run Info table order.
+    pub fn run_info_summaries(&self) -> Vec<Pod5RunInfoSummary> {
+        let mut counts = HashMap::<&str, (usize, u64)>::new();
+        for record in &self.records {
+            let entry = counts.entry(record.run_info.as_str()).or_default();
+            entry.0 += 1;
+            entry.1 += record.num_samples;
+        }
+
+        self.run_infos
+            .iter()
+            .map(|run_info| {
+                let (read_count, sample_count) = counts
+                    .get(run_info.acquisition_id.as_str())
+                    .copied()
+                    .unwrap_or_default();
+                Pod5RunInfoSummary {
+                    acquisition_id: run_info.acquisition_id.clone(),
+                    sample_id: run_info.sample_id.clone(),
+                    experiment_name: run_info.experiment_name.clone(),
+                    flow_cell_id: run_info.flow_cell_id.clone(),
+                    sequencing_kit: run_info.sequencing_kit.clone(),
+                    sample_rate: run_info.sample_rate,
+                    software: run_info.software.clone(),
+                    read_count,
+                    sample_count,
+                }
+            })
+            .collect()
+    }
+
+    /// Returns a high-level summary of reads, signals, runs, channels, and sample counts.
+    pub fn summary(&self) -> Pod5Summary {
+        Pod5Summary {
+            read_count: self.records.len(),
+            signal_count: self.signals.len(),
+            run_info_count: self.run_infos.len(),
+            total_samples: self.total_samples(),
+            channels: self.channel_summaries(),
+            run_infos: self.run_info_summaries(),
+        }
     }
 }
 
@@ -326,23 +504,40 @@ impl Pod5Reader<File> {
     }
 }
 
-impl<R: Read> Pod5Reader<R> {
-    /// Creates a POD5 reader from a byte stream.
+impl<R: Read + Seek> Pod5Reader<R> {
+    /// Creates a streaming POD5 reader from a seekable byte stream.
     ///
-    /// POD5 requires footer and table access, so the stream is read into memory
-    /// during construction.
-    pub fn from_reader(mut reader: R) -> io::Result<Self> {
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data)?;
-        let (header, run_infos, signals, records) = parse_pod5(&data)?;
+    /// POD5 stores table offsets in a footer at the end of the file, so true
+    /// streaming requires [`Seek`]. Construction validates wrapper metadata,
+    /// opens embedded Arrow sections, and parses Run Info rows, but Reads and
+    /// Signal rows are loaded batch-by-batch on demand.
+    pub fn from_reader(reader: R) -> io::Result<Self> {
+        let shared = Rc::new(RefCell::new(reader));
+        let (header, run_infos) = inspect_pod5(shared.clone())?;
+        let read_sections = header
+            .sections
+            .iter()
+            .filter(|section| section.kind == Pod5SectionKind::Reads)
+            .cloned()
+            .collect::<Vec<_>>();
+        let signal_sections = header
+            .sections
+            .iter()
+            .filter(|section| section.kind == Pod5SectionKind::Signal)
+            .cloned()
+            .collect::<Vec<_>>();
+        let signal_cursor = Pod5SignalCursor::new(shared.clone(), signal_sections.clone());
 
         Ok(Self {
             header,
             run_infos,
-            signals,
-            records,
-            position: 0,
-            _reader: std::marker::PhantomData,
+            shared,
+            read_sections,
+            signal_sections,
+            read_section_index: 0,
+            read_reader: None,
+            read_buffer: VecDeque::new(),
+            signal_cursor,
         })
     }
 
@@ -350,12 +545,16 @@ impl<R: Read> Pod5Reader<R> {
     ///
     /// Returns `Ok(None)` when all parsed reads have been returned.
     pub fn read_record(&mut self) -> io::Result<Option<Pod5Record>> {
-        let Some(record) = self.records.get(self.position).cloned() else {
-            return Ok(None);
-        };
+        loop {
+            if let Some(record) = self.read_buffer.pop_front() {
+                return Ok(Some(record));
+            }
 
-        self.position += 1;
-        Ok(Some(record))
+            let Some(batch) = self.next_reads_batch()? else {
+                return Ok(None);
+            };
+            self.read_buffer.extend(parse_reads_batch(&batch)?);
+        }
     }
 
     /// Reads the next POD5 record.
@@ -365,13 +564,47 @@ impl<R: Read> Pod5Reader<R> {
         self.read_record()
     }
 
-    /// Returns an iterator over records in the POD5 file.
+    /// Returns an iterator over the remaining read records.
     pub fn records(&mut self) -> Pod5Records<'_, R> {
         Pod5Records { reader: self }
     }
 
+    /// Decompresses and concatenates the signal rows referenced by `record`.
+    ///
+    /// Signal rows are read lazily from the Signal table. Sequential reads are
+    /// served with a forward cursor; if a record references an earlier Signal
+    /// row, the Signal cursor is restarted and advanced to that row. Once a row
+    /// has been decompressed, its samples are cached for later requests.
+    pub fn signal_for_record(&mut self, record: &Pod5Record) -> io::Result<Vec<i16>> {
+        let total = usize::try_from(record.num_samples)
+            .map_err(|_| invalid_data("POD5 read sample count exceeds usize"))?;
+        let mut samples = Vec::with_capacity(total);
+
+        for &index in &record.signal_rows {
+            let signal = self.signal_cursor.signal_samples_at(index)?;
+            if signal.read_id != record.read_id {
+                return Err(invalid_data("POD5 signal row read_id does not match read"));
+            }
+            samples.extend_from_slice(&signal.samples);
+        }
+
+        if samples.len() != total {
+            return Err(invalid_data(
+                "POD5 read num_samples does not match referenced signal rows",
+            ));
+        }
+
+        Ok(samples)
+    }
+
+    /// Reads one Signal table row by zero-based row number.
+    pub fn signal_row(&mut self, row: u64) -> io::Result<Pod5Signal> {
+        self.signal_cursor.signal_row_at(row)
+    }
+
     /// Consumes this reader and materializes the remaining POD5 records.
     pub fn read_all(mut self) -> io::Result<Pod5> {
+        let signals = self.read_all_signals_from_start()?;
         let mut records = Vec::new();
         while let Some(record) = self.read_record()? {
             records.push(record);
@@ -380,9 +613,39 @@ impl<R: Read> Pod5Reader<R> {
         Ok(Pod5 {
             header: self.header,
             run_infos: self.run_infos,
-            signals: self.signals,
+            signals,
             records,
         })
+    }
+
+    fn next_reads_batch(&mut self) -> io::Result<Option<RecordBatch>> {
+        loop {
+            if let Some(reader) = &mut self.read_reader {
+                match reader.next() {
+                    Some(Ok(batch)) => return Ok(Some(batch)),
+                    Some(Err(error)) => return Err(arrow_error(error)),
+                    None => {
+                        self.read_reader = None;
+                        self.read_section_index += 1;
+                    }
+                }
+            } else if let Some(section) = self.read_sections.get(self.read_section_index) {
+                self.read_reader = Some(open_arrow_reader(self.shared.clone(), section)?);
+            } else {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn read_all_signals_from_start(&self) -> io::Result<Vec<Pod5Signal>> {
+        let mut cursor = Pod5SignalCursor::new(self.shared.clone(), self.signal_sections.clone());
+        let mut signals = Vec::with_capacity(self.header.signal_count());
+
+        while let Some(signal) = cursor.read_next_signal()? {
+            signals.push(signal);
+        }
+
+        Ok(signals)
     }
 }
 
@@ -408,6 +671,10 @@ impl<W: Write> Pod5Writer<W> {
     }
 
     /// Writes a complete materialized POD5 payload.
+    ///
+    /// The writer validates UUIDs, signal row references, read sample counts,
+    /// and run-info references before encoding Arrow sections and the POD5
+    /// footer.
     pub fn write_all(&mut self, pod5: &Pod5) -> io::Result<()> {
         let data = encode_pod5(pod5)?;
         self.writer.write_all(&data)
@@ -433,20 +700,28 @@ impl<W: Write> Pod5Writer<W> {
 
 impl Pod5Record {
     /// Decompresses and concatenates the signal rows referenced by this read.
+    ///
+    /// `signal_rows` are interpreted as indices into the supplied `signals`
+    /// slice.
     pub fn signal(&self, signals: &[Pod5Signal]) -> io::Result<Vec<i16>> {
-        let total = self
-            .signal_rows
-            .iter()
-            .filter_map(|&index| signals.get(index as usize))
-            .map(|signal| signal.samples as usize)
-            .sum();
+        let total = usize::try_from(self.num_samples)
+            .map_err(|_| invalid_data("POD5 read sample count exceeds usize"))?;
         let mut samples = Vec::with_capacity(total);
 
         for &index in &self.signal_rows {
             let signal = signals
                 .get(index as usize)
                 .ok_or_else(|| invalid_data("POD5 signal row index is out of bounds"))?;
+            if signal.read_id != self.read_id {
+                return Err(invalid_data("POD5 signal row read_id does not match read"));
+            }
             samples.extend(signal.decompress()?);
+        }
+
+        if samples.len() != total {
+            return Err(invalid_data(
+                "POD5 read num_samples does not match referenced signal rows",
+            ));
         }
 
         Ok(samples)
@@ -476,17 +751,76 @@ impl Pod5Signal {
     }
 
     /// Encodes this row's samples as a VBZ-compressed signal blob.
+    ///
+    /// Existing VBZ payloads are decompressed before recompression.
     pub fn compress(&self) -> io::Result<Vec<u8>> {
         compress_vbz_signal(&self.decompress()?)
     }
 }
 
-/// Iterator over records from a [`Pod5Reader`].
-pub struct Pod5Records<'a, R: Read> {
+impl<'a> Pod5SignalCache<'a> {
+    /// Creates a cache over Signal table rows.
+    pub fn new(signals: &'a [Pod5Signal]) -> Self {
+        Self {
+            signals,
+            decoded_cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Decompresses one Signal row by zero-based row index, reusing cached
+    /// samples on subsequent calls.
+    pub fn signal_row(&self, row: u64) -> io::Result<Vec<i16>> {
+        if let Some(samples) = self.decoded_cache.borrow().get(&row) {
+            return Ok(samples.clone());
+        }
+
+        let signal = self
+            .signals
+            .get(row as usize)
+            .ok_or_else(|| invalid_data("POD5 signal row index is out of bounds"))?;
+        let samples = signal.decompress()?;
+        self.decoded_cache.borrow_mut().insert(row, samples.clone());
+        Ok(samples)
+    }
+
+    /// Decompresses and concatenates signal rows referenced by a read record.
+    pub fn signal_for_record(&self, record: &Pod5Record) -> io::Result<Vec<i16>> {
+        let total = usize::try_from(record.num_samples)
+            .map_err(|_| invalid_data("POD5 read sample count exceeds usize"))?;
+        let mut samples = Vec::with_capacity(total);
+
+        for &row in &record.signal_rows {
+            let signal = self
+                .signals
+                .get(row as usize)
+                .ok_or_else(|| invalid_data("POD5 signal row index is out of bounds"))?;
+            if signal.read_id != record.read_id {
+                return Err(invalid_data("POD5 signal row read_id does not match read"));
+            }
+            samples.extend(self.signal_row(row)?);
+        }
+
+        if samples.len() != total {
+            return Err(invalid_data(
+                "POD5 read num_samples does not match referenced signal rows",
+            ));
+        }
+
+        Ok(samples)
+    }
+
+    /// Returns the number of signal rows currently cached.
+    pub fn cached_row_count(&self) -> usize {
+        self.decoded_cache.borrow().len()
+    }
+}
+
+/// Iterator over read records from a [`Pod5Reader`].
+pub struct Pod5Records<'a, R: Read + Seek> {
     reader: &'a mut Pod5Reader<R>,
 }
 
-impl<R: Read> Iterator for Pod5Records<'_, R> {
+impl<R: Read + Seek> Iterator for Pod5Records<'_, R> {
     type Item = io::Result<Pod5Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -521,6 +855,626 @@ impl Pod5Header {
             .map(|section| section.row_count)
             .sum()
     }
+}
+
+type SharedReader<R> = Rc<RefCell<R>>;
+
+#[derive(Clone)]
+struct SectionReader<R: Read + Seek> {
+    reader: SharedReader<R>,
+    offset: u64,
+    length: u64,
+    position: u64,
+}
+
+impl<R: Read + Seek> SectionReader<R> {
+    fn new(reader: SharedReader<R>, section: &Pod5Section) -> Self {
+        Self {
+            reader,
+            offset: section.offset,
+            length: section.length,
+            position: 0,
+        }
+    }
+}
+
+impl<R: Read + Seek> Read for SectionReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.position >= self.length {
+            return Ok(0);
+        }
+
+        let remaining = usize::try_from(self.length - self.position)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        let mut reader = self.reader.borrow_mut();
+        reader.seek(SeekFrom::Start(self.offset + self.position))?;
+        let bytes = reader.read(&mut buf[..remaining])?;
+        self.position += bytes as u64;
+        Ok(bytes)
+    }
+}
+
+impl<R: Read + Seek> Seek for SectionReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let base = match pos {
+            SeekFrom::Start(position) => position as i128,
+            SeekFrom::End(offset) => self.length as i128 + offset as i128,
+            SeekFrom::Current(offset) => self.position as i128 + offset as i128,
+        };
+
+        if base < 0 || base > self.length as i128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "POD5 section seek is out of bounds",
+            ));
+        }
+
+        self.position = base as u64;
+        Ok(self.position)
+    }
+}
+
+struct Pod5SignalCursor<R: Read + Seek> {
+    shared: SharedReader<R>,
+    sections: Vec<Pod5Section>,
+    section_index: usize,
+    reader: Option<FileReader<SectionReader<R>>>,
+    buffer: VecDeque<Pod5Signal>,
+    decoded_cache: HashMap<u64, CachedSignalSamples>,
+    next_row: u64,
+}
+
+#[derive(Clone)]
+struct CachedSignalSamples {
+    read_id: String,
+    samples: Vec<i16>,
+}
+
+impl<R: Read + Seek> Pod5SignalCursor<R> {
+    fn new(shared: SharedReader<R>, sections: Vec<Pod5Section>) -> Self {
+        Self {
+            shared,
+            sections,
+            section_index: 0,
+            reader: None,
+            buffer: VecDeque::new(),
+            decoded_cache: HashMap::new(),
+            next_row: 0,
+        }
+    }
+
+    fn restart(&mut self) {
+        self.section_index = 0;
+        self.reader = None;
+        self.buffer.clear();
+        self.next_row = 0;
+    }
+
+    fn signal_row_at(&mut self, row: u64) -> io::Result<Pod5Signal> {
+        if row < self.next_row {
+            self.restart();
+        }
+
+        while let Some(signal) = self.read_next_signal()? {
+            let index = self.next_row - 1;
+            if index == row {
+                return Ok(signal);
+            }
+        }
+
+        Err(invalid_data("POD5 signal row index is out of bounds"))
+    }
+
+    fn signal_samples_at(&mut self, row: u64) -> io::Result<CachedSignalSamples> {
+        if let Some(cached) = self.decoded_cache.get(&row) {
+            return Ok(cached.clone());
+        }
+
+        let signal = self.signal_row_at(row)?;
+        let samples = signal.decompress()?;
+        let cached = CachedSignalSamples {
+            read_id: signal.read_id,
+            samples,
+        };
+        self.decoded_cache.insert(row, cached.clone());
+        Ok(cached)
+    }
+
+    fn read_next_signal(&mut self) -> io::Result<Option<Pod5Signal>> {
+        loop {
+            if let Some(signal) = self.buffer.pop_front() {
+                self.next_row += 1;
+                return Ok(Some(signal));
+            }
+
+            let Some(batch) = self.next_signal_batch()? else {
+                return Ok(None);
+            };
+            self.buffer.extend(parse_signal_batch(&batch)?);
+        }
+    }
+
+    fn next_signal_batch(&mut self) -> io::Result<Option<RecordBatch>> {
+        loop {
+            if let Some(reader) = &mut self.reader {
+                match reader.next() {
+                    Some(Ok(batch)) => return Ok(Some(batch)),
+                    Some(Err(error)) => return Err(arrow_error(error)),
+                    None => {
+                        self.reader = None;
+                        self.section_index += 1;
+                    }
+                }
+            } else if let Some(section) = self.sections.get(self.section_index) {
+                self.reader = Some(open_arrow_reader(self.shared.clone(), section)?);
+            } else {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+fn open_arrow_reader<R: Read + Seek>(
+    shared: SharedReader<R>,
+    section: &Pod5Section,
+) -> io::Result<FileReader<SectionReader<R>>> {
+    FileReader::try_new(SectionReader::new(shared, section), None).map_err(arrow_error)
+}
+
+fn inspect_pod5<R: Read + Seek>(
+    shared: SharedReader<R>,
+) -> io::Result<(Pod5Header, Vec<Pod5RunInfo>)> {
+    let file_len = shared.borrow_mut().seek(SeekFrom::End(0))?;
+    if file_len < 8 + 16 + 8 + 16 + 8 {
+        return Err(invalid_data("POD5 file is too short"));
+    }
+
+    let magic = slice_to_array::<8>(&read_exact_at(shared.clone(), 0, 8)?);
+    if &magic != POD5_MAGIC {
+        return Err(invalid_data("invalid POD5 leading magic"));
+    }
+
+    let trailing_magic = read_exact_at(shared.clone(), file_len - 8, 8)?;
+    if trailing_magic.as_slice() != POD5_MAGIC {
+        return Err(invalid_data("invalid POD5 trailing magic"));
+    }
+
+    let section_marker = slice_to_array::<16>(&read_exact_at(shared.clone(), 8, 16)?);
+    let final_marker_offset = file_len - 8 - 16;
+    let final_marker = read_exact_at(shared.clone(), final_marker_offset, 16)?;
+    if final_marker.as_slice() != section_marker {
+        return Err(invalid_data("POD5 final section marker is missing"));
+    }
+
+    let footer_len_offset = final_marker_offset - 8;
+    let footer_len = i64::from_le_bytes(slice_to_array::<8>(&read_exact_at(
+        shared.clone(),
+        footer_len_offset,
+        8,
+    )?));
+    if footer_len < 0 {
+        return Err(invalid_data("POD5 footer length is negative"));
+    }
+    let footer_len = footer_len as u64;
+    let footer_payload_start = footer_len_offset
+        .checked_sub(footer_len)
+        .ok_or_else(|| invalid_data("POD5 footer length exceeds file"))?;
+    let footer_magic_start = footer_payload_start
+        .checked_sub(POD5_FOOTER_MAGIC.len() as u64)
+        .ok_or_else(|| invalid_data("POD5 footer magic offset is malformed"))?;
+
+    let footer_magic = read_exact_at(shared.clone(), footer_magic_start, POD5_FOOTER_MAGIC.len())?;
+    if footer_magic.as_slice() != POD5_FOOTER_MAGIC {
+        return Err(invalid_data("POD5 footer magic is missing"));
+    }
+
+    let footer_padding = read_exact_at(shared.clone(), footer_payload_start, footer_len as usize)?;
+    let footer = parse_pod5_footer(&footer_padding)?;
+    let mut sections = Vec::with_capacity(footer.entries.len() + 1);
+    let mut run_infos = Vec::new();
+    let mut metadata = Pod5Metadata {
+        file_identifier: footer.file_identifier.clone(),
+        software: footer.software.clone(),
+        pod5_version: footer.pod5_version.clone(),
+    };
+
+    for entry in &footer.entries {
+        let offset = u64::try_from(entry.offset)
+            .map_err(|_| invalid_data("POD5 embedded file offset is negative"))?;
+        let length = u64::try_from(entry.length)
+            .map_err(|_| invalid_data("POD5 embedded file length is negative"))?;
+        if length == 0 {
+            return Err(invalid_data("POD5 embedded file is empty"));
+        }
+        let padded_length = checked_padded_len(length)?;
+        let preceding_marker = offset
+            .checked_sub(16)
+            .ok_or_else(|| invalid_data("POD5 embedded file offset is malformed"))?;
+        let following_marker = offset
+            .checked_add(padded_length)
+            .ok_or_else(|| invalid_data("POD5 embedded file length overflow"))?;
+
+        if read_exact_at(shared.clone(), preceding_marker, 16)?.as_slice() != section_marker {
+            return Err(invalid_data("POD5 section marker is malformed"));
+        }
+        if read_exact_at(shared.clone(), following_marker, 16)?.as_slice() != section_marker {
+            return Err(invalid_data("POD5 section marker is malformed"));
+        }
+        if following_marker > footer_magic_start {
+            return Err(invalid_data("POD5 embedded file overlaps footer"));
+        }
+        if padded_length > length {
+            let padding = read_exact_at(
+                shared.clone(),
+                offset + length,
+                usize::try_from(padded_length - length)
+                    .map_err(|_| invalid_data("POD5 section padding exceeds usize"))?,
+            )?;
+            if !padding.iter().all(|byte| *byte == 0) {
+                return Err(invalid_data("POD5 Arrow section padding is not zeroed"));
+            }
+        }
+
+        let mut arrow_reader = FileReader::try_new(
+            SectionReader {
+                reader: shared.clone(),
+                offset,
+                length,
+                position: 0,
+            },
+            None,
+        )
+        .map_err(arrow_error)?;
+        update_metadata(arrow_reader.custom_metadata(), &mut metadata)?;
+        let schema = arrow_reader.schema();
+        let kind = infer_section_kind(&schema);
+        let footer_kind = section_kind_from_footer_content_type(entry.content_type);
+        if footer_kind != Pod5SectionKind::Unknown && kind != footer_kind {
+            return Err(invalid_data(
+                "POD5 footer content type does not match Arrow schema",
+            ));
+        }
+        let row_count = arrow_section_row_count(shared.clone(), offset, length)?;
+
+        if kind == Pod5SectionKind::RunInfo {
+            for batch in &mut arrow_reader {
+                run_infos.extend(parse_run_info_batch(&batch.map_err(arrow_error)?)?);
+            }
+        }
+
+        sections.push(Pod5Section {
+            kind,
+            offset,
+            length,
+            padded_length,
+            row_count,
+        });
+    }
+
+    sections.push(Pod5Section {
+        kind: Pod5SectionKind::Footer,
+        offset: footer_magic_start,
+        length: footer_len,
+        padded_length: final_marker_offset - footer_magic_start,
+        row_count: 0,
+    });
+
+    if sections
+        .iter()
+        .all(|section| section.kind != Pod5SectionKind::Reads)
+    {
+        return Err(invalid_data("POD5 Reads table is missing"));
+    }
+    if sections
+        .iter()
+        .all(|section| section.kind != Pod5SectionKind::Signal)
+    {
+        return Err(invalid_data("POD5 Signal table is missing"));
+    }
+    if sections
+        .iter()
+        .all(|section| section.kind != Pod5SectionKind::RunInfo)
+    {
+        return Err(invalid_data("POD5 Run Info table is missing"));
+    }
+
+    let header = Pod5Header {
+        magic,
+        section_marker,
+        sections,
+        file_identifier: metadata.file_identifier,
+        software: metadata.software,
+        pod5_version: metadata.pod5_version,
+    };
+
+    Ok((header, run_infos))
+}
+
+#[derive(Debug)]
+struct ParsedPod5Footer {
+    file_identifier: Option<String>,
+    software: Option<String>,
+    pod5_version: Option<String>,
+    entries: Vec<Pod5FooterEntry>,
+}
+
+fn parse_pod5_footer(data: &[u8]) -> io::Result<ParsedPod5Footer> {
+    let table = fb_root_table(data)?;
+    let file_identifier = fb_string_field(data, table, 4)?;
+    let software = fb_string_field(data, table, 6)?;
+    let pod5_version = fb_string_field(data, table, 8)?;
+    let mut entries = Vec::new();
+
+    for entry_table in fb_table_vector_field(data, table, 10)? {
+        entries.push(Pod5FooterEntry {
+            offset: fb_i64_field(data, entry_table, 4)?
+                .ok_or_else(|| invalid_data("POD5 footer embedded file offset is missing"))?,
+            length: fb_i64_field(data, entry_table, 6)?
+                .ok_or_else(|| invalid_data("POD5 footer embedded file length is missing"))?,
+            content_type: fb_i16_field(data, entry_table, 10)?.unwrap_or_default(),
+        });
+    }
+
+    Ok(ParsedPod5Footer {
+        file_identifier,
+        software,
+        pod5_version,
+        entries,
+    })
+}
+
+fn section_kind_from_footer_content_type(content_type: i16) -> Pod5SectionKind {
+    match content_type {
+        0 => Pod5SectionKind::Reads,
+        1 => Pod5SectionKind::Signal,
+        4 => Pod5SectionKind::RunInfo,
+        _ => Pod5SectionKind::Unknown,
+    }
+}
+
+fn arrow_section_row_count<R: Read + Seek>(
+    shared: SharedReader<R>,
+    offset: u64,
+    length: u64,
+) -> io::Result<usize> {
+    let footer = read_arrow_footer(shared.clone(), offset, length)?;
+    let footer = root_as_footer(&footer)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let Some(blocks) = footer.recordBatches() else {
+        return Ok(0);
+    };
+
+    let mut total = 0usize;
+    for block in blocks {
+        let metadata_len = usize::try_from(block.metaDataLength())
+            .map_err(|_| invalid_data("Arrow block metadata length is negative"))?;
+        let block_offset = u64::try_from(block.offset())
+            .map_err(|_| invalid_data("Arrow block offset is negative"))?;
+        let metadata = read_exact_at(shared.clone(), offset + block_offset, metadata_len)?;
+        let message = parse_arrow_message(&metadata)?;
+        if message.header_type() != MessageHeader::RecordBatch {
+            continue;
+        }
+        let header = message
+            .header()
+            .ok_or_else(|| invalid_data("Arrow record batch message is missing header"))?;
+        let batch = unsafe { arrow_ipc::RecordBatch::init_from_table(header) };
+        let rows = usize::try_from(batch.length())
+            .map_err(|_| invalid_data("Arrow record batch length is negative"))?;
+        total = total
+            .checked_add(rows)
+            .ok_or_else(|| invalid_data("Arrow record batch row count overflow"))?;
+    }
+
+    Ok(total)
+}
+
+fn read_arrow_footer<R: Read + Seek>(
+    shared: SharedReader<R>,
+    offset: u64,
+    length: u64,
+) -> io::Result<Vec<u8>> {
+    if length < 10 {
+        return Err(invalid_data("embedded Arrow file is too short"));
+    }
+
+    let trailer = read_exact_at(shared.clone(), offset + length - 10, 10)?;
+    if trailer[4..] != ARROW_MAGIC[..] {
+        return Err(invalid_data(
+            "embedded Arrow file is missing trailing magic",
+        ));
+    }
+
+    let footer_len = i32::from_le_bytes(slice_to_array::<4>(&trailer[..4]));
+    if footer_len < 0 {
+        return Err(invalid_data("Arrow footer length is negative"));
+    }
+    let footer_len = footer_len as u64;
+    if footer_len > length - 10 {
+        return Err(invalid_data("Arrow footer length exceeds section"));
+    }
+
+    read_exact_at(
+        shared,
+        offset + length - 10 - footer_len,
+        usize::try_from(footer_len)
+            .map_err(|_| invalid_data("Arrow footer length exceeds usize"))?,
+    )
+}
+
+fn parse_arrow_message(data: &[u8]) -> io::Result<arrow_ipc::Message<'_>> {
+    if data.len() < 4 {
+        return Err(invalid_data("Arrow message is truncated"));
+    }
+
+    let message = if data[..4] == [0xff; 4] {
+        if data.len() < 8 {
+            return Err(invalid_data("Arrow continuation message is truncated"));
+        }
+        &data[8..]
+    } else {
+        &data[4..]
+    };
+
+    root_as_message(message)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn read_exact_at<R: Read + Seek>(
+    shared: SharedReader<R>,
+    offset: u64,
+    len: usize,
+) -> io::Result<Vec<u8>> {
+    let mut data = vec![0; len];
+    let mut reader = shared.borrow_mut();
+    reader.seek(SeekFrom::Start(offset))?;
+    reader.read_exact(&mut data)?;
+    Ok(data)
+}
+
+fn checked_padded_len(length: u64) -> io::Result<u64> {
+    length
+        .checked_add((8 - length % 8) % 8)
+        .ok_or_else(|| invalid_data("POD5 padded section length overflow"))
+}
+
+fn fb_root_table(data: &[u8]) -> io::Result<usize> {
+    let offset = fb_u32_at(data, 0)? as usize;
+    if offset >= data.len() {
+        return Err(invalid_data("POD5 footer root table is out of bounds"));
+    }
+    Ok(offset)
+}
+
+fn fb_table_vector_field(data: &[u8], table: usize, slot: u16) -> io::Result<Vec<usize>> {
+    let Some(field) = fb_field_position(data, table, slot)? else {
+        return Ok(Vec::new());
+    };
+    let vector = fb_uoffset_target(data, field)?;
+    let len = fb_u32_at(data, vector)? as usize;
+    let mut tables = Vec::with_capacity(len);
+    let elements = vector
+        .checked_add(4)
+        .ok_or_else(|| invalid_data("FlatBuffer vector offset overflow"))?;
+
+    for index in 0..len {
+        let element = elements
+            .checked_add(
+                index
+                    .checked_mul(4)
+                    .ok_or_else(|| invalid_data("FlatBuffer vector offset overflow"))?,
+            )
+            .ok_or_else(|| invalid_data("FlatBuffer vector offset overflow"))?;
+        tables.push(fb_uoffset_target(data, element)?);
+    }
+
+    Ok(tables)
+}
+
+fn fb_string_field(data: &[u8], table: usize, slot: u16) -> io::Result<Option<String>> {
+    let Some(field) = fb_field_position(data, table, slot)? else {
+        return Ok(None);
+    };
+    let string = fb_uoffset_target(data, field)?;
+    let len = fb_u32_at(data, string)? as usize;
+    let start = string
+        .checked_add(4)
+        .ok_or_else(|| invalid_data("FlatBuffer string offset overflow"))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| invalid_data("FlatBuffer string length overflow"))?;
+    let bytes = data
+        .get(start..end)
+        .ok_or_else(|| invalid_data("FlatBuffer string is out of bounds"))?;
+
+    String::from_utf8(bytes.to_vec())
+        .map(Some)
+        .map_err(|_| invalid_data("FlatBuffer string is not valid UTF-8"))
+}
+
+fn fb_i64_field(data: &[u8], table: usize, slot: u16) -> io::Result<Option<i64>> {
+    let Some(position) = fb_field_position(data, table, slot)? else {
+        return Ok(None);
+    };
+    Ok(Some(i64::from_le_bytes(slice_to_array::<8>(
+        data.get(position..position + 8)
+            .ok_or_else(|| invalid_data("FlatBuffer i64 is out of bounds"))?,
+    ))))
+}
+
+fn fb_i16_field(data: &[u8], table: usize, slot: u16) -> io::Result<Option<i16>> {
+    let Some(position) = fb_field_position(data, table, slot)? else {
+        return Ok(None);
+    };
+    Ok(Some(i16::from_le_bytes(slice_to_array::<2>(
+        data.get(position..position + 2)
+            .ok_or_else(|| invalid_data("FlatBuffer i16 is out of bounds"))?,
+    ))))
+}
+
+fn fb_field_position(data: &[u8], table: usize, slot: u16) -> io::Result<Option<usize>> {
+    let vtable = fb_vtable_position(data, table)?;
+    let vtable_len = fb_u16_at(data, vtable)?;
+    if slot.saturating_add(2) > vtable_len {
+        return Ok(None);
+    }
+    let field_offset = fb_u16_at(data, vtable + slot as usize)?;
+    if field_offset == 0 {
+        return Ok(None);
+    }
+    let position = table
+        .checked_add(field_offset as usize)
+        .ok_or_else(|| invalid_data("FlatBuffer field offset overflow"))?;
+    if position >= data.len() {
+        return Err(invalid_data("FlatBuffer field is out of bounds"));
+    }
+    Ok(Some(position))
+}
+
+fn fb_vtable_position(data: &[u8], table: usize) -> io::Result<usize> {
+    let offset = fb_i32_at(data, table)? as isize;
+    let vtable = table as isize - offset;
+    if vtable < 0 {
+        return Err(invalid_data("FlatBuffer vtable is out of bounds"));
+    }
+    let vtable = vtable as usize;
+    if vtable >= data.len() {
+        return Err(invalid_data("FlatBuffer vtable is out of bounds"));
+    }
+    Ok(vtable)
+}
+
+fn fb_uoffset_target(data: &[u8], position: usize) -> io::Result<usize> {
+    let offset = fb_u32_at(data, position)? as usize;
+    let target = position
+        .checked_add(offset)
+        .ok_or_else(|| invalid_data("FlatBuffer offset overflow"))?;
+    if target >= data.len() {
+        return Err(invalid_data("FlatBuffer offset is out of bounds"));
+    }
+    Ok(target)
+}
+
+fn fb_u16_at(data: &[u8], position: usize) -> io::Result<u16> {
+    Ok(u16::from_le_bytes(slice_to_array::<2>(
+        data.get(position..position + 2)
+            .ok_or_else(|| invalid_data("FlatBuffer u16 is out of bounds"))?,
+    )))
+}
+
+fn fb_u32_at(data: &[u8], position: usize) -> io::Result<u32> {
+    Ok(u32::from_le_bytes(slice_to_array::<4>(
+        data.get(position..position + 4)
+            .ok_or_else(|| invalid_data("FlatBuffer u32 is out of bounds"))?,
+    )))
+}
+
+fn fb_i32_at(data: &[u8], position: usize) -> io::Result<i32> {
+    Ok(i32::from_le_bytes(slice_to_array::<4>(
+        data.get(position..position + 4)
+            .ok_or_else(|| invalid_data("FlatBuffer i32 is out of bounds"))?,
+    )))
 }
 
 fn encode_pod5(pod5: &Pod5) -> io::Result<Vec<u8>> {
@@ -647,6 +1601,7 @@ struct Pod5WriterMetadata {
     pod5_version: String,
 }
 
+#[derive(Debug)]
 struct Pod5FooterEntry {
     offset: i64,
     length: i64,
@@ -1375,6 +2330,10 @@ fn update_metadata(
     arrow_metadata: &std::collections::HashMap<String, String>,
     metadata: &mut Pod5Metadata,
 ) -> io::Result<()> {
+    if let Some(version) = arrow_metadata.get("MINKNOW:pod5_version") {
+        validate_pod5_version(version)?;
+    }
+
     merge_metadata(
         &mut metadata.file_identifier,
         arrow_metadata.get("MINKNOW:file_identifier"),
@@ -1390,6 +2349,21 @@ fn update_metadata(
         arrow_metadata.get("MINKNOW:pod5_version"),
         "MINKNOW:pod5_version",
     )?;
+
+    Ok(())
+}
+
+fn validate_pod5_version(version: &str) -> io::Result<()> {
+    let parts = version.split('.').collect::<Vec<_>>();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(invalid_data(format!(
+            "MINKNOW:pod5_version must be semantic major.minor.patch, got {version}"
+        )));
+    }
 
     Ok(())
 }
@@ -1585,12 +2559,12 @@ fn uuid_string_to_bytes(value: &str) -> io::Result<[u8; 16]> {
 
 /// Compresses raw int16 ADC samples into a POD5 VBZ signal blob.
 ///
-/// The local transform is:
+/// The transform implemented here is:
 ///
 /// 1. first-order delta encode with wrapping `i16` subtraction,
 /// 2. zigzag encode signed deltas into `u16`,
 /// 3. SVB16 encode with one control bit per value, LSB first,
-/// 4. zstd-compress the SVB16 byte stream at the POD5-compatible level.
+/// 4. zstd-compress the SVB16 byte stream at level 1.
 pub fn compress_vbz_signal(samples: &[i16]) -> io::Result<Vec<u8>> {
     if samples.is_empty() {
         return Ok(Vec::new());
@@ -1602,6 +2576,9 @@ pub fn compress_vbz_signal(samples: &[i16]) -> io::Result<Vec<u8>> {
 }
 
 /// Decompresses a POD5 VBZ signal blob into raw int16 ADC samples.
+///
+/// `num_samples` is required because the SVB16 control stream length is derived
+/// from the expected number of samples.
 pub fn decompress_vbz_signal(data: &[u8], num_samples: usize) -> io::Result<Vec<i16>> {
     if num_samples == 0 {
         if data.is_empty() {
@@ -1703,19 +2680,52 @@ fn arrow_error(error: ArrowError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
-fn invalid_data(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    Error::invalid(Format::Pod5, message).into()
 }
 
 #[cfg(test)]
 mod pod5_tests {
     use super::*;
+    use std::cell::Cell;
 
     const A_100_POD5: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/A_100.pod5");
     const RECORD_COUNT: usize = 100;
     const FIRST_READ_ID: &str = "1cadb1e9-592f-4e22-9285-4626f2b7da9f";
     const LAST_READ_ID: &str = "6ae6c2e9-fe1a-4b1d-befb-ac98a5a16c9a";
     const RUN_ID: &str = "1f03c20c2da347cc99b58b232181a7464126f4cb";
+
+    struct CountingReadSeek<R> {
+        inner: R,
+        bytes_read: Rc<Cell<u64>>,
+    }
+
+    impl<R> CountingReadSeek<R> {
+        fn new(inner: R) -> (Self, Rc<Cell<u64>>) {
+            let bytes_read = Rc::new(Cell::new(0));
+            (
+                Self {
+                    inner,
+                    bytes_read: bytes_read.clone(),
+                },
+                bytes_read,
+            )
+        }
+    }
+
+    impl<R: Read> Read for CountingReadSeek<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let bytes = self.inner.read(buf)?;
+            self.bytes_read.set(self.bytes_read.get() + bytes as u64);
+            Ok(bytes)
+        }
+    }
+
+    impl<R: Seek> Seek for CountingReadSeek<R> {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
 
     fn assert_records_equivalent(actual: &[Pod5Record], expected: &[Pod5Record]) {
         assert_eq!(actual.len(), expected.len());
@@ -1786,7 +2796,6 @@ mod pod5_tests {
         assert_eq!(reader.header.pod5_version.as_deref(), Some("0.3.28"));
         assert_eq!(reader.run_infos[0].acquisition_id, RUN_ID);
         assert_eq!(reader.run_infos[0].sample_rate, 5000);
-        assert_eq!(reader.signals.len(), RECORD_COUNT);
 
         let first = reader.read_record().unwrap().unwrap();
         assert_eq!(first.read_id, FIRST_READ_ID);
@@ -1802,7 +2811,7 @@ mod pod5_tests {
         assert_eq!(first.run_info, RUN_ID);
         assert_eq!(first.signal_rows, vec![0]);
 
-        let signal = first.signal(&reader.signals).unwrap();
+        let signal = reader.signal_for_record(&first).unwrap();
         assert_eq!(signal.len(), first.num_samples as usize);
         assert_eq!(
             &signal[..20],
@@ -1822,6 +2831,38 @@ mod pod5_tests {
         assert_eq!(count, RECORD_COUNT);
         assert_eq!(last.read_id, LAST_READ_ID);
         assert!(reader.read_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn reader_from_seekable_source_does_not_buffer_entire_file() {
+        let file = File::open(A_100_POD5).expect("fixture should open");
+        let file_len = file.metadata().unwrap().len();
+        let (file, bytes_read) = CountingReadSeek::new(file);
+        let mut reader = Pod5Reader::from_reader(file).unwrap();
+
+        assert!(
+            bytes_read.get() < file_len,
+            "Pod5Reader construction read {} bytes from a {file_len}-byte file",
+            bytes_read.get()
+        );
+
+        let first = reader.read_record().unwrap().unwrap();
+        assert_eq!(first.read_id, FIRST_READ_ID);
+    }
+
+    #[test]
+    fn reader_caches_decompressed_signal_rows() {
+        let file = File::open(A_100_POD5).expect("fixture should open");
+        let (file, bytes_read) = CountingReadSeek::new(file);
+        let mut reader = Pod5Reader::from_reader(file).unwrap();
+        let first = reader.read_record().unwrap().unwrap();
+
+        let signal = reader.signal_for_record(&first).unwrap();
+        let bytes_after_first_signal = bytes_read.get();
+        let cached_signal = reader.signal_for_record(&first).unwrap();
+
+        assert_eq!(cached_signal, signal);
+        assert_eq!(bytes_read.get(), bytes_after_first_signal);
     }
 
     #[test]

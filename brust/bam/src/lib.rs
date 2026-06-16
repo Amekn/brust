@@ -1,23 +1,29 @@
-//! Minimal BAM parsing primitives.
+//! BAM reader and writer primitives.
 //!
-//! The crate exposes two ownership models:
+//! The crate exposes both streaming and materialized APIs:
 //!
-//! - [`BamReader`] is a streaming parser over a compressed BAM byte stream. It
-//!   owns decoder state and is intentionally not [`Clone`].
-//! - [`Bam`] is a fully materialized BAM payload containing the header,
-//!   references, and records. It is [`Clone`] for deep-copy workflows.
+//! - [`BamReader`] reads a gzip-compatible BAM stream, parses the binary header
+//!   and reference dictionary up front, then returns one [`BamRecord`] at a
+//!   time.
+//! - [`Bam`] owns the header, references, and every parsed record and can be
+//!   cloned or written back out.
 //!
-//! Positions in record fields follow the BAM binary format: alignment positions
-//! are zero-based and unmapped positions are represented as `-1`.
+//! Record fields follow the BAM binary layout. Alignment positions are
+//! zero-based, unmapped positions are represented as `-1`, CIGAR and sequence
+//! data remain packed in the record, and helper methods expose SAM-style
+//! strings when needed. The writer serializes the stored BAM structures into
+//! BGZF blocks and validates internal lengths before emitting records.
 
-use flate2::read::MultiGzDecoder;
+use brust_core::{Error, Format};
+use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use flate2::{Compression, Crc};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
-/// A fully materialized BAM file.
+/// A fully materialized BAM payload.
 ///
 /// `Bam` owns its header, references, and all records, so cloning this type
 /// performs a deep copy of the parsed BAM data.
@@ -31,47 +37,100 @@ pub struct Bam {
     pub records: Vec<BamRecord>,
 }
 
-/// Streaming BAM parser over a BGZF/gzip-compressed reader.
+/// Streaming BAM parser over a gzip-compatible BAM reader.
 ///
-/// `BamReader` owns an active decoder and file/reader cursor, so it is not
-/// cloneable. Use [`BamReader::read_all`] or [`Bam::from_path`] when a deep
-/// copyable, materialized representation is needed.
+/// BAM files are normally BGZF, which is compatible with multi-member gzip
+/// decoding. `BamReader` owns the active decoder and parser cursor, so it is
+/// intentionally not cloneable. Use [`BamReader::read_all`] or
+/// [`Bam::from_path`] when a cloneable, in-memory representation is needed.
 pub struct BamReader<R: Read = File> {
     /// BAM header metadata and SAM header text.
     pub header: BamHeader,
     /// Reference sequence dictionary.
     pub refs: Vec<BamRef>,
-    reader: BufReader<MultiGzDecoder<R>>,
+    reader: BgzfReader<R>,
 }
 
 /// Streaming BAM writer over any writable byte stream.
 ///
-/// `BamWriter` writes BAM binary data in BGZF blocks. Use
-/// [`BamWriter::write_all`] for a materialized [`Bam`] value, or write a header
-/// and then stream records manually.
+/// `BamWriter` writes BAM binary data in BGZF blocks and appends the standard
+/// BGZF EOF block from [`BamWriter::finish`]. Use [`BamWriter::write_all`] for
+/// a materialized [`Bam`], or write a header and then stream records manually.
 pub struct BamWriter<W: Write = File> {
     writer: W,
     pending: Vec<u8>,
     header_written: bool,
 }
 
-/// BAM header information.
+/// Packed BGZF virtual offset (`compressed_block_offset << 16 | block_offset`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BgzfVirtualOffset(u64);
+
+impl BgzfVirtualOffset {
+    /// Creates a virtual offset from a compressed block start and uncompressed
+    /// offset within that block.
+    pub fn new(compressed_offset: u64, uncompressed_offset: u16) -> Self {
+        Self((compressed_offset << 16) | u64::from(uncompressed_offset))
+    }
+
+    /// Creates a virtual offset from its packed `u64` representation.
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the packed `u64` representation.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Returns the compressed BGZF block start offset.
+    pub fn compressed_offset(self) -> u64 {
+        self.0 >> 16
+    }
+
+    /// Returns the uncompressed offset inside the BGZF block.
+    pub fn uncompressed_offset(self) -> u16 {
+        (self.0 & 0xffff) as u16
+    }
+}
+
+/// BAM record paired with the BGZF virtual offset where the record begins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionedBamRecord {
+    /// Virtual offset of the record's `block_size` field.
+    pub virtual_offset: BgzfVirtualOffset,
+    /// Parsed BAM alignment record.
+    pub record: BamRecord,
+}
+
+/// Reader for BGZF blocks with virtual-offset tracking.
+pub struct BgzfReader<R: Read> {
+    inner: R,
+    buffer: Vec<u8>,
+    position: usize,
+    current_block_start: u64,
+    next_block_start: u64,
+    eof: bool,
+}
+
+/// BAM header information from the binary file header.
 ///
-/// Contains the BAM magic bytes, SAM header text length, SAM header text, and
-/// reference count.
+/// The parsed `text` field is the SAM header text with trailing NUL padding
+/// removed. The original `l_text` value is preserved and is used by the writer
+/// when it is non-zero.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BamHeader {
     /// BAM magic bytes, always `[0x42, 0x41, 0x4D, 0x01]`.
     pub magic: [u8; 4],
     /// Length of the SAM header text in bytes, including any NUL padding.
     pub l_text: u32,
-    /// Plain SAM header text; not necessarily NUL-terminated in the file.
+    /// SAM header text with trailing NUL padding removed.
     pub text: String,
     /// Number of reference sequences in the BAM reference dictionary.
     pub n_ref: u32,
 }
 
-/// Reference sequence information.
+/// Reference sequence dictionary entry.
 ///
 /// Contains a reference sequence name and its declared sequence length.
 #[derive(Debug, Clone, PartialEq)]
@@ -91,16 +150,16 @@ pub struct BamRecord {
     pub fixed: BamRecordFixed,
     /// Variable-width read name, CIGAR, sequence, and quality fields.
     pub variable: BamRecordVariable,
-    /// Auxiliary tags following the core record payload.
+    /// Auxiliary tags following the core and variable-length record fields.
     pub auxiliary: Vec<BamRecordAuxiliary>,
 }
 
-/// Fixed-length fields of a BAM alignment record.
+/// Fixed-length core fields of a BAM alignment record.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BamRecordFixed {
     /// Total alignment record length, excluding the `block_size` field itself.
     pub block_size: u32,
-    /// Reference sequence ID, or `-1` for a read without a mapping position.
+    /// Reference sequence ID, or `-1` for an unmapped read.
     pub ref_id: i32,
     /// Zero-based leftmost coordinate, equal to SAM `POS - 1`.
     pub pos: i32,
@@ -118,7 +177,7 @@ pub struct BamRecordFixed {
     pub l_seq: u32,
     /// Reference ID of the next segment, or `-1` when absent.
     pub next_ref_id: i32,
-    /// Zero-based leftmost coordinate of the next segment.
+    /// Zero-based leftmost coordinate of the next segment, or `-1` when absent.
     pub next_pos: i32,
     /// Template length (`TLEN`).
     pub tlen: i32,
@@ -128,7 +187,8 @@ impl BamRecordFixed {
     /// Parses the fixed 32-byte BAM record core.
     ///
     /// `block_size` is the record length read from the stream, excluding the
-    /// four-byte `block_size` field itself. `data` begins at `refID`.
+    /// four-byte `block_size` field itself. `data` begins at `refID` and must
+    /// contain at least the fixed core bytes.
     pub fn new(block_size: u32, data: &[u8]) -> io::Result<Self> {
         if data.len() < 32 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "data too short"));
@@ -198,7 +258,7 @@ pub struct BamRecordVariable {
     pub cigar: Vec<u32>,
     /// Packed 4-bit BAM sequence bytes.
     pub seq: Vec<u8>,
-    /// Raw Phred-scaled base qualities.
+    /// Raw Phred-scaled base qualities, or `0xff` bytes when unavailable.
     pub qual: Vec<u8>,
 }
 
@@ -207,6 +267,7 @@ impl BamRecordVariable {
     ///
     /// `fixed` contains offsets and lengths from the fixed record core. `data`
     /// begins at `refID` and does not include the four-byte `block_size` field.
+    /// The returned offset points to the first auxiliary field.
     pub fn new(fixed: &BamRecordFixed, data: &[u8]) -> io::Result<(Self, usize)> {
         let mut offset = 32;
 
@@ -298,6 +359,9 @@ pub struct BamRecordAuxiliary {
 
 impl BamRecordAuxiliary {
     /// Parses one auxiliary field and advances `offset` past it.
+    ///
+    /// The parser validates value type tags and byte lengths while preserving
+    /// the two-byte auxiliary tag as stored.
     pub fn new(offset: &mut usize, data: &[u8]) -> io::Result<Self> {
         let tag = match data.get(*offset..*offset + 2) {
             Some(tag) => String::from_utf8_lossy(tag).to_string(),
@@ -449,7 +513,8 @@ impl BamRecordAuxiliary {
                 }
 
                 let s = String::from_utf8_lossy(&data[start..*offset]).to_string();
-                *offset += 1; // consume NUL
+                // Skip the NUL terminator stored in the BAM payload.
+                *offset += 1;
 
                 BamAuxValue::Z(s)
             }
@@ -469,7 +534,8 @@ impl BamRecordAuxiliary {
                 }
 
                 let s = String::from_utf8_lossy(&data[start..*offset]).to_string();
-                *offset += 1; // consume NUL
+                // Skip the NUL terminator stored in the BAM payload.
+                *offset += 1;
 
                 BamAuxValue::H(s)
             }
@@ -662,7 +728,7 @@ impl BamRecordAuxiliary {
 /// BAM auxiliary tag value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BamAuxValue {
-    /// Printable ASCII character (`A`).
+    /// Raw byte for an `A` auxiliary value.
     A(u8),
     /// Signed 8-bit integer (`c`).
     #[allow(non_camel_case_types)]
@@ -682,9 +748,9 @@ pub enum BamAuxValue {
     /// 32-bit floating point number (`f`).
     #[allow(non_camel_case_types)]
     f(f32),
-    /// NUL-terminated printable string (`Z`).
+    /// String value from a NUL-terminated `Z` payload, stored without the NUL.
     Z(String),
-    /// NUL-terminated hexadecimal string (`H`).
+    /// Hex string from a NUL-terminated `H` payload, stored without the NUL.
     H(String),
     /// Homogeneous numeric array (`B`).
     B(BamAuxArray),
@@ -717,7 +783,9 @@ impl BamRecord {
     /// Parses a BAM alignment record from raw payload bytes.
     ///
     /// `block_size` is not included in `data`. `data` begins at `refID` and
-    /// contains the full alignment record payload.
+    /// contains the full alignment record payload. The parser validates the
+    /// fixed/variable field boundaries and parses auxiliary fields until the end
+    /// of the payload.
     pub fn new(block_size: u32, data: Vec<u8>) -> io::Result<Self> {
         if block_size as usize != data.len() {
             return Err(io::Error::new(
@@ -785,6 +853,9 @@ impl BamRecord {
     }
 
     /// Decodes BAM quality bytes into a SAM-style quality string.
+    ///
+    /// If every stored quality byte is `0xff`, the unavailable-quality marker
+    /// `*` is returned.
     pub fn quality_string(&self) -> String {
         if self.variable.qual.iter().all(|quality| *quality == 0xff) {
             return "*".to_string();
@@ -803,6 +874,78 @@ impl BamRecord {
             .iter()
             .find(|auxiliary| auxiliary.tag == tag)
             .map(|auxiliary| &auxiliary.value)
+    }
+
+    /// Returns `true` when the multi-segment template flag (`0x1`) is set.
+    pub fn has_multiple_segments(&self) -> bool {
+        self.fixed.flag & sam::flags::MULTIPLE_SEGMENTS != 0
+    }
+
+    /// Returns `true` when the properly-aligned flag (`0x2`) is set.
+    pub fn is_properly_aligned(&self) -> bool {
+        self.fixed.flag & sam::flags::PROPERLY_ALIGNED != 0
+    }
+
+    /// Returns `true` when the segment-unmapped flag (`0x4`) is set.
+    pub fn is_unmapped(&self) -> bool {
+        self.fixed.flag & sam::flags::UNMAPPED != 0
+    }
+
+    /// Returns `true` when the mate/next-segment-unmapped flag (`0x8`) is set.
+    pub fn is_next_unmapped(&self) -> bool {
+        self.fixed.flag & sam::flags::NEXT_UNMAPPED != 0
+    }
+
+    /// Returns `true` when the reverse-complemented flag (`0x10`) is set.
+    pub fn is_reverse_complemented(&self) -> bool {
+        self.fixed.flag & sam::flags::REVERSE_COMPLEMENTED != 0
+    }
+
+    /// Returns `true` when the mate/next-segment reverse-complemented flag (`0x20`) is set.
+    pub fn is_next_reverse_complemented(&self) -> bool {
+        self.fixed.flag & sam::flags::NEXT_REVERSE_COMPLEMENTED != 0
+    }
+
+    /// Returns `true` when this is the first segment in a template (`0x40`).
+    pub fn is_first_segment(&self) -> bool {
+        self.fixed.flag & sam::flags::FIRST_SEGMENT != 0
+    }
+
+    /// Returns `true` when this is the last segment in a template (`0x80`).
+    pub fn is_last_segment(&self) -> bool {
+        self.fixed.flag & sam::flags::LAST_SEGMENT != 0
+    }
+
+    /// Returns `true` when this is a secondary alignment (`0x100`).
+    pub fn is_secondary(&self) -> bool {
+        self.fixed.flag & sam::flags::SECONDARY != 0
+    }
+
+    /// Returns `true` when this segment fails platform/vendor checks (`0x200`).
+    pub fn is_filtered(&self) -> bool {
+        self.fixed.flag & sam::flags::FILTERED != 0
+    }
+
+    /// Returns `true` when this segment is marked duplicate (`0x400`).
+    pub fn is_duplicate(&self) -> bool {
+        self.fixed.flag & sam::flags::DUPLICATE != 0
+    }
+
+    /// Returns `true` when this is a supplementary alignment (`0x800`).
+    pub fn is_supplementary(&self) -> bool {
+        self.fixed.flag & sam::flags::SUPPLEMENTARY != 0
+    }
+
+    /// Converts this BAM record to a SAM alignment record using the supplied
+    /// reference dictionary.
+    pub fn to_sam_record(&self, refs: &[BamRef]) -> io::Result<sam::SamRecord> {
+        bam_record_to_sam_record(self, refs)
+    }
+
+    /// Formats this BAM record as a SAM alignment line using the supplied
+    /// reference dictionary.
+    pub fn to_sam_line(&self, refs: &[BamRef]) -> io::Result<String> {
+        format_sam_line(&self.to_sam_record(refs)?)
     }
 }
 
@@ -829,6 +972,23 @@ impl Bam {
         self.write_with(writer)
     }
 
+    /// Converts a supported materialized SAM payload into BAM.
+    ///
+    /// The conversion supports SAM records whose reference names are declared in
+    /// `@SQ`, textual sequence and quality fields, standard CIGAR operations,
+    /// and scalar/string/hex/numeric-array optional fields.
+    pub fn from_sam(sam: &sam::Sam) -> io::Result<Self> {
+        bam_from_sam(sam)
+    }
+
+    /// Converts all records in this BAM payload to SAM records.
+    pub fn to_sam_records(&self) -> io::Result<Vec<sam::SamRecord>> {
+        self.records
+            .iter()
+            .map(|record| record.to_sam_record(&self.refs))
+            .collect()
+    }
+
     fn write_with<W: Write>(&self, mut writer: BamWriter<W>) -> io::Result<()> {
         writer.write_all(self)?;
         writer.finish().map(|_| ())
@@ -852,8 +1012,11 @@ impl BamReader<File> {
 
 impl<R: Read> BamReader<R> {
     /// Creates a streaming parser from a compressed BAM byte stream.
+    ///
+    /// The BAM header and reference dictionary are parsed immediately and
+    /// exposed through [`BamReader::header`] and [`BamReader::refs`].
     pub fn from_reader(reader: R) -> io::Result<Self> {
-        let mut reader = BufReader::new(MultiGzDecoder::new(reader));
+        let mut reader = BgzfReader::new(reader);
         let header = BamHeader::read_from(&mut reader)?;
         let mut refs = Vec::with_capacity(header.n_ref as usize);
 
@@ -868,11 +1031,24 @@ impl<R: Read> BamReader<R> {
         })
     }
 
+    /// Returns the current BGZF virtual offset.
+    pub fn virtual_offset(&self) -> BgzfVirtualOffset {
+        self.reader.virtual_offset()
+    }
+
     /// Reads the next BAM alignment record.
     ///
     /// Returns `Ok(None)` only when the stream is at EOF before a new record's
     /// `block_size` field begins.
     pub fn read_record(&mut self) -> io::Result<Option<BamRecord>> {
+        Ok(self
+            .read_record_with_virtual_offset()?
+            .map(|positioned| positioned.record))
+    }
+
+    /// Reads the next BAM alignment record with its starting BGZF virtual offset.
+    pub fn read_record_with_virtual_offset(&mut self) -> io::Result<Option<PositionedBamRecord>> {
+        let virtual_offset = self.virtual_offset();
         let mut block_size = [0u8; 4];
         if !read_exact_or_eof(&mut self.reader, &mut block_size)? {
             return Ok(None);
@@ -882,7 +1058,11 @@ impl<R: Read> BamReader<R> {
 
         let mut record_data = vec![0u8; block_size as usize];
         self.reader.read_exact(&mut record_data)?;
-        BamRecord::new(block_size, record_data).map(Some)
+        let record = BamRecord::new(block_size, record_data)?;
+        Ok(Some(PositionedBamRecord {
+            virtual_offset,
+            record,
+        }))
     }
 
     /// Reads the next BAM alignment record.
@@ -938,6 +1118,9 @@ impl<W: Write> BamWriter<W> {
     }
 
     /// Writes the BAM header and reference dictionary.
+    ///
+    /// The header can be written only once. The stored reference count must
+    /// match the supplied reference slice.
     pub fn write_header(&mut self, header: &BamHeader, refs: &[BamRef]) -> io::Result<()> {
         if self.header_written {
             return Err(io::Error::new(
@@ -953,6 +1136,9 @@ impl<W: Write> BamWriter<W> {
     }
 
     /// Writes one BAM alignment record.
+    ///
+    /// A header must have already been written. Packed CIGAR, sequence, quality,
+    /// and auxiliary fields are serialized from the record as stored.
     pub fn write_record(&mut self, record: &BamRecord) -> io::Result<()> {
         if !self.header_written {
             return Err(io::Error::new(
@@ -1040,6 +1226,171 @@ impl<R: Read> Iterator for BamRecords<'_, R> {
     }
 }
 
+impl<R: Read> BgzfReader<R> {
+    /// Creates a BGZF reader over a compressed byte stream.
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buffer: Vec::new(),
+            position: 0,
+            current_block_start: 0,
+            next_block_start: 0,
+            eof: false,
+        }
+    }
+
+    /// Returns the current virtual offset.
+    pub fn virtual_offset(&self) -> BgzfVirtualOffset {
+        if self.position >= self.buffer.len() {
+            BgzfVirtualOffset::new(self.next_block_start, 0)
+        } else {
+            BgzfVirtualOffset::new(self.current_block_start, self.position as u16)
+        }
+    }
+
+    /// Consumes this reader and returns the wrapped stream.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    fn fill_block(&mut self) -> io::Result<bool> {
+        if self.eof {
+            return Ok(false);
+        }
+
+        loop {
+            let Some(block) = read_bgzf_block(&mut self.inner, self.next_block_start)? else {
+                self.eof = true;
+                self.buffer.clear();
+                self.position = 0;
+                return Ok(false);
+            };
+
+            self.current_block_start = self.next_block_start;
+            self.next_block_start = self
+                .next_block_start
+                .checked_add(block.compressed_size as u64)
+                .ok_or_else(|| invalid_data("BGZF compressed offset overflow"))?;
+            self.buffer = block.uncompressed;
+            self.position = 0;
+
+            if !self.buffer.is_empty() {
+                return Ok(true);
+            }
+        }
+    }
+}
+
+impl<R: Read> Read for BgzfReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+
+        if self.position >= self.buffer.len() && !self.fill_block()? {
+            return Ok(0);
+        }
+
+        let available = self.buffer.len() - self.position;
+        let take = available.min(output.len());
+        output[..take].copy_from_slice(&self.buffer[self.position..self.position + take]);
+        self.position += take;
+        Ok(take)
+    }
+}
+
+struct BgzfBlock {
+    compressed_size: usize,
+    uncompressed: Vec<u8>,
+}
+
+fn read_bgzf_block<R: Read>(
+    reader: &mut R,
+    compressed_offset: u64,
+) -> io::Result<Option<BgzfBlock>> {
+    let mut prefix = [0u8; 12];
+    if !read_exact_or_eof(reader, &mut prefix)? {
+        return Ok(None);
+    }
+
+    if prefix[..4] != [0x1f, 0x8b, 0x08, 0x04] {
+        return Err(invalid_data("invalid BGZF gzip header"));
+    }
+
+    let xlen = u16::from_le_bytes([prefix[10], prefix[11]]) as usize;
+    if xlen < 6 {
+        return Err(invalid_data("BGZF extra field is too short"));
+    }
+
+    let mut extra = vec![0u8; xlen];
+    reader.read_exact(&mut extra)?;
+    let bsize = bgzf_bsize(&extra)?;
+    let compressed_size = usize::from(bsize) + 1;
+    let header_size = 12usize
+        .checked_add(xlen)
+        .ok_or_else(|| invalid_data("BGZF header size overflow"))?;
+    if compressed_size < header_size + 8 {
+        return Err(invalid_data("BGZF block size is too small"));
+    }
+
+    let remaining_len = compressed_size - header_size;
+    let mut remaining = vec![0u8; remaining_len];
+    reader.read_exact(&mut remaining)?;
+
+    let deflate_len = remaining_len - 8;
+    let deflate = &remaining[..deflate_len];
+    let footer = &remaining[deflate_len..];
+    let expected_crc = u32::from_le_bytes(footer[..4].try_into().unwrap());
+    let expected_isize = u32::from_le_bytes(footer[4..8].try_into().unwrap());
+
+    let mut decoder = DeflateDecoder::new(deflate);
+    let mut uncompressed = Vec::with_capacity(expected_isize as usize);
+    decoder.read_to_end(&mut uncompressed)?;
+    if uncompressed.len() != expected_isize as usize {
+        return Err(invalid_data(
+            "BGZF ISIZE does not match decompressed length",
+        ));
+    }
+
+    let mut crc = Crc::new();
+    crc.update(&uncompressed);
+    if crc.sum() != expected_crc {
+        return Err(invalid_data(format!(
+            "BGZF CRC mismatch at compressed offset {compressed_offset}"
+        )));
+    }
+
+    Ok(Some(BgzfBlock {
+        compressed_size,
+        uncompressed,
+    }))
+}
+
+fn bgzf_bsize(extra: &[u8]) -> io::Result<u16> {
+    let mut offset = 0usize;
+    while offset + 4 <= extra.len() {
+        let si1 = extra[offset];
+        let si2 = extra[offset + 1];
+        let slen = u16::from_le_bytes([extra[offset + 2], extra[offset + 3]]) as usize;
+        offset += 4;
+        let end = offset
+            .checked_add(slen)
+            .ok_or_else(|| invalid_data("BGZF extra subfield length overflow"))?;
+        if end > extra.len() {
+            return Err(invalid_data("BGZF extra subfield is truncated"));
+        }
+        if si1 == b'B' && si2 == b'C' {
+            if slen != 2 {
+                return Err(invalid_data("BGZF BC subfield has invalid length"));
+            }
+            return Ok(u16::from_le_bytes([extra[offset], extra[offset + 1]]));
+        }
+        offset = end;
+    }
+
+    Err(invalid_data("BGZF BC subfield is missing"))
+}
+
 impl BamHeader {
     /// Reads a BAM header from a decompressed BAM byte stream.
     pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
@@ -1088,6 +1439,493 @@ impl BamRef {
             l_seq,
         })
     }
+}
+
+fn bam_record_to_sam_record(record: &BamRecord, refs: &[BamRef]) -> io::Result<sam::SamRecord> {
+    let rname = reference_name(refs, record.fixed.ref_id)?;
+    let rnext = mate_reference_name(refs, record.fixed.ref_id, record.fixed.next_ref_id)?;
+    let pos = sam_position(record.fixed.pos)?;
+    let pnext = sam_position(record.fixed.next_pos)?;
+    let seq = if record.fixed.l_seq == 0 {
+        "*".to_string()
+    } else {
+        record.sequence_string()
+    };
+    let optional = record
+        .auxiliary
+        .iter()
+        .map(bam_aux_to_sam_optional)
+        .collect::<io::Result<Vec<_>>>()?;
+
+    Ok(sam::SamRecord::new(
+        record.read_name().to_string(),
+        record.fixed.flag,
+        rname,
+        pos,
+        record.fixed.mapq,
+        record.cigar_string(),
+        rnext,
+        pnext,
+        record.fixed.tlen,
+        seq,
+        record.quality_string(),
+        optional,
+    ))
+}
+
+fn reference_name(refs: &[BamRef], ref_id: i32) -> io::Result<String> {
+    if ref_id < 0 {
+        return Ok("*".to_string());
+    }
+
+    refs.get(ref_id as usize)
+        .map(|reference| reference.name.clone())
+        .ok_or_else(|| invalid_data("BAM record reference ID is out of bounds"))
+}
+
+fn mate_reference_name(refs: &[BamRef], ref_id: i32, next_ref_id: i32) -> io::Result<String> {
+    if next_ref_id < 0 {
+        return Ok("*".to_string());
+    }
+    if next_ref_id == ref_id && ref_id >= 0 {
+        return Ok("=".to_string());
+    }
+
+    reference_name(refs, next_ref_id)
+}
+
+fn sam_position(position: i32) -> io::Result<u32> {
+    if position < 0 {
+        return Ok(0);
+    }
+
+    u32::try_from(position)
+        .ok()
+        .and_then(|position| position.checked_add(1))
+        .ok_or_else(|| invalid_data("BAM position cannot be represented as SAM POS"))
+}
+
+fn bam_aux_to_sam_optional(auxiliary: &BamRecordAuxiliary) -> io::Result<sam::SamOptionalField> {
+    let value = match &auxiliary.value {
+        BamAuxValue::A(value) => sam::SamOptionalValue::Character(char::from(*value)),
+        BamAuxValue::c(value) => sam::SamOptionalValue::Integer(i64::from(*value)),
+        BamAuxValue::C(value) => sam::SamOptionalValue::Integer(i64::from(*value)),
+        BamAuxValue::s(value) => sam::SamOptionalValue::Integer(i64::from(*value)),
+        BamAuxValue::S(value) => sam::SamOptionalValue::Integer(i64::from(*value)),
+        BamAuxValue::i(value) => sam::SamOptionalValue::Integer(i64::from(*value)),
+        BamAuxValue::I(value) => sam::SamOptionalValue::Integer(i64::from(*value)),
+        BamAuxValue::f(value) => sam::SamOptionalValue::Float(*value),
+        BamAuxValue::Z(value) => sam::SamOptionalValue::String(value.clone()),
+        BamAuxValue::H(value) => sam::SamOptionalValue::Hex(hex_string_to_bytes(value)?),
+        BamAuxValue::B(value) => sam::SamOptionalValue::Array(bam_array_to_sam_array(value)),
+    };
+
+    Ok(sam::SamOptionalField::new(auxiliary.tag.clone(), value))
+}
+
+fn bam_array_to_sam_array(array: &BamAuxArray) -> sam::SamOptionalArray {
+    match array {
+        BamAuxArray::c(values) => sam::SamOptionalArray::Int8(values.clone()),
+        BamAuxArray::C(values) => sam::SamOptionalArray::UInt8(values.clone()),
+        BamAuxArray::s(values) => sam::SamOptionalArray::Int16(values.clone()),
+        BamAuxArray::S(values) => sam::SamOptionalArray::UInt16(values.clone()),
+        BamAuxArray::i(values) => sam::SamOptionalArray::Int32(values.clone()),
+        BamAuxArray::I(values) => sam::SamOptionalArray::UInt32(values.clone()),
+        BamAuxArray::f(values) => sam::SamOptionalArray::Float(values.clone()),
+    }
+}
+
+fn format_sam_line(record: &sam::SamRecord) -> io::Result<String> {
+    record.to_sam_line()
+}
+
+fn bam_from_sam(input: &sam::Sam) -> io::Result<Bam> {
+    let mut validation_sink = Vec::new();
+    input.to_writer(&mut validation_sink)?;
+
+    let refs = bam_refs_from_sam_header(&input.header)?;
+    let reference_ids = refs
+        .iter()
+        .enumerate()
+        .map(|(index, reference)| (reference.name.clone(), index as i32))
+        .collect::<HashMap<_, _>>();
+    let records = input
+        .records
+        .iter()
+        .map(|record| bam_record_from_sam_record(record, &reference_ids))
+        .collect::<io::Result<Vec<_>>>()?;
+    let text = sam_header_text(&input.header)?;
+    let header = BamHeader {
+        magic: [0x42, 0x41, 0x4D, 0x01],
+        l_text: text.len() as u32,
+        text,
+        n_ref: refs.len() as u32,
+    };
+
+    Ok(Bam {
+        header,
+        refs,
+        records,
+    })
+}
+
+fn bam_refs_from_sam_header(header: &sam::SamHeader) -> io::Result<Vec<BamRef>> {
+    let mut refs = Vec::new();
+    for record in header.records_of_type("SQ") {
+        let name = record
+            .value("SN")
+            .ok_or_else(|| invalid_data("SAM @SQ record missing SN"))?;
+        let length = record
+            .value("LN")
+            .ok_or_else(|| invalid_data("SAM @SQ record missing LN"))?
+            .parse::<u32>()
+            .map_err(|_| invalid_data("SAM @SQ LN is not a u32"))?;
+        refs.push(BamRef {
+            l_name: (name.len() + 1) as u32,
+            name: name.to_string(),
+            l_seq: length,
+        });
+    }
+
+    Ok(refs)
+}
+
+fn sam_header_text(header: &sam::SamHeader) -> io::Result<String> {
+    let mut output = String::new();
+    for record in &header.records {
+        output.push_str(&sam_header_record_line(record)?);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn sam_header_record_line(record: &sam::SamHeaderRecord) -> io::Result<String> {
+    if record.record_type == "CO" {
+        return Ok(format!(
+            "@CO\t{}",
+            record.comment.as_deref().unwrap_or_default()
+        ));
+    }
+
+    if record.record_type.len() != 2 {
+        return Err(invalid_data(
+            "SAM header record type must be two characters",
+        ));
+    }
+
+    let mut line = format!("@{}", record.record_type);
+    for field in &record.fields {
+        line.push('\t');
+        line.push_str(&field.tag);
+        line.push(':');
+        line.push_str(&field.value);
+    }
+    Ok(line)
+}
+
+fn bam_record_from_sam_record(
+    record: &sam::SamRecord,
+    reference_ids: &HashMap<String, i32>,
+) -> io::Result<BamRecord> {
+    record.to_sam_line()?;
+
+    let ref_id = sam_reference_id(&record.rname, reference_ids)?;
+    let next_ref_id = if record.rnext == "=" {
+        ref_id
+    } else {
+        sam_reference_id(&record.rnext, reference_ids)?
+    };
+    let pos = bam_position(record.pos)?;
+    let next_pos = bam_position(record.pnext)?;
+    let cigar = pack_cigar(&record.cigar)?;
+    let seq = pack_sequence(&record.seq)?;
+    let l_seq = if record.seq == "*" {
+        0
+    } else {
+        u32::try_from(record.seq.len()).map_err(|_| invalid_data("SAM SEQ length exceeds u32"))?
+    };
+    let qual = pack_quality(&record.qual, l_seq as usize)?;
+    let read_name_len = record
+        .qname
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("SAM QNAME length overflow"))?;
+    let l_read_name =
+        u8::try_from(read_name_len).map_err(|_| invalid_data("SAM QNAME is too long for BAM"))?;
+    let n_cigar_op = u16::try_from(cigar.len())
+        .map_err(|_| invalid_data("SAM CIGAR has too many operations for BAM"))?;
+    let bin = bam_bin(record, pos)?;
+    let auxiliary = record
+        .optional
+        .iter()
+        .map(sam_optional_to_bam_aux)
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let mut bam_record = BamRecord {
+        fixed: BamRecordFixed {
+            block_size: 0,
+            ref_id,
+            pos,
+            l_read_name,
+            mapq: record.mapq,
+            bin,
+            n_cigar_op,
+            flag: record.flag,
+            l_seq,
+            next_ref_id,
+            next_pos,
+            tlen: record.tlen,
+        },
+        variable: BamRecordVariable {
+            read_name: record.qname.clone(),
+            cigar,
+            seq,
+            qual,
+        },
+        auxiliary,
+    };
+
+    let mut payload = Vec::new();
+    encode_bam_record_payload(&bam_record, &mut payload)?;
+    bam_record.fixed.block_size =
+        u32::try_from(payload.len()).map_err(|_| invalid_data("BAM record is too large"))?;
+    Ok(bam_record)
+}
+
+fn sam_reference_id(value: &str, reference_ids: &HashMap<String, i32>) -> io::Result<i32> {
+    if value == "*" {
+        return Ok(-1);
+    }
+
+    reference_ids
+        .get(value)
+        .copied()
+        .ok_or_else(|| invalid_data(format!("SAM reference {value} is missing from @SQ header")))
+}
+
+fn bam_position(position: u32) -> io::Result<i32> {
+    if position == 0 {
+        return Ok(-1);
+    }
+    i32::try_from(position - 1).map_err(|_| invalid_data("SAM position exceeds BAM i32 range"))
+}
+
+fn pack_cigar(cigar: &str) -> io::Result<Vec<u32>> {
+    if cigar == "*" {
+        return Ok(Vec::new());
+    }
+
+    let mut packed = Vec::new();
+    let mut len = 0u32;
+    let mut saw_digit = false;
+    for byte in cigar.bytes() {
+        match byte {
+            b'0'..=b'9' => {
+                saw_digit = true;
+                len = len
+                    .checked_mul(10)
+                    .and_then(|value| value.checked_add(u32::from(byte - b'0')))
+                    .ok_or_else(|| invalid_data("SAM CIGAR operation length overflow"))?;
+            }
+            b'M' | b'I' | b'D' | b'N' | b'S' | b'H' | b'P' | b'=' | b'X' => {
+                if !saw_digit || len == 0 {
+                    return Err(invalid_data("invalid SAM CIGAR operation length"));
+                }
+                packed.push((len << 4) | cigar_op_code(byte));
+                len = 0;
+                saw_digit = false;
+            }
+            _ => return Err(invalid_data("invalid SAM CIGAR operation")),
+        }
+    }
+
+    if saw_digit {
+        return Err(invalid_data("SAM CIGAR ends with length but no operation"));
+    }
+    Ok(packed)
+}
+
+fn cigar_op_code(op: u8) -> u32 {
+    match op {
+        b'M' => 0,
+        b'I' => 1,
+        b'D' => 2,
+        b'N' => 3,
+        b'S' => 4,
+        b'H' => 5,
+        b'P' => 6,
+        b'=' => 7,
+        b'X' => 8,
+        _ => unreachable!("validated CIGAR op"),
+    }
+}
+
+fn pack_sequence(seq: &str) -> io::Result<Vec<u8>> {
+    if seq == "*" {
+        return Ok(Vec::new());
+    }
+
+    let mut packed = Vec::with_capacity(seq.len().div_ceil(2));
+    for chunk in seq.as_bytes().chunks(2) {
+        let high = base_code(chunk[0])?;
+        let low = chunk
+            .get(1)
+            .copied()
+            .map(base_code)
+            .transpose()?
+            .unwrap_or(0);
+        packed.push((high << 4) | low);
+    }
+    Ok(packed)
+}
+
+fn base_code(base: u8) -> io::Result<u8> {
+    match base.to_ascii_uppercase() {
+        b'=' => Ok(0),
+        b'A' => Ok(1),
+        b'C' => Ok(2),
+        b'M' => Ok(3),
+        b'G' => Ok(4),
+        b'R' => Ok(5),
+        b'S' => Ok(6),
+        b'V' => Ok(7),
+        b'T' => Ok(8),
+        b'W' => Ok(9),
+        b'Y' => Ok(10),
+        b'H' => Ok(11),
+        b'K' => Ok(12),
+        b'D' => Ok(13),
+        b'B' => Ok(14),
+        b'N' => Ok(15),
+        _ => Err(invalid_data("SAM SEQ contains a base BAM cannot encode")),
+    }
+}
+
+fn pack_quality(qual: &str, len: usize) -> io::Result<Vec<u8>> {
+    if qual == "*" {
+        return Ok(vec![0xff; len]);
+    }
+    if qual.len() != len {
+        return Err(invalid_data("SAM QUAL length does not match SEQ length"));
+    }
+
+    qual.bytes()
+        .map(|byte| {
+            if !(33..=126).contains(&byte) {
+                return Err(invalid_data("SAM QUAL contains an invalid byte"));
+            }
+            Ok(byte - 33)
+        })
+        .collect()
+}
+
+fn bam_bin(record: &sam::SamRecord, pos: i32) -> io::Result<u16> {
+    if pos < 0 || record.cigar == "*" {
+        return Ok(0);
+    }
+
+    let reference_len = record.reference_len_from_cigar()?;
+    if reference_len == 0 {
+        return Ok(0);
+    }
+    let beg = u32::try_from(pos).map_err(|_| invalid_data("BAM position is negative"))?;
+    let end = beg
+        .checked_add(
+            u32::try_from(reference_len)
+                .map_err(|_| invalid_data("SAM CIGAR reference length exceeds u32"))?,
+        )
+        .ok_or_else(|| invalid_data("SAM alignment end overflows u32"))?;
+    Ok(reg2bin(beg, end))
+}
+
+fn reg2bin(beg: u32, end: u32) -> u16 {
+    let end = end.saturating_sub(1);
+    if beg >> 14 == end >> 14 {
+        return 4681 + (beg >> 14) as u16;
+    }
+    if beg >> 17 == end >> 17 {
+        return 585 + (beg >> 17) as u16;
+    }
+    if beg >> 20 == end >> 20 {
+        return 73 + (beg >> 20) as u16;
+    }
+    if beg >> 23 == end >> 23 {
+        return 9 + (beg >> 23) as u16;
+    }
+    if beg >> 26 == end >> 26 {
+        return 1 + (beg >> 26) as u16;
+    }
+    0
+}
+
+fn sam_optional_to_bam_aux(field: &sam::SamOptionalField) -> io::Result<BamRecordAuxiliary> {
+    Ok(BamRecordAuxiliary {
+        tag: field.tag.clone(),
+        value: sam_optional_value_to_bam(&field.value)?,
+    })
+}
+
+fn sam_optional_value_to_bam(value: &sam::SamOptionalValue) -> io::Result<BamAuxValue> {
+    match value {
+        sam::SamOptionalValue::Character(value) => {
+            if !value.is_ascii() {
+                return Err(invalid_data("SAM A optional value is not ASCII"));
+            }
+            Ok(BamAuxValue::A(*value as u8))
+        }
+        sam::SamOptionalValue::Integer(value) => {
+            if let Ok(value) = i32::try_from(*value) {
+                Ok(BamAuxValue::i(value))
+            } else if let Ok(value) = u32::try_from(*value) {
+                Ok(BamAuxValue::I(value))
+            } else {
+                Err(invalid_data(
+                    "SAM integer optional value is out of BAM range",
+                ))
+            }
+        }
+        sam::SamOptionalValue::Float(value) => Ok(BamAuxValue::f(*value)),
+        sam::SamOptionalValue::String(value) => Ok(BamAuxValue::Z(value.clone())),
+        sam::SamOptionalValue::Hex(value) => Ok(BamAuxValue::H(bytes_to_hex(value))),
+        sam::SamOptionalValue::Array(value) => Ok(BamAuxValue::B(sam_array_to_bam_array(value))),
+    }
+}
+
+fn sam_array_to_bam_array(array: &sam::SamOptionalArray) -> BamAuxArray {
+    match array {
+        sam::SamOptionalArray::Int8(values) => BamAuxArray::c(values.clone()),
+        sam::SamOptionalArray::UInt8(values) => BamAuxArray::C(values.clone()),
+        sam::SamOptionalArray::Int16(values) => BamAuxArray::s(values.clone()),
+        sam::SamOptionalArray::UInt16(values) => BamAuxArray::S(values.clone()),
+        sam::SamOptionalArray::Int32(values) => BamAuxArray::i(values.clone()),
+        sam::SamOptionalArray::UInt32(values) => BamAuxArray::I(values.clone()),
+        sam::SamOptionalArray::Float(values) => BamAuxArray::f(values.clone()),
+    }
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn hex_string_to_bytes(value: &str) -> io::Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return Err(invalid_data("BAM H auxiliary value has odd length"));
+    }
+
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for index in (0..value.len()).step_by(2) {
+        bytes.push(
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|_| invalid_data("BAM H auxiliary value is not hex"))?,
+        );
+    }
+    Ok(bytes)
 }
 
 fn read_u32_le<R: Read>(reader: &mut R, field: &str) -> io::Result<u32> {
@@ -1421,6 +2259,10 @@ fn encode_bam_array_header(payload: &mut Vec<u8>, subtype: u8, len: usize) -> io
     payload.push(subtype);
     payload.extend_from_slice(&len.to_le_bytes());
     Ok(())
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    Error::invalid(Format::Bam, message).into()
 }
 
 #[cfg(test)]
