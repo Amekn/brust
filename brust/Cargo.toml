@@ -1,12 +1,18 @@
-[workspace]
-resolver = "3"
-members = ["bam", "brust", "brust-core", "fasta", "fastq", "pod5", "sam"]
+[package]
+name = "brust"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Public facade for Brust bioinformatics format readers, writers, and conversion helpers."
+keywords.workspace = true
+categories.workspace = true
 
-[workspace.package]
-version = "0.1.0"
-edition = "2024"
-authors = ["Kang Zhou"]
-repository = "https://github.com/Amekn/project_biorust"
-license = "MIT OR Apache-2.0"
-keywords = ["bioinformatics", "fasta", "fastq", "sam", "bam"]
-categories = ["science", "parser-implementations"]
+[dependencies]
+brust-core = { path = "../brust-core" }
+fasta = { path = "../fasta" }
+sam = { path = "../sam" }
+bam = { path = "../bam" }
+fastq = { path = "../fastq" }
+pod5 = { path = "../pod5" }
