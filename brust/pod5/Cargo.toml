@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arrow-array = "58.3.0"
+arrow-ipc = "58.3.0"
+arrow-schema = "58.3.0"
+flatbuffers = "25.12.19"
+zstd = { version = "0.13", default-features = false }
