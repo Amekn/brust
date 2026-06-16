@@ -1,14 +1,18 @@
-//! Minimal BAM parsing primitives.
+//! BAM reader and writer primitives.
 //!
-//! The crate exposes two ownership models:
+//! The crate exposes both streaming and materialized APIs:
 //!
-//! - [`BamReader`] is a streaming parser over a compressed BAM byte stream. It
-//!   owns decoder state and is intentionally not [`Clone`].
-//! - [`Bam`] is a fully materialized BAM payload containing the header,
-//!   references, and records. It is [`Clone`] for deep-copy workflows.
+//! - [`BamReader`] reads a gzip-compatible BAM stream, parses the binary header
+//!   and reference dictionary up front, then returns one [`BamRecord`] at a
+//!   time.
+//! - [`Bam`] owns the header, references, and every parsed record and can be
+//!   cloned or written back out.
 //!
-//! Positions in record fields follow the BAM binary format: alignment positions
-//! are zero-based and unmapped positions are represented as `-1`.
+//! Record fields follow the BAM binary layout. Alignment positions are
+//! zero-based, unmapped positions are represented as `-1`, CIGAR and sequence
+//! data remain packed in the record, and helper methods expose SAM-style
+//! strings when needed. The writer serializes the stored BAM structures into
+//! BGZF blocks and validates internal lengths before emitting records.
 
 use flate2::read::MultiGzDecoder;
 use flate2::write::DeflateEncoder;
@@ -17,7 +21,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 
-/// A fully materialized BAM file.
+/// A fully materialized BAM payload.
 ///
 /// `Bam` owns its header, references, and all records, so cloning this type
 /// performs a deep copy of the parsed BAM data.
@@ -31,11 +35,12 @@ pub struct Bam {
     pub records: Vec<BamRecord>,
 }
 
-/// Streaming BAM parser over a BGZF/gzip-compressed reader.
+/// Streaming BAM parser over a gzip-compatible BAM reader.
 ///
-/// `BamReader` owns an active decoder and file/reader cursor, so it is not
-/// cloneable. Use [`BamReader::read_all`] or [`Bam::from_path`] when a deep
-/// copyable, materialized representation is needed.
+/// BAM files are normally BGZF, which is compatible with multi-member gzip
+/// decoding. `BamReader` owns the active decoder and parser cursor, so it is
+/// intentionally not cloneable. Use [`BamReader::read_all`] or
+/// [`Bam::from_path`] when a cloneable, in-memory representation is needed.
 pub struct BamReader<R: Read = File> {
     /// BAM header metadata and SAM header text.
     pub header: BamHeader,
@@ -46,32 +51,33 @@ pub struct BamReader<R: Read = File> {
 
 /// Streaming BAM writer over any writable byte stream.
 ///
-/// `BamWriter` writes BAM binary data in BGZF blocks. Use
-/// [`BamWriter::write_all`] for a materialized [`Bam`] value, or write a header
-/// and then stream records manually.
+/// `BamWriter` writes BAM binary data in BGZF blocks and appends the standard
+/// BGZF EOF block from [`BamWriter::finish`]. Use [`BamWriter::write_all`] for
+/// a materialized [`Bam`], or write a header and then stream records manually.
 pub struct BamWriter<W: Write = File> {
     writer: W,
     pending: Vec<u8>,
     header_written: bool,
 }
 
-/// BAM header information.
+/// BAM header information from the binary file header.
 ///
-/// Contains the BAM magic bytes, SAM header text length, SAM header text, and
-/// reference count.
+/// The parsed `text` field is the SAM header text with trailing NUL padding
+/// removed. The original `l_text` value is preserved and is used by the writer
+/// when it is non-zero.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BamHeader {
     /// BAM magic bytes, always `[0x42, 0x41, 0x4D, 0x01]`.
     pub magic: [u8; 4],
     /// Length of the SAM header text in bytes, including any NUL padding.
     pub l_text: u32,
-    /// Plain SAM header text; not necessarily NUL-terminated in the file.
+    /// SAM header text with trailing NUL padding removed.
     pub text: String,
     /// Number of reference sequences in the BAM reference dictionary.
     pub n_ref: u32,
 }
 
-/// Reference sequence information.
+/// Reference sequence dictionary entry.
 ///
 /// Contains a reference sequence name and its declared sequence length.
 #[derive(Debug, Clone, PartialEq)]
@@ -91,16 +97,16 @@ pub struct BamRecord {
     pub fixed: BamRecordFixed,
     /// Variable-width read name, CIGAR, sequence, and quality fields.
     pub variable: BamRecordVariable,
-    /// Auxiliary tags following the core record payload.
+    /// Auxiliary tags following the core and variable-length record fields.
     pub auxiliary: Vec<BamRecordAuxiliary>,
 }
 
-/// Fixed-length fields of a BAM alignment record.
+/// Fixed-length core fields of a BAM alignment record.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BamRecordFixed {
     /// Total alignment record length, excluding the `block_size` field itself.
     pub block_size: u32,
-    /// Reference sequence ID, or `-1` for a read without a mapping position.
+    /// Reference sequence ID, or `-1` for an unmapped read.
     pub ref_id: i32,
     /// Zero-based leftmost coordinate, equal to SAM `POS - 1`.
     pub pos: i32,
@@ -118,7 +124,7 @@ pub struct BamRecordFixed {
     pub l_seq: u32,
     /// Reference ID of the next segment, or `-1` when absent.
     pub next_ref_id: i32,
-    /// Zero-based leftmost coordinate of the next segment.
+    /// Zero-based leftmost coordinate of the next segment, or `-1` when absent.
     pub next_pos: i32,
     /// Template length (`TLEN`).
     pub tlen: i32,
@@ -128,7 +134,8 @@ impl BamRecordFixed {
     /// Parses the fixed 32-byte BAM record core.
     ///
     /// `block_size` is the record length read from the stream, excluding the
-    /// four-byte `block_size` field itself. `data` begins at `refID`.
+    /// four-byte `block_size` field itself. `data` begins at `refID` and must
+    /// contain at least the fixed core bytes.
     pub fn new(block_size: u32, data: &[u8]) -> io::Result<Self> {
         if data.len() < 32 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "data too short"));
@@ -198,7 +205,7 @@ pub struct BamRecordVariable {
     pub cigar: Vec<u32>,
     /// Packed 4-bit BAM sequence bytes.
     pub seq: Vec<u8>,
-    /// Raw Phred-scaled base qualities.
+    /// Raw Phred-scaled base qualities, or `0xff` bytes when unavailable.
     pub qual: Vec<u8>,
 }
 
@@ -207,6 +214,7 @@ impl BamRecordVariable {
     ///
     /// `fixed` contains offsets and lengths from the fixed record core. `data`
     /// begins at `refID` and does not include the four-byte `block_size` field.
+    /// The returned offset points to the first auxiliary field.
     pub fn new(fixed: &BamRecordFixed, data: &[u8]) -> io::Result<(Self, usize)> {
         let mut offset = 32;
 
@@ -298,6 +306,9 @@ pub struct BamRecordAuxiliary {
 
 impl BamRecordAuxiliary {
     /// Parses one auxiliary field and advances `offset` past it.
+    ///
+    /// The parser validates value type tags and byte lengths while preserving
+    /// the two-byte auxiliary tag as stored.
     pub fn new(offset: &mut usize, data: &[u8]) -> io::Result<Self> {
         let tag = match data.get(*offset..*offset + 2) {
             Some(tag) => String::from_utf8_lossy(tag).to_string(),
@@ -449,7 +460,8 @@ impl BamRecordAuxiliary {
                 }
 
                 let s = String::from_utf8_lossy(&data[start..*offset]).to_string();
-                *offset += 1; // consume NUL
+                // Skip the NUL terminator stored in the BAM payload.
+                *offset += 1;
 
                 BamAuxValue::Z(s)
             }
@@ -469,7 +481,8 @@ impl BamRecordAuxiliary {
                 }
 
                 let s = String::from_utf8_lossy(&data[start..*offset]).to_string();
-                *offset += 1; // consume NUL
+                // Skip the NUL terminator stored in the BAM payload.
+                *offset += 1;
 
                 BamAuxValue::H(s)
             }
@@ -662,7 +675,7 @@ impl BamRecordAuxiliary {
 /// BAM auxiliary tag value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BamAuxValue {
-    /// Printable ASCII character (`A`).
+    /// Raw byte for an `A` auxiliary value.
     A(u8),
     /// Signed 8-bit integer (`c`).
     #[allow(non_camel_case_types)]
@@ -682,9 +695,9 @@ pub enum BamAuxValue {
     /// 32-bit floating point number (`f`).
     #[allow(non_camel_case_types)]
     f(f32),
-    /// NUL-terminated printable string (`Z`).
+    /// String value from a NUL-terminated `Z` payload, stored without the NUL.
     Z(String),
-    /// NUL-terminated hexadecimal string (`H`).
+    /// Hex string from a NUL-terminated `H` payload, stored without the NUL.
     H(String),
     /// Homogeneous numeric array (`B`).
     B(BamAuxArray),
@@ -717,7 +730,9 @@ impl BamRecord {
     /// Parses a BAM alignment record from raw payload bytes.
     ///
     /// `block_size` is not included in `data`. `data` begins at `refID` and
-    /// contains the full alignment record payload.
+    /// contains the full alignment record payload. The parser validates the
+    /// fixed/variable field boundaries and parses auxiliary fields until the end
+    /// of the payload.
     pub fn new(block_size: u32, data: Vec<u8>) -> io::Result<Self> {
         if block_size as usize != data.len() {
             return Err(io::Error::new(
@@ -785,6 +800,9 @@ impl BamRecord {
     }
 
     /// Decodes BAM quality bytes into a SAM-style quality string.
+    ///
+    /// If every stored quality byte is `0xff`, the unavailable-quality marker
+    /// `*` is returned.
     pub fn quality_string(&self) -> String {
         if self.variable.qual.iter().all(|quality| *quality == 0xff) {
             return "*".to_string();
@@ -852,6 +870,9 @@ impl BamReader<File> {
 
 impl<R: Read> BamReader<R> {
     /// Creates a streaming parser from a compressed BAM byte stream.
+    ///
+    /// The BAM header and reference dictionary are parsed immediately and
+    /// exposed through [`BamReader::header`] and [`BamReader::refs`].
     pub fn from_reader(reader: R) -> io::Result<Self> {
         let mut reader = BufReader::new(MultiGzDecoder::new(reader));
         let header = BamHeader::read_from(&mut reader)?;
@@ -938,6 +959,9 @@ impl<W: Write> BamWriter<W> {
     }
 
     /// Writes the BAM header and reference dictionary.
+    ///
+    /// The header can be written only once. The stored reference count must
+    /// match the supplied reference slice.
     pub fn write_header(&mut self, header: &BamHeader, refs: &[BamRef]) -> io::Result<()> {
         if self.header_written {
             return Err(io::Error::new(
@@ -953,6 +977,9 @@ impl<W: Write> BamWriter<W> {
     }
 
     /// Writes one BAM alignment record.
+    ///
+    /// A header must have already been written. Packed CIGAR, sequence, quality,
+    /// and auxiliary fields are serialized from the record as stored.
     pub fn write_record(&mut self, record: &BamRecord) -> io::Result<()> {
         if !self.header_written {
             return Err(io::Error::new(

@@ -1,16 +1,17 @@
-//! Minimal FASTQ parsing primitives.
+//! FASTQ reader and writer primitives.
 //!
-//! The crate exposes two ownership models:
+//! The crate exposes both streaming and materialized APIs:
 //!
-//! - [`FastqReader`] is a streaming parser over a FASTQ byte stream. It owns
-//!   reader state and returns one [`FastqRecord`] at a time.
-//! - [`Fastq`] is a fully materialized FASTQ payload containing all records. It
-//!   is [`Clone`] for deep-copy workflows.
+//! - [`FastqReader`] reads one [`FastqRecord`] at a time from any [`Read`]
+//!   source.
+//! - [`Fastq`] owns every parsed record and can be cloned or written back out.
 //!
 //! FASTQ headers are split at the first whitespace character: the first token
 //! after `@` is the record ID, and the remaining text is stored as the optional
 //! description. Sequence lines are concatenated until the `+` separator, then
-//! quality lines are concatenated until their length matches the sequence.
+//! quality lines are concatenated until their length exactly matches the
+//! sequence length. The writer emits a canonical four-line record with a bare
+//! `+` separator and validates that sequence and quality lengths match.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -18,19 +19,19 @@ use std::path::Path;
 
 /// Streaming FASTQ parser over any readable byte stream.
 ///
-/// `FastqReader` owns the buffered reader and parser cursor, so it is not
-/// cloneable. Use [`FastqReader::read_all`] or [`Fastq::from_path`] when a
-/// deep-copyable, materialized representation is needed.
+/// `FastqReader` keeps the underlying reader and parser cursor in one place, so
+/// it is intentionally not cloneable. Use [`FastqReader::read_all`] or
+/// [`Fastq::from_path`] when a cloneable, in-memory representation is needed.
 pub struct FastqReader<R: Read = File> {
     reader: BufReader<R>,
-    // One-based line counter maintained for future diagnostics.
+    // Number of lines consumed from the underlying reader.
     line_number: usize,
 }
 
 /// Streaming FASTQ writer over any writable byte stream.
 ///
-/// `FastqWriter` writes one [`FastqRecord`] at a time and validates that the
-/// sequence and quality strings have matching lengths before emitting a record.
+/// `FastqWriter` emits one [`FastqRecord`] at a time. It validates record shape
+/// before writing and always writes sequence and quality as single lines.
 pub struct FastqWriter<W: Write = File> {
     writer: W,
 }
@@ -59,21 +60,16 @@ impl<R: Read> FastqReader<R> {
         })
     }
 
-    /// Reads the next FASTQ record.
+    /// Reads the next FASTQ record from the stream.
     ///
-    /// Returns `Ok(None)` when the stream is at EOF before another header line
-    /// begins. Sequence line endings are removed and sequence lines are
-    /// concatenated until the `+` separator. Quality line endings are removed
-    /// and quality lines are concatenated until their length matches the
+    /// Returns `Ok(None)` when the stream is at EOF before another header. A
+    /// malformed or truncated record returns `InvalidData`. Sequence line
+    /// endings are removed until a `+` separator line is reached, and quality
+    /// line endings are removed until the accumulated quality length equals the
     /// parsed sequence length.
     pub fn read_record(&mut self) -> io::Result<Option<FastqRecord>> {
-        // 1. Header starts with @
-        // 2. Read sequence until +
-        // 3. Read quality until quality length == sequence length
-        // 4. Only after that, expect the next record header (next call to read_record)
         let mut line = String::new();
         let byte = self.reader.read_line(&mut line)?;
-        // EOF reached
         if byte == 0 {
             return Ok(None);
         }
@@ -101,15 +97,12 @@ impl<R: Read> FastqReader<R> {
                 return Err(invalid_data("FASTQ sequence ended before + separator"));
             }
             self.line_number += 1;
-            // Check if line starts with '+' (end of sequence)
             if line.starts_with('+') {
-                // sequence ends
                 break;
             }
             sequence.push_str(line.trim_end());
         }
 
-        // Now it's time to read the quality scores
         let mut quality = String::new();
         loop {
             line.clear();
@@ -119,14 +112,14 @@ impl<R: Read> FastqReader<R> {
             }
             self.line_number += 1;
             quality.push_str(line.trim_end());
-            // Check if the quality line length matches the sequence line length
+            if quality.len() > sequence.len() {
+                return Err(invalid_data("FASTQ quality length exceeds sequence length"));
+            }
             if quality.len() == sequence.len() {
-                // quality ends
                 break;
             }
         }
 
-        // Now we can construct the FastqRecord
         Ok(Some(FastqRecord {
             id,
             description,
@@ -179,6 +172,10 @@ impl<W: Write> FastqWriter<W> {
     }
 
     /// Writes one FASTQ record.
+    ///
+    /// The record ID must be non-empty and contain no whitespace. IDs,
+    /// descriptions, sequences, and qualities must not contain line endings,
+    /// and sequence and quality lengths must match.
     pub fn write_record(&mut self, record: &FastqRecord) -> io::Result<()> {
         validate_fastq_record(record)?;
 
@@ -204,6 +201,8 @@ impl<W: Write> FastqWriter<W> {
     }
 
     /// Writes all records from a materialized FASTQ value.
+    ///
+    /// Each record is validated by [`FastqWriter::write_record`].
     pub fn write_all(&mut self, fastq: &Fastq) -> io::Result<()> {
         for record in &fastq.records {
             self.write_record(record)?;
@@ -222,7 +221,7 @@ impl<W: Write> FastqWriter<W> {
     }
 }
 
-/// A fully materialized FASTQ file.
+/// A fully materialized FASTQ payload.
 ///
 /// `Fastq` owns all records from the stream, so cloning this type performs a
 /// deep copy of the parsed FASTQ data.
@@ -262,7 +261,7 @@ impl Fastq {
 ///
 /// The ID is the first token after `@`, the description is the remaining header
 /// text after the first whitespace, the sequence is stored without line
-/// endings, and the quality string has the same length as the sequence.
+/// endings, and the quality string is stored without line endings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FastqRecord {
     /// Record identifier from the FASTQ header.
@@ -271,7 +270,7 @@ pub struct FastqRecord {
     pub description: Option<String>,
     /// Sequence bases with record line endings removed.
     pub sequence: String,
-    /// ASCII-encoded base quality characters with record line endings removed.
+    /// Base quality characters with record line endings removed.
     pub quality: String,
 }
 
@@ -523,5 +522,16 @@ mod fastq_tests {
     fn malformed_truncated_record_returns_error() {
         assert!(Fastq::from_reader(&b"@seq1\nACGT\n"[..]).is_err());
         assert!(Fastq::from_reader(&b"@seq1\nACGT\n+\nII\n"[..]).is_err());
+    }
+
+    #[test]
+    fn malformed_overlong_quality_returns_error() {
+        let err = Fastq::from_reader(&b"@seq1\nACGT\n+\nIIIII\n"[..]).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            "FASTQ quality length exceeds sequence length"
+        );
     }
 }
