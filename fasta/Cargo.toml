@@ -1,13 +1,14 @@
 [package]
-name = "fasta"
+name = "brust-fasta"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+readme = "README.md"
 description = "FASTA reader and writer primitives for Brust."
 keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-brust-core = { path = "../brust-core" }
+brust-core = { path = "../brust-core", version = "0.1.1" }

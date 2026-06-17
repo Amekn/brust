@@ -3,10 +3,10 @@ resolver = "3"
 members = ["bam", "brust", "brust-core", "fasta", "fastq", "pod5", "sam"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Kang Zhou"]
 repository = "https://github.com/Amekn/brust"
 license = "MIT OR Apache-2.0"
-keywords = ["bioinformatics", "fasta", "fastq", "sam", "bam", "pod5"]
-categories = ["bioinformatics"]
+keywords = ["bioinformatics", "fasta", "fastq", "sam", "bam"]
+categories = ["science::bioinformatics", "parser-implementations"]

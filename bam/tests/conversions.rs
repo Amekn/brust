@@ -1,4 +1,4 @@
-use bam::{Bam, BamReader, BgzfVirtualOffset};
+use brust_bam::{Bam, BamReader, BgzfVirtualOffset};
 use sam::{Sam, SamHeader, SamHeaderField, SamHeaderRecord, SamRecord};
 
 const ALIGNED_BAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/aligned.bam");

@@ -1,4 +1,4 @@
-use pod5::Pod5;
+use brust_pod5::Pod5;
 
 const A_100_POD5: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/A_100.pod5");
 const FIRST_READ_ID: &str = "1cadb1e9-592f-4e22-9285-4626f2b7da9f";

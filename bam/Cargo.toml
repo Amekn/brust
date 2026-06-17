@@ -1,15 +1,16 @@
 [package]
-name = "bam"
+name = "brust-bam"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+readme = "README.md"
 description = "BAM and BGZF reader, writer, and SAM conversion helpers for Brust."
 keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-brust-core = { path = "../brust-core" }
+brust-core = { path = "../brust-core", version = "0.1.1" }
 flate2 = "1.1.9"
-sam = { path = "../sam" }
+sam = { package = "brust-sam", path = "../sam", version = "0.1.1" }

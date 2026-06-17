@@ -1,4 +1,4 @@
-use sam::{Sam, SamRecord, flags};
+use brust_sam::{Sam, SamRecord, flags};
 use std::io;
 
 #[test]

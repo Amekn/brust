@@ -1,4 +1,4 @@
-use fastq::Fastq;
+use brust_fastq::Fastq;
 use std::io;
 
 #[test]

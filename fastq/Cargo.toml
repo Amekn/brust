@@ -1,14 +1,15 @@
 [package]
-name = "fastq"
+name = "brust-fastq"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+readme = "README.md"
 description = "FASTQ reader, writer, and FASTA conversion helpers for Brust."
 keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-brust-core = { path = "../brust-core" }
-fasta = { path = "../fasta" }
+brust-core = { path = "../brust-core", version = "0.1.1" }
+fasta = { package = "brust-fasta", path = "../fasta", version = "0.1.1" }

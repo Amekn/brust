@@ -1,13 +1,14 @@
 [package]
-name = "sam"
+name = "brust-sam"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+readme = "README.md"
 description = "SAM reader, writer, parser validation, and flag helpers for Brust."
 keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-brust-core = { path = "../brust-core" }
+brust-core = { path = "../brust-core", version = "0.1.1" }

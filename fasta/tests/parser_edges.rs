@@ -1,4 +1,4 @@
-use fasta::{Fasta, FastaRecord};
+use brust_fasta::{Fasta, FastaRecord};
 use std::io;
 
 #[test]

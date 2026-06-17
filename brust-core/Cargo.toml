@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
+readme = "README.md"
 description = "Shared error and result types for Brust bioinformatics format crates."
 keywords.workspace = true
 categories.workspace = true
