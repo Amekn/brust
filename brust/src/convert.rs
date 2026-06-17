@@ -299,3 +299,95 @@ fn create_temp_output_path(output: &Path) -> Result<PathBuf> {
         output.display()
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "brust-convert-test-{}-{counter}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn conversion_metadata_matches_supported_paths() {
+        // The CLI relies on these stable names and format pairs for dispatch.
+        assert_eq!(Conversion::FastqToFasta.name(), "fastq-to-fasta");
+        assert_eq!(Conversion::FastqToFasta.input_format(), Format::Fastq);
+        assert_eq!(Conversion::FastqToFasta.output_format(), Format::Fasta);
+        assert_eq!(Conversion::SamToBam.name(), "sam-to-bam");
+        assert_eq!(Conversion::SamToBam.input_format(), Format::Sam);
+        assert_eq!(Conversion::SamToBam.output_format(), Format::Bam);
+        assert_eq!(Conversion::BamToFastq.name(), "bam-to-fastq");
+        assert_eq!(Conversion::BamToFastq.input_format(), Format::Bam);
+        assert_eq!(Conversion::BamToFastq.output_format(), Format::Fastq);
+    }
+
+    #[test]
+    fn runtime_convert_fastq_to_fasta_drops_quality_scores() {
+        // A tiny fixture keeps the conversion contract readable in the assertion.
+        let dir = TestDir::new();
+        let input = dir.path("reads.fastq");
+        let output = dir.path("reads.fasta");
+        fs::write(&input, "@read1 sample\nACGT\n+\nIIII\n").unwrap();
+
+        convert(Conversion::FastqToFasta, &input, &output).unwrap();
+
+        assert_eq!(fs::read_to_string(output).unwrap(), ">read1 sample\nACGT\n");
+    }
+
+    #[test]
+    fn sam_to_fastq_rejects_records_without_quality_scores() {
+        // FASTQ output requires both SEQ and QUAL, even when SAM parsing succeeds.
+        let dir = TestDir::new();
+        let input = dir.path("reads.sam");
+        let output = dir.path("reads.fastq");
+        fs::write(&input, "read1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t*\n").unwrap();
+
+        let error = sam_to_fastq(&input, &output).unwrap_err();
+
+        assert_eq!(error.format(), Some(Format::Sam));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn failed_conversion_preserves_existing_output_file() {
+        // Atomic writes must leave the original output untouched on parse failure.
+        let dir = TestDir::new();
+        let input = dir.path("broken.fastq");
+        let output = dir.path("reads.fasta");
+        fs::write(&input, "@read1\nACGT\n+\nIII\n").unwrap();
+        fs::write(&output, "keep me\n").unwrap();
+
+        let error = fastq_to_fasta(&input, &output).unwrap_err();
+
+        assert_eq!(error.format(), Some(Format::Fastq));
+        assert_eq!(fs::read_to_string(output).unwrap(), "keep me\n");
+    }
+}

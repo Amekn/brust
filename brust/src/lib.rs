@@ -31,6 +31,7 @@ pub use stats::Stats;
 mod tests {
     #[test]
     fn facade_exports_format_crates() {
+        // Compile-time construction verifies the facade re-exports the format crates.
         let _ = crate::fasta::FastaRecord {
             id: "seq1".to_string(),
             description: None,
@@ -43,5 +44,33 @@ mod tests {
             quality: "IIII".to_string(),
         };
         let _ = crate::sam::SamHeader::default();
+    }
+
+    #[test]
+    fn facade_exports_runtime_helpers() {
+        // Public helper types should be reachable from the top-level crate namespace.
+        assert_eq!(crate::Conversion::FastqToFasta.name(), "fastq-to-fasta");
+        assert_eq!(
+            crate::Stats::Fasta(crate::stats::FastaStats {
+                file_size_bytes: 0,
+                records: 0,
+                sequence_lengths: crate::stats::LengthStats {
+                    count: 0,
+                    total: 0,
+                    min: None,
+                    max: None,
+                    mean: None,
+                    n50: None,
+                    n90: None,
+                },
+                bases: crate::stats::BaseComposition::default(),
+                records_with_description: 0,
+                empty_records: 0,
+                unique_ids: 0,
+                duplicate_id_records: 0,
+            })
+            .format(),
+            crate::Format::Fasta
+        );
     }
 }

@@ -1695,6 +1695,7 @@ mod tests {
 
     #[test]
     fn fasta_fixture_stats_capture_sequence_rollups() {
+        // FASTA stats should count records, lengths, descriptions, and bases.
         let stats = fasta_stats(FASTA).unwrap();
 
         assert_eq!(stats.records, 6);
@@ -1707,6 +1708,7 @@ mod tests {
 
     #[test]
     fn fastq_fixture_stats_capture_quality_rollups() {
+        // FASTQ stats should include both sequence lengths and Phred summaries.
         let stats = fastq_stats(FASTQ).unwrap();
 
         assert_eq!(stats.reads, 100);
@@ -1719,6 +1721,7 @@ mod tests {
 
     #[test]
     fn sam_and_bam_fixture_alignment_stats_match() {
+        // Equivalent SAM/BAM fixtures should produce matching alignment rollups.
         let sam = sam_stats(SAM).unwrap();
         let bam = bam_stats(BAM).unwrap();
 
@@ -1738,6 +1741,7 @@ mod tests {
 
     #[test]
     fn pod5_fixture_stats_capture_metadata_without_signal_decompression() {
+        // POD5 stats summarize metadata and read rows without decoding signal arrays.
         let stats = pod5_stats(POD5).unwrap();
 
         assert_eq!(stats.read_count, 100);
