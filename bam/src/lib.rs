@@ -62,6 +62,21 @@ pub struct BamWriter<W: Write = File> {
     header_written: bool,
 }
 
+/// Converts SAM alignment records to BAM records using one SAM header.
+///
+/// `SamToBamConverter` owns the BAM header, reference dictionary, and reference
+/// lookup derived from a [`sam::SamHeader`]. It is intended for streaming
+/// conversions: construct it once from the parsed header, write
+/// [`SamToBamConverter::header`] and [`SamToBamConverter::refs`] to a
+/// [`BamWriter`], then call [`SamToBamConverter::convert_record`] for each SAM
+/// alignment record as it is read.
+#[derive(Debug, Clone)]
+pub struct SamToBamConverter {
+    header: BamHeader,
+    refs: Vec<BamRef>,
+    reference_ids: HashMap<String, i32>,
+}
+
 /// Packed BGZF virtual offset (`compressed_block_offset << 16 | block_offset`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BgzfVirtualOffset(u64);
@@ -949,6 +964,58 @@ impl BamRecord {
     }
 }
 
+impl SamToBamConverter {
+    /// Builds a converter and BAM header/reference dictionary from a SAM header.
+    ///
+    /// The SAM header is validated by formatting it into the BAM header text and
+    /// extracting all `@SQ` records into the BAM reference dictionary. Records
+    /// converted with this value must reference only these declared references,
+    /// unless they are unmapped and use `*`.
+    pub fn new(header: &sam::SamHeader) -> io::Result<Self> {
+        let mut validation_sink = Vec::new();
+        sam::Sam {
+            header: header.clone(),
+            records: Vec::new(),
+        }
+        .to_writer(&mut validation_sink)?;
+
+        let refs = bam_refs_from_sam_header(header)?;
+        let reference_ids = reference_ids_from_refs(&refs);
+        let text = sam_header_text(header)?;
+        let header = BamHeader {
+            magic: [0x42, 0x41, 0x4D, 0x01],
+            l_text: text.len() as u32,
+            text,
+            n_ref: refs.len() as u32,
+        };
+
+        Ok(Self {
+            header,
+            refs,
+            reference_ids,
+        })
+    }
+
+    /// Returns the BAM header derived from the SAM header.
+    pub fn header(&self) -> &BamHeader {
+        &self.header
+    }
+
+    /// Returns the BAM reference dictionary derived from `@SQ` header records.
+    pub fn refs(&self) -> &[BamRef] {
+        &self.refs
+    }
+
+    /// Converts one SAM alignment record to a BAM record.
+    ///
+    /// This validates the SAM record, resolves reference names against the
+    /// converter's reference dictionary, packs CIGAR/sequence/quality fields,
+    /// converts optional tags, and computes the BAM record `block_size`.
+    pub fn convert_record(&self, record: &sam::SamRecord) -> io::Result<BamRecord> {
+        bam_record_from_sam_record(record, &self.reference_ids)
+    }
+}
+
 impl Bam {
     /// Opens a BAM file and materializes all records into memory.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
@@ -978,7 +1045,18 @@ impl Bam {
     /// `@SQ`, textual sequence and quality fields, standard CIGAR operations,
     /// and scalar/string/hex/numeric-array optional fields.
     pub fn from_sam(sam: &sam::Sam) -> io::Result<Self> {
-        bam_from_sam(sam)
+        let converter = SamToBamConverter::new(&sam.header)?;
+        let records = sam
+            .records
+            .iter()
+            .map(|record| converter.convert_record(record))
+            .collect::<io::Result<Vec<_>>>()?;
+
+        Ok(Self {
+            header: converter.header.clone(),
+            refs: converter.refs.clone(),
+            records,
+        })
     }
 
     /// Converts all records in this BAM payload to SAM records.
@@ -1539,36 +1617,6 @@ fn format_sam_line(record: &sam::SamRecord) -> io::Result<String> {
     record.to_sam_line()
 }
 
-fn bam_from_sam(input: &sam::Sam) -> io::Result<Bam> {
-    let mut validation_sink = Vec::new();
-    input.to_writer(&mut validation_sink)?;
-
-    let refs = bam_refs_from_sam_header(&input.header)?;
-    let reference_ids = refs
-        .iter()
-        .enumerate()
-        .map(|(index, reference)| (reference.name.clone(), index as i32))
-        .collect::<HashMap<_, _>>();
-    let records = input
-        .records
-        .iter()
-        .map(|record| bam_record_from_sam_record(record, &reference_ids))
-        .collect::<io::Result<Vec<_>>>()?;
-    let text = sam_header_text(&input.header)?;
-    let header = BamHeader {
-        magic: [0x42, 0x41, 0x4D, 0x01],
-        l_text: text.len() as u32,
-        text,
-        n_ref: refs.len() as u32,
-    };
-
-    Ok(Bam {
-        header,
-        refs,
-        records,
-    })
-}
-
 fn bam_refs_from_sam_header(header: &sam::SamHeader) -> io::Result<Vec<BamRef>> {
     let mut refs = Vec::new();
     for record in header.records_of_type("SQ") {
@@ -1588,6 +1636,13 @@ fn bam_refs_from_sam_header(header: &sam::SamHeader) -> io::Result<Vec<BamRef>> 
     }
 
     Ok(refs)
+}
+
+fn reference_ids_from_refs(refs: &[BamRef]) -> HashMap<String, i32> {
+    refs.iter()
+        .enumerate()
+        .map(|(index, reference)| (reference.name.clone(), index as i32))
+        .collect()
 }
 
 fn sam_header_text(header: &sam::SamHeader) -> io::Result<String> {
@@ -2283,6 +2338,14 @@ mod bam_tests {
             .into_owned()
     }
 
+    fn workspace_fixture_path(relative: &str) -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(relative)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn open_bam(name: &str) -> BamReader {
         let path = fixture_path(name);
         BamReader::new(&path).unwrap_or_else(|err| panic!("failed to open {name}: {err}"))
@@ -2532,6 +2595,39 @@ mod bam_tests {
         assert_eq!(round_tripped.header, bam.header);
         assert_eq!(round_tripped.refs, bam.refs);
         assert_eq!(round_tripped.records, bam.records[..3]);
+    }
+
+    #[test]
+    fn sam_to_bam_converter_streams_records_matching_materialized_conversion() {
+        let sam_path = workspace_fixture_path("sam/aligned.sam");
+        let mut reader = sam::SamReader::from_path(&sam_path).expect("SAM fixture should open");
+        let converter =
+            SamToBamConverter::new(&reader.header).expect("converter should derive BAM metadata");
+        let mut writer = BamWriter::from_writer(Vec::new());
+
+        writer
+            .write_header(converter.header(), converter.refs())
+            .expect("converted header should write");
+
+        let mut streamed_record_count = 0;
+        while let Some(record) = reader.read_record().expect("SAM record should parse") {
+            let record = converter
+                .convert_record(&record)
+                .expect("SAM record should convert to BAM");
+            writer
+                .write_record(&record)
+                .expect("BAM record should write");
+            streamed_record_count += 1;
+        }
+
+        let output = writer.finish().expect("streaming BAM writer should finish");
+        let streamed = Bam::from_reader(&output[..]).expect("streamed BAM should parse");
+        let materialized_sam = sam::Sam::from_path(&sam_path).expect("SAM fixture should load");
+        let materialized =
+            Bam::from_sam(&materialized_sam).expect("materialized SAM should convert");
+
+        assert_eq!(streamed_record_count, 100);
+        assert_eq!(streamed, materialized);
     }
 
     #[test]

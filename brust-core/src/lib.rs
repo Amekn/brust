@@ -159,6 +159,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
+        if let Some(error) = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Error>())
+        {
+            return error.clone();
+        }
+
         Self::Io(error.to_string())
     }
 }
@@ -233,5 +240,14 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "invalid FASTA: empty ID");
+    }
+
+    #[test]
+    fn preserves_domain_error_when_converting_from_io_error() {
+        let original = Error::invalid(Format::Sam, "bad CIGAR").with_line(12);
+        let wrapped: io::Error = original.clone().into();
+        let converted = Error::from(wrapped);
+
+        assert_eq!(converted, original);
     }
 }

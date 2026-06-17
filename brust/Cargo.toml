@@ -16,3 +16,4 @@ sam = { path = "../sam" }
 bam = { path = "../bam" }
 fastq = { path = "../fastq" }
 pod5 = { path = "../pod5" }
+clap = { version = "4.6.1", features = ["derive"]}
