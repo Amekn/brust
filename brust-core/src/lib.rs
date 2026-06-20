@@ -7,6 +7,47 @@
 
 use std::fmt;
 use std::io;
+use std::path::Path;
+
+/// Compression applied around a biological format stream.
+///
+/// Path-based writers use [`Compression::from_path`] to select gzip for a
+/// final `.gz` suffix, including conventional `.fq.gz` and `.fastq.gz` files.
+/// Readers may additionally inspect stream magic bytes so renamed gzip files
+/// can still be decoded.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Compression {
+    /// Bytes are stored without a compression wrapper.
+    #[default]
+    Uncompressed,
+    /// Bytes are wrapped in a standard gzip stream.
+    Gzip,
+}
+
+impl Compression {
+    /// Infers compression from the final component of a filesystem path.
+    ///
+    /// The comparison is ASCII case-insensitive. Paths without a final `.gz`
+    /// suffix are treated as uncompressed so ordinary `.fq` and `.fastq`
+    /// behavior remains unchanged.
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Self {
+        if path
+            .as_ref()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gz"))
+        {
+            Self::Gzip
+        } else {
+            Self::Uncompressed
+        }
+    }
+
+    /// Returns whether this value represents a compressed stream.
+    pub fn is_compressed(self) -> bool {
+        !matches!(self, Self::Uncompressed)
+    }
+}
 
 /// Format associated with a domain diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,5 +290,18 @@ mod tests {
         let converted = Error::from(wrapped);
 
         assert_eq!(converted, original);
+    }
+
+    #[test]
+    fn compression_is_inferred_from_the_final_gzip_suffix() {
+        // Both conventional FASTQ extensions share the same gzip wrapper.
+        assert_eq!(Compression::from_path("reads.fastq.gz"), Compression::Gzip);
+        assert_eq!(Compression::from_path("reads.fq.GZ"), Compression::Gzip);
+        assert_eq!(
+            Compression::from_path("reads.fastq"),
+            Compression::Uncompressed
+        );
+        assert!(!Compression::Uncompressed.is_compressed());
+        assert!(Compression::Gzip.is_compressed());
     }
 }

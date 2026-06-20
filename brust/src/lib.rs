@@ -12,8 +12,8 @@ pub mod validate;
 
 /// Re-export of the BAM format crate.
 pub use bam;
-/// Shared Brust diagnostic, error, format, and result types.
-pub use brust_core::{Diagnostic, Error, Format, Result};
+/// Shared Brust compression, diagnostic, error, format, and result types.
+pub use brust_core::{Compression, Diagnostic, Error, Format, Result};
 /// Supported conversion paths.
 pub use convert::Conversion;
 /// Re-export of the FASTA format crate.
@@ -49,6 +49,10 @@ mod tests {
     #[test]
     fn facade_exports_runtime_helpers() {
         // Public helper types should be reachable from the top-level crate namespace.
+        assert_eq!(
+            crate::Compression::from_path("reads.fastq.gz"),
+            crate::Compression::Gzip
+        );
         assert_eq!(crate::Conversion::FastqToFasta.name(), "fastq-to-fasta");
         assert_eq!(
             crate::Stats::Fasta(crate::stats::FastaStats {

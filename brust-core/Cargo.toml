@@ -1,6 +1,6 @@
 [package]
 name = "brust-core"
-version.workspace = true
+version = "0.1.2"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true

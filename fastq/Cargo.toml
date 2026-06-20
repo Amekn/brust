@@ -1,6 +1,6 @@
 [package]
 name = "brust-fastq"
-version.workspace = true
+version = "0.1.2"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -11,5 +11,6 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-brust-core = { path = "../brust-core", version = "0.1.1" }
+brust-core = { path = "../brust-core", version = "0.1.2" }
 fasta = { package = "brust-fasta", path = "../fasta", version = "0.1.1" }
+flate2 = "1.1.9"

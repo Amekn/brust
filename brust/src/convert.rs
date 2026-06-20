@@ -4,7 +4,8 @@
 //! writers, avoiding whole-file materialization in the facade layer. Outputs are
 //! written through a temporary file that is renamed only after successful
 //! completion, protecting existing output files from being replaced by a partial
-//! conversion when parsing or writing fails.
+//! conversion when parsing or writing fails. Temporary names preserve the final
+//! suffix so `.fq.gz` and `.fastq.gz` outputs select streaming gzip compression.
 
 use crate::{Error, Format, Result};
 use std::ffi::OsString;
@@ -175,6 +176,8 @@ pub fn bam_to_sam<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result
 }
 
 /// Converts SAM records with stored sequence and qualities to FASTQ.
+///
+/// A `.fq.gz` or `.fastq.gz` output path is compressed while records stream.
 pub fn sam_to_fastq<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result<()> {
     let input = input.as_ref();
     write_atomic(output.as_ref(), |temp_output| {
@@ -183,12 +186,14 @@ pub fn sam_to_fastq<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Resu
         while let Some(record) = reader.read_record()? {
             writer.write_record(&sam_record_to_fastq(&record, Format::Sam)?)?;
         }
-        writer.flush()?;
+        writer.finish()?;
         Ok(())
     })
 }
 
 /// Converts BAM records with stored sequence and qualities to FASTQ.
+///
+/// A `.fq.gz` or `.fastq.gz` output path is compressed while records stream.
 pub fn bam_to_fastq<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result<()> {
     let input = input.as_ref();
     write_atomic(output.as_ref(), |temp_output| {
@@ -199,7 +204,7 @@ pub fn bam_to_fastq<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Resu
             let record = record.to_sam_record(&refs)?;
             writer.write_record(&sam_record_to_fastq(&record, Format::Bam)?)?;
         }
-        writer.flush()?;
+        writer.finish()?;
         Ok(())
     })
 }
@@ -278,9 +283,10 @@ fn create_temp_output_path(output: &Path) -> Result<PathBuf> {
 
     for _ in 0..100 {
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut temp_name = OsString::from(".");
+        // Keep the complete destination name at the end so suffix-driven
+        // writers see `.gz`, `.bam`, and other format indicators unchanged.
+        let mut temp_name = OsString::from(format!(".{}.{}.tmp.", process::id(), counter));
         temp_name.push(file_name);
-        temp_name.push(format!(".{}.{}.tmp", process::id(), counter));
         let temp_path = parent.join(temp_name);
 
         match OpenOptions::new()
@@ -360,6 +366,33 @@ mod tests {
         convert(Conversion::FastqToFasta, &input, &output).unwrap();
 
         assert_eq!(fs::read_to_string(output).unwrap(), ">read1 sample\nACGT\n");
+    }
+
+    #[test]
+    fn sam_to_fastq_compresses_gzip_destination() {
+        // Atomic temporary output retains `.gz`, so the FASTQ writer compresses it.
+        let dir = TestDir::new();
+        let input = dir.path("reads.sam");
+        let output = dir.path("reads.fq.gz");
+        fs::write(&input, "read1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\n").unwrap();
+
+        sam_to_fastq(&input, &output).unwrap();
+
+        assert_eq!(&fs::read(&output).unwrap()[..2], &[0x1f, 0x8b]);
+        let fastq = fastq::Fastq::from_path(output).unwrap();
+        assert_eq!(fastq.records.len(), 1);
+        assert_eq!(fastq.records[0].sequence, "ACGT");
+    }
+
+    #[test]
+    fn temporary_output_keeps_destination_suffix() {
+        // Compression selection relies on the final extension of the temporary path.
+        let dir = TestDir::new();
+        let output = dir.path("reads.fastq.gz");
+        let temporary = create_temp_output_path(&output).unwrap();
+
+        assert!(temporary.to_string_lossy().ends_with("reads.fastq.gz"));
+        fs::remove_file(temporary).unwrap();
     }
 
     #[test]

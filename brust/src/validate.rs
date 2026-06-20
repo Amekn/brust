@@ -20,7 +20,7 @@ pub fn validate<P: AsRef<Path>>(format: Format, input: P) -> Result<()> {
     }
 }
 
-/// Validates FASTQ by streaming every record through the parser.
+/// Validates plain or gzip FASTQ by streaming every record through the parser.
 pub fn validate_fastq<P: AsRef<Path>>(input: P) -> Result<()> {
     let mut reader = fastq::FastqReader::from_path(input.as_ref())?;
     while let Some(_record) = reader.read_record()? {
@@ -126,6 +126,25 @@ mod tests {
         let error = validate_fastq(&input).unwrap_err();
 
         assert_eq!(error.format(), Some(Format::Fastq));
+    }
+
+    #[test]
+    fn validate_fastq_accepts_gzip_streams() {
+        // Path-based validation inherits transparent decompression from FastqReader.
+        let dir = TestDir::new();
+        let input = dir.path("reads.fastq.gz");
+        let mut writer = fastq::FastqWriter::from_path(&input).unwrap();
+        writer
+            .write_record(&fastq::FastqRecord::new(
+                "read1".to_string(),
+                None,
+                "ACGT".to_string(),
+                "IIII".to_string(),
+            ))
+            .unwrap();
+        writer.finish().unwrap();
+
+        validate_fastq(input).unwrap();
     }
 
     #[test]

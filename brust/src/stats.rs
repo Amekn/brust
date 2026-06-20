@@ -525,7 +525,7 @@ pub fn fasta_stats<P: AsRef<Path>>(input: P) -> Result<FastaStats> {
     })
 }
 
-/// Computes typed FASTQ statistics.
+/// Computes typed statistics from a plain or gzip-compressed FASTQ stream.
 pub fn fastq_stats<P: AsRef<Path>>(input: P) -> Result<FastqStats> {
     let path = input.as_ref();
     let file_size_bytes = fs::metadata(path)?.len();
@@ -1689,6 +1689,10 @@ mod tests {
 
     const FASTA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../fasta/ace2_fragments.fasta");
     const FASTQ: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../fastq/UDP0057_sub100.fastq");
+    const FASTQ_GZIP: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../fastq/UDP0057_sub100.fastq.gz"
+    );
     const SAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../sam/aligned.sam");
     const BAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bam/aligned.bam");
     const POD5: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../pod5/A_100.pod5");
@@ -1717,6 +1721,19 @@ mod tests {
         assert_eq!(stats.qualities.q20_bases, 43_271);
         assert_eq!(stats.qualities.q30_bases, 36_286);
         assert_eq!(stats.reads_with_n, 0);
+    }
+
+    #[test]
+    fn gzip_fastq_stats_match_the_plain_record_rollups() {
+        // Physical file size differs, while decompressed biological metrics match.
+        let plain = fastq_stats(FASTQ).unwrap();
+        let compressed = fastq_stats(FASTQ_GZIP).unwrap();
+
+        assert!(compressed.file_size_bytes < plain.file_size_bytes);
+        assert_eq!(compressed.reads, plain.reads);
+        assert_eq!(compressed.read_lengths, plain.read_lengths);
+        assert_eq!(compressed.qualities, plain.qualities);
+        assert_eq!(compressed.bases, plain.bases);
     }
 
     #[test]

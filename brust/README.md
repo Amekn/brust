@@ -5,6 +5,10 @@ bioinformatics workspace. It re-exports the format crates under one namespace
 and provides parser-backed validation, structured statistics, and safe format
 conversion helpers.
 
+FASTQ operations transparently read gzip streams and write gzip when the output
+path ends in `.gz`, supporting both `.fq.gz` and `.fastq.gz` while retaining the
+streaming behavior of the plain-text APIs.
+
 The crate is designed for applications that want one dependency for FASTA,
 FASTQ, SAM, BAM, and POD5 handling:
 
@@ -42,6 +46,7 @@ Validate files with the same parsers used by the library:
 ```bash
 brust validate fasta reads.fasta
 brust validate fastq reads.fastq
+brust validate fastq reads.fastq.gz
 brust validate sam aligned.sam
 brust validate bam aligned.bam
 brust validate pod5 reads.pod5
@@ -51,6 +56,7 @@ Print human-readable statistics:
 
 ```bash
 brust stats fastq reads.fastq
+brust stats fastq reads.fastq.gz
 brust stats bam aligned.bam
 brust stats pod5 reads.pod5
 ```
@@ -65,11 +71,13 @@ brust convert sam-to-bam aligned.sam aligned.bam
 brust convert bam-to-sam aligned.bam aligned.sam
 brust convert sam-to-fastq aligned.sam reads.fastq
 brust convert bam-to-fastq aligned.bam reads.fastq
+brust convert bam-to-fastq aligned.bam reads.fastq.gz
 ```
 
 Conversions stream records and write through a temporary output path before
 renaming, so an existing output file is not replaced by a partial file when
-parsing or writing fails.
+parsing or writing fails. Temporary output names preserve the destination
+suffix, ensuring requested gzip FASTQ output is compressed before the rename.
 
 ## Public API
 

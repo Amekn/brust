@@ -7,6 +7,12 @@ use std::fs;
 fn validation_dispatcher_accepts_all_fixture_formats() {
     validate::validate(Format::Fasta, common::fixture("fasta/ace2_fragments.fasta")).unwrap();
     validate::validate(Format::Fastq, common::fixture("fastq/UDP0057_sub100.fastq")).unwrap();
+    // Gzip input follows the same parser-backed validation path.
+    validate::validate(
+        Format::Fastq,
+        common::fixture("fastq/UDP0057_sub100.fastq.gz"),
+    )
+    .unwrap();
     validate::validate(Format::Sam, common::fixture("sam/aligned.sam")).unwrap();
     validate::validate(Format::Bam, common::fixture("bam/aligned.bam")).unwrap();
     validate::validate(Format::Pod5, common::fixture("pod5/A_100.pod5")).unwrap();
@@ -72,4 +78,15 @@ fn stats_dispatcher_returns_typed_variants_with_fixture_rollups() {
         }
         _ => panic!("expected POD5 stats"),
     }
+}
+
+#[test]
+fn compressed_fastq_stats_match_plain_fastq_stats() {
+    // Biological rollups are computed after streaming decompression.
+    let plain = stats::fastq_stats(common::fixture("fastq/UDP0057_sub100.fastq")).unwrap();
+    let gzip = stats::fastq_stats(common::fixture("fastq/UDP0057_sub100.fastq.gz")).unwrap();
+
+    assert_eq!(gzip.reads, plain.reads);
+    assert_eq!(gzip.read_lengths, plain.read_lengths);
+    assert_eq!(gzip.qualities, plain.qualities);
 }

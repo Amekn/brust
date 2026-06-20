@@ -1,6 +1,6 @@
 [package]
 name = "brust"
-version.workspace = true
+version = "0.1.2"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -11,10 +11,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-brust-core = { path = "../brust-core", version = "0.1.1" }
+brust-core = { path = "../brust-core", version = "0.1.2" }
 fasta = { package = "brust-fasta", path = "../fasta", version = "0.1.1" }
 sam = { package = "brust-sam", path = "../sam", version = "0.1.1" }
 bam = { package = "brust-bam", path = "../bam", version = "0.1.1" }
-fastq = { package = "brust-fastq", path = "../fastq", version = "0.1.1" }
+fastq = { package = "brust-fastq", path = "../fastq", version = "0.1.2" }
 pod5 = { package = "brust-pod5", path = "../pod5", version = "0.1.1" }
 clap = { version = "4.6.1", features = ["derive"] }

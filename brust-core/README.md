@@ -19,10 +19,14 @@ cargo add brust-core
 The crate provides:
 
 - `Format`: the supported format enum: FASTA, FASTQ, SAM, BAM, and POD5.
+- `Compression`: shared uncompressed/gzip selection for path-based format I/O.
 - `Diagnostic`: message plus optional line and field context.
 - `Error`: cloneable Brust error type with format-specific invalid-data
   variants and an I/O variant.
 - `Result<T>`: alias for `std::result::Result<T, Error>`.
+
+`Compression::from_path` recognizes a final `.gz` suffix case-insensitively,
+including the conventional `.fq.gz` and `.fastq.gz` FASTQ names.
 
 ## Example
 

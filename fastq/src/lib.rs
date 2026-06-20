@@ -5,6 +5,8 @@
 //! - [`FastqReader`] reads one [`FastqRecord`] at a time from any [`Read`]
 //!   source.
 //! - [`Fastq`] owns every parsed record and can be cloned or written back out.
+//! - Path APIs transparently decompress gzip input and compress output whose
+//!   name ends in `.gz`, including `.fq.gz` and `.fastq.gz`.
 //!
 //! FASTQ headers are split at the first whitespace character: the first token
 //! after `@` is the record ID, and the remaining text is stored as the optional
@@ -13,11 +15,79 @@
 //! sequence length. The writer emits a canonical four-line record with a bare
 //! `+` separator and validates that sequence and quality lengths match.
 
-use brust_core::{Error, Format};
+use brust_core::{Compression, Error, Format};
 use fasta::{Fasta, FastaRecord};
+use flate2::Compression as GzipLevel;
+use flate2::read::MultiGzDecoder;
+use flate2::write::GzEncoder;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
+
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+fn has_gzip_magic_prefix(buffer: &[u8]) -> bool {
+    match buffer {
+        [first, second, ..] => [*first, *second] == GZIP_MAGIC,
+        // A streaming reader may yield only one byte at a time. The decoder
+        // validates the second magic byte once it arrives.
+        [first] => *first == GZIP_MAGIC[0],
+        [] => false,
+    }
+}
+
+/// Buffered plain or gzip-decoded input used by the streaming parser.
+enum FastqInput<R: Read> {
+    Plain(BufReader<R>),
+    Gzip(Box<BufReader<MultiGzDecoder<BufReader<R>>>>),
+}
+
+impl<R: Read> Read for FastqInput<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(reader) => reader.read(buffer),
+            Self::Gzip(reader) => reader.read(buffer),
+        }
+    }
+}
+
+impl<R: Read> BufRead for FastqInput<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        match self {
+            Self::Plain(reader) => reader.fill_buf(),
+            Self::Gzip(reader) => reader.fill_buf(),
+        }
+    }
+
+    fn consume(&mut self, amount: usize) {
+        match self {
+            Self::Plain(reader) => reader.consume(amount),
+            Self::Gzip(reader) => reader.consume(amount),
+        }
+    }
+}
+
+/// Plain or gzip-encoded output used by the streaming writer.
+enum FastqOutput<W: Write> {
+    Plain(W),
+    Gzip(GzEncoder<W>),
+}
+
+impl<W: Write> Write for FastqOutput<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(writer) => writer.write(buffer),
+            Self::Gzip(writer) => writer.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(writer) => writer.flush(),
+            Self::Gzip(writer) => writer.flush(),
+        }
+    }
+}
 
 /// Streaming FASTQ parser over any readable byte stream.
 ///
@@ -25,7 +95,7 @@ use std::path::Path;
 /// it is intentionally not cloneable. Use [`FastqReader::read_all`] or
 /// [`Fastq::from_path`] when a cloneable, in-memory representation is needed.
 pub struct FastqReader<R: Read = File> {
-    reader: BufReader<R>,
+    reader: FastqInput<R>,
     // Number of lines consumed from the underlying reader.
     line_number: usize,
 }
@@ -33,16 +103,26 @@ pub struct FastqReader<R: Read = File> {
 /// Streaming FASTQ writer over any writable byte stream.
 ///
 /// `FastqWriter` emits one [`FastqRecord`] at a time. It validates record shape
-/// before writing and always writes sequence and quality as single lines.
+/// before writing and always writes sequence and quality as single lines. Call
+/// [`FastqWriter::finish`] to finalize gzip output and report trailer errors.
 pub struct FastqWriter<W: Write = File> {
-    writer: W,
+    writer: FastqOutput<W>,
 }
 
 impl FastqReader<File> {
-    /// Opens a FASTQ file from a filesystem path.
+    /// Opens a plain or gzip-compressed FASTQ file from a filesystem path.
+    ///
+    /// A final `.gz` suffix selects gzip, and gzip magic bytes are also
+    /// recognized when the file has been renamed. Decompression occurs as
+    /// records are read rather than materializing the decompressed file.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let compression = Compression::from_path(path.as_ref());
         let file = File::open(path)?;
-        Self::from_reader(file)
+        if compression == Compression::Gzip {
+            Self::from_reader_with_compression(file, compression)
+        } else {
+            Self::from_reader(file)
+        }
     }
 
     /// Opens a FASTQ file from a filesystem path.
@@ -54,12 +134,44 @@ impl FastqReader<File> {
 }
 
 impl<R: Read> FastqReader<R> {
-    /// Creates a streaming parser from a FASTQ byte stream.
+    /// Creates a streaming parser from a plain or gzip FASTQ byte stream.
+    ///
+    /// The reader peeks at the stream's gzip magic bytes without consuming
+    /// them. Use [`FastqReader::from_reader_with_compression`] when compression
+    /// is known out of band.
     pub fn from_reader(reader: R) -> io::Result<Self> {
-        Ok(Self {
-            reader: BufReader::new(reader),
+        let mut reader = BufReader::new(reader);
+        let compression = if has_gzip_magic_prefix(reader.fill_buf()?) {
+            Compression::Gzip
+        } else {
+            Compression::Uncompressed
+        };
+        Ok(Self::from_buffered_reader(reader, compression))
+    }
+
+    /// Creates a streaming parser with the specified compression wrapper.
+    ///
+    /// Unlike [`FastqReader::from_reader`], this constructor does not inspect
+    /// magic bytes and uses the caller's selection directly.
+    pub fn from_reader_with_compression(reader: R, compression: Compression) -> io::Result<Self> {
+        Ok(Self::from_buffered_reader(
+            BufReader::new(reader),
+            compression,
+        ))
+    }
+
+    fn from_buffered_reader(reader: BufReader<R>, compression: Compression) -> Self {
+        let reader = match compression {
+            Compression::Uncompressed => FastqInput::Plain(reader),
+            Compression::Gzip => {
+                FastqInput::Gzip(Box::new(BufReader::new(MultiGzDecoder::new(reader))))
+            }
+        };
+
+        Self {
+            reader,
             line_number: 0,
-        })
+        }
     }
 
     /// Reads the next FASTQ record from the stream.
@@ -202,10 +314,25 @@ impl<R: Read> FastqReader<R> {
 }
 
 impl FastqWriter<File> {
-    /// Creates or truncates a FASTQ file at a filesystem path.
+    /// Creates or truncates a plain or gzip-compressed FASTQ path.
+    ///
+    /// A final `.gz` suffix selects streaming gzip compression. Other paths,
+    /// including `.fq` and `.fastq`, remain plain text.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let compression = Compression::from_path(path.as_ref());
+        Self::from_path_with_compression(path, compression)
+    }
+
+    /// Creates a FASTQ path with an explicit compression wrapper.
+    ///
+    /// This is useful for temporary output paths whose suffix does not reflect
+    /// the final destination's compression.
+    pub fn from_path_with_compression<P: AsRef<Path>>(
+        path: P,
+        compression: Compression,
+    ) -> io::Result<Self> {
         let file = File::create(path)?;
-        Ok(Self::from_writer(file))
+        Ok(Self::from_writer_with_compression(file, compression))
     }
 
     /// Creates or truncates a FASTQ file at a filesystem path.
@@ -219,6 +346,19 @@ impl FastqWriter<File> {
 impl<W: Write> FastqWriter<W> {
     /// Creates a FASTQ writer from a writable byte stream.
     pub fn from_writer(writer: W) -> Self {
+        Self::from_writer_with_compression(writer, Compression::Uncompressed)
+    }
+
+    /// Creates a FASTQ writer with an explicit compression wrapper.
+    ///
+    /// Gzip bytes are emitted incrementally as records are written. Call
+    /// [`FastqWriter::finish`] to write the gzip trailer and surface any final
+    /// I/O error.
+    pub fn from_writer_with_compression(writer: W, compression: Compression) -> Self {
+        let writer = match compression {
+            Compression::Uncompressed => FastqOutput::Plain(writer),
+            Compression::Gzip => FastqOutput::Gzip(GzEncoder::new(writer, GzipLevel::default())),
+        };
         Self { writer }
     }
 
@@ -266,9 +406,27 @@ impl<W: Write> FastqWriter<W> {
         self.writer.flush()
     }
 
-    /// Consumes this writer and returns the wrapped byte stream.
+    /// Finishes the stream and returns the wrapped writer.
+    ///
+    /// For gzip output this writes and validates the stream trailer. For plain
+    /// output it flushes the wrapped writer.
+    pub fn finish(self) -> io::Result<W> {
+        match self.writer {
+            FastqOutput::Plain(mut writer) => {
+                writer.flush()?;
+                Ok(writer)
+            }
+            FastqOutput::Gzip(writer) => writer.finish(),
+        }
+    }
+
+    /// Consumes this writer, finalizes compression, and returns its byte stream.
+    ///
+    /// This preserves the original infallible API and panics if finalization
+    /// fails. Prefer [`FastqWriter::finish`] when an I/O failure must be handled.
     pub fn into_inner(self) -> W {
-        self.writer
+        self.finish()
+            .expect("failed to finalize FASTQ output before returning its writer")
     }
 }
 
@@ -293,18 +451,20 @@ impl Fastq {
         FastqReader::from_reader(reader)?.read_all()
     }
 
-    /// Writes this FASTQ payload to a filesystem path.
+    /// Writes this FASTQ payload to a plain or gzip filesystem path.
+    ///
+    /// A final `.gz` suffix selects streaming gzip compression.
     pub fn to_path<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let mut writer = FastqWriter::from_path(path)?;
         writer.write_all(self)?;
-        writer.flush()
+        writer.finish().map(drop)
     }
 
     /// Writes this FASTQ payload to a writable byte stream.
     pub fn to_writer<W: Write>(&self, writer: W) -> io::Result<()> {
         let mut writer = FastqWriter::from_writer(writer);
         writer.write_all(self)?;
-        writer.flush()
+        writer.finish().map(drop)
     }
 
     /// Converts this FASTQ payload to FASTA records, dropping quality scores.
@@ -423,6 +583,7 @@ mod fastq_tests {
     use super::*;
 
     const UDP0057_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/UDP0057_sub100.fastq");
+    const UDP0057_GZIP_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/UDP0057_sub100.fastq.gz");
     const UDP0057_RECORD_COUNT: usize = 100;
     const UDP0057_READ_LENGTH: usize = 687;
     const FIRST_ID: &str = "FT100112191L1C001R00100001474:UMI_GATGTTAT_AGTAGTTC";
@@ -484,6 +645,18 @@ mod fastq_tests {
                 .iter()
                 .all(|record| record.sequence.len() == record.quality.len())
         );
+    }
+
+    #[test]
+    fn gzip_fixture_is_decompressed_while_records_are_read() {
+        // The compressed fixture must expose the same record stream as the plain file.
+        let mut reader = FastqReader::from_path(UDP0057_GZIP_PATH).unwrap();
+        let first = reader.read_record().unwrap().unwrap();
+        let remaining = reader.records().count();
+
+        assert_eq!(first.id, FIRST_ID);
+        assert_sample_record_shape(&first);
+        assert_eq!(remaining + 1, UDP0057_RECORD_COUNT);
     }
 
     #[test]
@@ -564,6 +737,46 @@ mod fastq_tests {
     }
 
     #[test]
+    fn gzip_writer_round_trips_through_magic_detection() {
+        // Explicit compression supports non-file sinks without buffering all records.
+        let fastq = Fastq::from_reader(&b"@seq1\nACGT\n+\nIIII\n"[..]).unwrap();
+        let mut writer = FastqWriter::from_writer_with_compression(Vec::new(), Compression::Gzip);
+        writer.write_all(&fastq).unwrap();
+        let output = writer.finish().unwrap();
+
+        assert_eq!(&output[..2], &GZIP_MAGIC);
+        assert_eq!(Fastq::from_reader(&output[..]).unwrap(), fastq);
+    }
+
+    #[test]
+    fn gzip_magic_detection_handles_one_byte_reader_chunks() {
+        struct BytewiseReader<R>(R);
+
+        impl<R: Read> Read for BytewiseReader<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let chunk_length = buffer.len().min(1);
+                self.0.read(&mut buffer[..chunk_length])
+            }
+        }
+
+        // Compression detection must not assume one underlying read fills both magic bytes.
+        let mut writer = FastqWriter::from_writer_with_compression(Vec::new(), Compression::Gzip);
+        writer
+            .write_record(&FastqRecord::new(
+                "seq1".to_string(),
+                None,
+                "ACGT".to_string(),
+                "IIII".to_string(),
+            ))
+            .unwrap();
+        let compressed = writer.finish().unwrap();
+
+        let fastq = Fastq::from_reader(BytewiseReader(&compressed[..])).unwrap();
+        assert_eq!(fastq.records.len(), 1);
+        assert_eq!(fastq.records[0].id, "seq1");
+    }
+
+    #[test]
     fn writer_emits_expected_record_shape() {
         let record = FastqRecord::new(
             "seq1".to_string(),
@@ -574,6 +787,7 @@ mod fastq_tests {
         let mut output = Vec::new();
         let mut writer = FastqWriter::from_writer(&mut output);
         writer.write_record(&record).unwrap();
+        writer.finish().unwrap();
 
         assert_eq!(
             String::from_utf8(output).unwrap(),

@@ -73,3 +73,32 @@ fn convert_cli_writes_expected_output() {
     let fasta = fasta::Fasta::from_path(&output_path).unwrap();
     assert_eq!(fasta.records.len(), 100);
 }
+
+#[test]
+fn cli_validates_and_converts_compressed_fastq() {
+    let input = common::fixture("fastq/UDP0057_sub100.fastq.gz");
+    let temp = common::TempDir::new("cli-compressed-fastq");
+    let output_path = temp.join("reads.fasta");
+
+    // CLI validation and conversion share the gzip-aware facade readers.
+    let validation = brust()
+        .args(["validate", "fastq", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(validation.status.success());
+
+    let conversion = brust()
+        .args([
+            "convert",
+            "fastq-to-fasta",
+            input.to_str().unwrap(),
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(conversion.status.success());
+    assert_eq!(
+        fasta::Fasta::from_path(output_path).unwrap().records.len(),
+        100
+    );
+}

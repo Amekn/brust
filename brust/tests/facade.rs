@@ -1,4 +1,4 @@
-use brust::{Conversion, Error, Format, Stats, bam, fasta, fastq, pod5, sam};
+use brust::{Compression, Conversion, Error, Format, Stats, bam, fasta, fastq, pod5, sam};
 
 #[test]
 fn facade_reexports_format_crates_and_shared_error() {
@@ -13,6 +13,7 @@ fn facade_reexports_format_crates_and_shared_error() {
     let _ = bam::BgzfVirtualOffset::new(10, 4);
     let _ = pod5::Pod5SectionKind::Reads;
     let _ = Conversion::FastqToFasta;
+    let _ = Compression::from_path("reads.fastq.gz");
     let _ = Stats::Fasta(brust::stats::FastaStats {
         file_size_bytes: 0,
         records: 0,
@@ -34,4 +35,5 @@ fn facade_reexports_format_crates_and_shared_error() {
 
     let error = Error::invalid(Format::Fasta, "empty ID");
     assert_eq!(error.to_string(), "invalid FASTA: empty ID");
+    assert_eq!(Compression::from_path("reads.fq.gz"), Compression::Gzip);
 }

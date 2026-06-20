@@ -48,6 +48,32 @@ fn fastq_alignment_conversions_stream_unmapped_records() {
 }
 
 #[test]
+fn compressed_fastq_inputs_and_outputs_stream_through_conversions() {
+    let temp = common::TempDir::new("compressed-fastq-conversions");
+    let fasta_output = temp.join("reads.fasta");
+    let fastq_output = temp.join("aligned.fq.gz");
+
+    // Compressed FASTQ input is decoded record-by-record during conversion.
+    convert::fastq_to_fasta(
+        common::fixture("fastq/UDP0057_sub100.fastq.gz"),
+        &fasta_output,
+    )
+    .unwrap();
+    assert_eq!(
+        fasta::Fasta::from_path(fasta_output).unwrap().records.len(),
+        100
+    );
+
+    // A gzip FASTQ destination remains compressed through the atomic temp path.
+    convert::sam_to_fastq(common::fixture("sam/aligned.sam"), &fastq_output).unwrap();
+    assert_eq!(&fs::read(&fastq_output).unwrap()[..2], &[0x1f, 0x8b]);
+    assert_eq!(
+        fastq::Fastq::from_path(fastq_output).unwrap().records.len(),
+        100
+    );
+}
+
+#[test]
 fn supported_alignment_conversions_round_trip_through_real_fixtures() {
     let temp = common::TempDir::new("alignment-conversions");
     let bam_output = temp.join("aligned.bam");
