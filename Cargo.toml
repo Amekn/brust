@@ -5,6 +5,7 @@ members = ["bam", "brust", "brust-core", "fasta", "fastq", "pod5", "sam"]
 [workspace.package]
 version = "0.1.2"
 edition = "2024"
+rust-version = "1.96"
 authors = ["Kang Zhou"]
 repository = "https://github.com/Amekn/brust"
 license = "MIT OR Apache-2.0"
