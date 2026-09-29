@@ -327,7 +327,9 @@ const PER_WORKER: usize = 2;
 ///
 /// If any call returns an error, the stream is incomplete, so every later
 /// [`Write::write`], [`Write::flush`] or [`BgzfWriter::finish`] returns an
-/// error too. The call that hit the original error returns that error.
+/// error too. The call that hit the original error returns that error. The
+/// same holds after a call that panicked, for example because the wrapped
+/// writer panicked and the caller caught the panic.
 pub struct BgzfWriter<W: Write> {
     inner: W,
     /// Uncompressed bytes not yet written as a block; never longer than
@@ -338,7 +340,8 @@ pub struct BgzfWriter<W: Write> {
     framed: Vec<u8>,
     /// Worker threads that compress blocks; `None` compresses inline.
     pool: Option<Pool>,
-    /// Set once any call has returned an error.
+    /// Set once any call has returned an error or panicked, and while a call
+    /// runs.
     failed: bool,
 }
 
@@ -415,11 +418,19 @@ impl<W: Write> BgzfWriter<W> {
         }
     }
 
-    /// Passes `result` through, marking the writer failed if it is an error.
-    fn track<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        if result.is_err() {
-            self.failed = true;
-        }
+    /// Runs one `write` or `flush` call, leaving the writer failed unless the
+    /// call returns `Ok`.
+    ///
+    /// If an earlier call failed, returns the poison error without running
+    /// `call`. `failed` stays set while `call` runs, so a call that panics part
+    /// way also leaves the writer failed, even if the caller catches the panic:
+    /// the buffered block and the blocks in flight may no longer match the
+    /// stream.
+    fn guarded<T>(&mut self, call: impl FnOnce(&mut Self) -> io::Result<T>) -> io::Result<T> {
+        self.ensure_not_failed()?;
+        self.failed = true;
+        let result = call(self);
+        self.failed = result.is_err();
         result
     }
 
@@ -483,9 +494,7 @@ impl<W: Write> Write for BgzfWriter<W> {
     /// instead and writes any blocks already compressed, in order. If two
     /// blocks per worker are already in flight, it waits for the oldest first.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.ensure_not_failed()?;
-        let result = self.buffer(buf).map(|()| buf.len());
-        self.track(result)
+        self.guarded(|writer| writer.buffer(buf).map(|()| buf.len()))
     }
 
     /// Writes any buffered bytes as a block, then flushes the wrapped writer.
@@ -493,12 +502,12 @@ impl<W: Write> Write for BgzfWriter<W> {
     /// A threaded writer waits for and writes every block in flight before it
     /// flushes. No block is added if no bytes are buffered.
     fn flush(&mut self) -> io::Result<()> {
-        self.ensure_not_failed()?;
-        let result = self
-            .write_pending_partial()
-            .and_then(|()| self.write_in_flight())
-            .and_then(|()| self.inner.flush());
-        self.track(result)
+        self.guarded(|writer| {
+            writer
+                .write_pending_partial()
+                .and_then(|()| writer.write_in_flight())
+                .and_then(|()| writer.inner.flush())
+        })
     }
 }
 
@@ -752,6 +761,58 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Inner writer that panics with "injected panic" once a write would take
+    /// it past `panic_after` bytes.
+    #[derive(Debug)]
+    struct PanickingWriter {
+        written: usize,
+        panic_after: usize,
+    }
+
+    impl Write for PanickingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.written + buf.len() > self.panic_after {
+                panic!("injected panic");
+            }
+            self.written += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A `with_threads(threads)` writer whose inner writer panicked during a
+    /// `write` call that the caller caught.
+    fn writer_after_a_caught_panic(threads: usize) -> BgzfWriter<PanickingWriter> {
+        let inner = PanickingWriter {
+            written: 0,
+            panic_after: 70_000,
+        };
+        let mut writer = BgzfWriter::with_threads(inner, threads);
+        let data = text(2_000_000);
+
+        let payload = data
+            .chunks(10_000)
+            .find_map(|chunk| {
+                panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    let written = writer
+                        .write(chunk)
+                        .expect("writes should succeed until the inner writer panics");
+                    assert_eq!(written, chunk.len());
+                }))
+                .err()
+            })
+            .expect("the inner writer should panic");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"injected panic"),
+            "threads = {threads}"
+        );
+        writer
     }
 
     fn assert_poisoned<T: Debug>(result: io::Result<T>) {
@@ -1225,6 +1286,23 @@ mod tests {
                 decode_all(&out) == data,
                 "MultiGzDecoder must give back the input"
             );
+        });
+    }
+
+    #[test]
+    fn a_call_that_panics_poisons_the_writer() {
+        within(30, || {
+            // 1 compresses inline; with 4 workers the panic comes while blocks
+            // are in flight.
+            for threads in [1, 4] {
+                let mut writer = writer_after_a_caught_panic(threads);
+                assert_poisoned(writer.write(b"more"));
+                assert_poisoned(writer.flush());
+                assert_poisoned(writer.finish());
+
+                // Dropping instead of finishing must also return.
+                drop(writer_after_a_caught_panic(threads));
+            }
         });
     }
 
