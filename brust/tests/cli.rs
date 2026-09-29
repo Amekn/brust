@@ -102,3 +102,127 @@ fn cli_validates_and_converts_compressed_fastq() {
         100
     );
 }
+
+#[test]
+fn convert_cli_threads_match_default_bytes() {
+    let temp = common::TempDir::new("cli-threads-bytes");
+    let sam_input = common::fixture("sam/aligned.sam");
+    let fastq_input = common::fixture("fastq/UDP0057_sub100.fastq");
+
+    let sam_default = temp.join("sam-default.bam");
+    let sam_threaded = temp.join("sam-threaded.bam");
+    let fastq_default = temp.join("fastq-default.bam");
+    let fastq_threaded = temp.join("fastq-threaded.bam");
+
+    let run = |args: &[&str]| {
+        let output = brust().args(args).output().unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("Conversion completed")
+        );
+        assert!(String::from_utf8(output.stderr).unwrap().is_empty());
+    };
+
+    run(&[
+        "convert",
+        "sam-to-bam",
+        sam_input.to_str().unwrap(),
+        sam_default.to_str().unwrap(),
+    ]);
+    run(&[
+        "convert",
+        "sam-to-bam",
+        sam_input.to_str().unwrap(),
+        sam_threaded.to_str().unwrap(),
+        "--threads",
+        "4",
+    ]);
+    assert_eq!(
+        fs::read(&sam_default).unwrap(),
+        fs::read(&sam_threaded).unwrap()
+    );
+
+    run(&[
+        "convert",
+        "fastq-to-bam",
+        fastq_input.to_str().unwrap(),
+        fastq_default.to_str().unwrap(),
+    ]);
+    run(&[
+        "convert",
+        "fastq-to-bam",
+        fastq_input.to_str().unwrap(),
+        fastq_threaded.to_str().unwrap(),
+        "-t",
+        "4",
+    ]);
+    assert_eq!(
+        fs::read(&fastq_default).unwrap(),
+        fs::read(&fastq_threaded).unwrap()
+    );
+}
+
+#[test]
+fn convert_cli_rejects_zero_threads() {
+    let temp = common::TempDir::new("cli-threads-zero");
+    let input = common::fixture("sam/aligned.sam");
+    let output_path = temp.join("aligned.bam");
+
+    let output = brust()
+        .args([
+            "convert",
+            "sam-to-bam",
+            input.to_str().unwrap(),
+            output_path.to_str().unwrap(),
+            "--threads",
+            "0",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("invalid value '0' for '--threads"));
+    assert!(!output_path.exists());
+}
+
+#[test]
+fn convert_cli_threads_only_on_bam_outputs() {
+    let temp = common::TempDir::new("cli-threads-fasta");
+    let input = common::fixture("fastq/UDP0057_sub100.fastq");
+    let output_path = temp.join("reads.fasta");
+
+    let output = brust()
+        .args([
+            "convert",
+            "fastq-to-fasta",
+            input.to_str().unwrap(),
+            output_path.to_str().unwrap(),
+            "--threads",
+            "2",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("unexpected argument '--threads'"));
+    assert!(!output_path.exists());
+}
+
+#[test]
+fn convert_cli_help_describes_threads() {
+    let output = brust()
+        .args(["convert", "sam-to-bam", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("BGZF compression threads")
+    );
+}

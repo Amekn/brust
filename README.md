@@ -128,6 +128,15 @@ brust convert sam-to-fastq aligned.sam reads.fastq
 brust convert bam-to-fastq aligned.bam reads.fastq
 ```
 
+Add `-t`/`--threads` to compress BAM output on several threads:
+
+```bash
+brust convert sam-to-bam aligned.sam aligned.bam --threads 4
+```
+
+Only the `*-to-bam` conversions take `--threads`. The default is 1, and the
+output is identical at any thread count.
+
 Conversions stream records and write through a temporary file beside the target
 path. The temporary file is renamed only after a successful conversion, so an
 existing output is not replaced by a partial file if parsing or writing fails.

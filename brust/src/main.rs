@@ -29,13 +29,40 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ConvertCommands {
-    FastqToFasta { input: PathBuf, output: PathBuf },
-    FastqToSam { input: PathBuf, output: PathBuf },
-    FastqToBam { input: PathBuf, output: PathBuf },
-    SamToBam { input: PathBuf, output: PathBuf },
-    BamToSam { input: PathBuf, output: PathBuf },
-    SamToFastq { input: PathBuf, output: PathBuf },
-    BamToFastq { input: PathBuf, output: PathBuf },
+    FastqToFasta {
+        input: PathBuf,
+        output: PathBuf,
+    },
+    FastqToSam {
+        input: PathBuf,
+        output: PathBuf,
+    },
+    FastqToBam {
+        input: PathBuf,
+        output: PathBuf,
+        /// BGZF compression threads
+        #[arg(short = 't', long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        threads: u32,
+    },
+    SamToBam {
+        input: PathBuf,
+        output: PathBuf,
+        /// BGZF compression threads
+        #[arg(short = 't', long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        threads: u32,
+    },
+    BamToSam {
+        input: PathBuf,
+        output: PathBuf,
+    },
+    SamToFastq {
+        input: PathBuf,
+        output: PathBuf,
+    },
+    BamToFastq {
+        input: PathBuf,
+        output: PathBuf,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -60,29 +87,45 @@ impl From<FormatArg> for brust::Format {
 }
 
 impl ConvertCommands {
-    fn into_parts(self) -> (brust::convert::Conversion, PathBuf, PathBuf) {
+    fn into_parts(
+        self,
+    ) -> (
+        brust::convert::Conversion,
+        PathBuf,
+        PathBuf,
+        brust::ConvertOptions,
+    ) {
+        use brust::convert::Conversion;
+
+        let options = brust::ConvertOptions::default();
         match self {
             Self::FastqToFasta { input, output } => {
-                (brust::convert::Conversion::FastqToFasta, input, output)
+                (Conversion::FastqToFasta, input, output, options)
             }
-            Self::FastqToSam { input, output } => {
-                (brust::convert::Conversion::FastqToSam, input, output)
-            }
-            Self::FastqToBam { input, output } => {
-                (brust::convert::Conversion::FastqToBam, input, output)
-            }
-            Self::SamToBam { input, output } => {
-                (brust::convert::Conversion::SamToBam, input, output)
-            }
-            Self::BamToSam { input, output } => {
-                (brust::convert::Conversion::BamToSam, input, output)
-            }
-            Self::SamToFastq { input, output } => {
-                (brust::convert::Conversion::SamToFastq, input, output)
-            }
-            Self::BamToFastq { input, output } => {
-                (brust::convert::Conversion::BamToFastq, input, output)
-            }
+            Self::FastqToSam { input, output } => (Conversion::FastqToSam, input, output, options),
+            Self::FastqToBam {
+                input,
+                output,
+                threads,
+            } => (
+                Conversion::FastqToBam,
+                input,
+                output,
+                options.threads(threads as usize),
+            ),
+            Self::SamToBam {
+                input,
+                output,
+                threads,
+            } => (
+                Conversion::SamToBam,
+                input,
+                output,
+                options.threads(threads as usize),
+            ),
+            Self::BamToSam { input, output } => (Conversion::BamToSam, input, output, options),
+            Self::SamToFastq { input, output } => (Conversion::SamToFastq, input, output, options),
+            Self::BamToFastq { input, output } => (Conversion::BamToFastq, input, output, options),
         }
     }
 }
@@ -113,16 +156,18 @@ fn run(cli: Cli) -> std::result::Result<(), String> {
             Ok(())
         }
         Commands::Convert { command } => {
-            let (conversion, input, output) = command.into_parts();
-            brust::convert::convert(conversion, &input, &output).map_err(|error| {
-                format!(
-                    "Conversion failed for {} ({} -> {}): {}",
-                    conversion.name(),
-                    input.display(),
-                    output.display(),
-                    error
-                )
-            })?;
+            let (conversion, input, output, options) = command.into_parts();
+            brust::convert::convert_with(conversion, &input, &output, &options).map_err(
+                |error| {
+                    format!(
+                        "Conversion failed for {} ({} -> {}): {}",
+                        conversion.name(),
+                        input.display(),
+                        output.display(),
+                        error
+                    )
+                },
+            )?;
             println!(
                 "Conversion completed: {} -> {}",
                 input.display(),
