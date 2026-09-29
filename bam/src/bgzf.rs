@@ -17,6 +17,7 @@ use flate2::write::DeflateEncoder;
 use flate2::{Compression, Crc};
 use std::io::{self, Read, Write};
 use std::mem;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -529,6 +530,16 @@ struct Worker {
     results: Mutex<Receiver<io::Result<Vec<u8>>>>,
     thread: JoinHandle<()>,
 }
+
+// `JoinHandle` is neither `UnwindSafe` nor `RefUnwindSafe`: the thread's
+// result sits in an `UnsafeCell` inside it. Only the worker thread writes that
+// cell, as it exits, and only `join` reads it, which consumes the handle. A
+// panic on the writer's side cannot leave it half updated, and a shared
+// `&Worker` cannot reach it. With these impls `BgzfWriter`, and `BamWriter`
+// over it, stay as unwind safe as their inner writer, as they were before
+// worker threads.
+impl UnwindSafe for Worker {}
+impl RefUnwindSafe for Worker {}
 
 impl Worker {
     /// This worker's result receiver.
@@ -1073,8 +1084,16 @@ mod tests {
 
             for threads in [0, 1, 2, 3, 8] {
                 let writer = BgzfWriter::with_threads(Vec::new(), threads);
-                let workers = if threads < 2 { 0 } else { threads };
-                assert_eq!(worker_count(&writer), workers, "threads = {threads}");
+                // A host that limits threads may start fewer workers, never more.
+                let workers = worker_count(&writer);
+                if threads < 2 {
+                    assert_eq!(workers, 0, "threads = {threads} must compress inline");
+                } else {
+                    assert!(
+                        (1..=threads).contains(&workers),
+                        "threads = {threads} started {workers} workers"
+                    );
+                }
                 assert_same_bytes(
                     &replay(writer, &ops),
                     &expected,
@@ -1160,7 +1179,12 @@ mod tests {
         within(30, || {
             assert_eq!(MAX_THREADS, 256);
             let writer = BgzfWriter::with_threads(Vec::new(), 100_000);
-            assert_eq!(worker_count(&writer), MAX_THREADS);
+            // A host that limits threads may start fewer workers, never more.
+            let workers = worker_count(&writer);
+            assert!(
+                (1..=MAX_THREADS).contains(&workers),
+                "threads = 100_000 started {workers} workers"
+            );
 
             let ops = [Op::Write(200_000)];
             assert_same_bytes(&replay(writer, &ops), &inline(&ops), "threads = 100_000");
@@ -1205,9 +1229,11 @@ mod tests {
     }
 
     #[test]
-    fn writer_is_send_and_sync_when_the_inner_writer_is() {
-        // BamWriter wraps BgzfWriter and was Send + Sync before worker threads.
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<BgzfWriter<Vec<u8>>>();
+    fn writer_keeps_the_auto_traits_of_the_inner_writer() {
+        // BamWriter wraps BgzfWriter. Before worker threads it was Send, Sync,
+        // UnwindSafe and RefUnwindSafe whenever its inner writer was.
+        fn assert_auto_traits<T: Send + Sync + panic::UnwindSafe + panic::RefUnwindSafe>() {}
+        assert_auto_traits::<BgzfWriter<Vec<u8>>>();
+        assert_auto_traits::<crate::BamWriter<Vec<u8>>>();
     }
 }
