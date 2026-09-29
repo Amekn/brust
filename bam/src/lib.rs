@@ -13,6 +13,12 @@
 //! data remain packed in the record, and helper methods expose SAM-style
 //! strings when needed. The writer serializes the stored BAM structures into
 //! BGZF blocks and validates internal lengths before emitting records.
+//!
+//! The [`bgzf`] module holds the BGZF layer on its own: [`BgzfReader`],
+//! [`BgzfWriter`], and [`bgzf::compress_block`]. [`BamWriter`] compresses on the
+//! calling thread by default. [`BamWriter::from_path_with_threads`] and
+//! [`BamWriter::from_writer_with_threads`] compress on worker threads instead,
+//! with the same output bytes for any thread count.
 
 use brust_core::{Error, Format};
 use std::collections::HashMap;
@@ -57,6 +63,15 @@ pub struct BamReader<R: Read = File> {
 /// `BamWriter` writes BAM binary data in BGZF blocks and appends the standard
 /// BGZF EOF block from [`BamWriter::finish`]. Use [`BamWriter::write_all`] for
 /// a materialized [`Bam`], or write a header and then stream records manually.
+///
+/// Compression runs on the calling thread unless the writer is built with
+/// [`BamWriter::from_path_with_threads`] or
+/// [`BamWriter::from_writer_with_threads`]. Either way the bytes written are
+/// the same.
+///
+/// After an I/O error from the wrapped writer, or a panic partway through a
+/// call, the BGZF stream is incomplete, so every later call on the writer
+/// returns an error.
 pub struct BamWriter<W: Write = File> {
     writer: BgzfWriter<W>,
     header_written: bool,
@@ -1165,6 +1180,19 @@ impl BamWriter<File> {
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         Self::from_path(path)
     }
+
+    /// Creates or truncates a BAM file at a filesystem path, compressing BGZF
+    /// blocks on `threads` worker threads.
+    ///
+    /// A `threads` of 0 or 1 compresses on the calling thread, like
+    /// [`BamWriter::from_path`]. Larger values start that many workers, capped
+    /// at [`bgzf::MAX_THREADS`]. Given the same calls, the file is
+    /// byte-for-byte the same as [`BamWriter::from_path`] writes, whatever the
+    /// thread count.
+    pub fn from_path_with_threads<P: AsRef<Path>>(path: P, threads: usize) -> io::Result<Self> {
+        let file = File::create(path)?;
+        Ok(Self::from_writer_with_threads(file, threads))
+    }
 }
 
 impl<W: Write> BamWriter<W> {
@@ -1172,6 +1200,22 @@ impl<W: Write> BamWriter<W> {
     pub fn from_writer(writer: W) -> Self {
         Self {
             writer: BgzfWriter::new(writer),
+            header_written: false,
+        }
+    }
+
+    /// Creates a BAM writer from a writable byte stream, compressing BGZF
+    /// blocks on `threads` worker threads.
+    ///
+    /// A `threads` of 0 or 1 compresses on the calling thread, like
+    /// [`BamWriter::from_writer`]. Larger values start that many workers,
+    /// capped at [`bgzf::MAX_THREADS`]. Given the same calls, the bytes
+    /// written are identical to [`BamWriter::from_writer`]'s, whatever the
+    /// thread count. Workers only compress; all writes to `writer` happen on
+    /// the calling thread, so `writer` need not be [`Send`].
+    pub fn from_writer_with_threads(writer: W, threads: usize) -> Self {
+        Self {
+            writer: BgzfWriter::with_threads(writer, threads),
             header_written: false,
         }
     }
