@@ -1,3 +1,11 @@
+//! Length and CRC-32 of the exact bytes `BamWriter` writes.
+//!
+//! The values pin the exact deflate output of the current flate2 backend at its
+//! default compression level. They were captured from the `BamWriter` before
+//! the BGZF writer was changed (commit 492acbd). A flate2 upgrade may
+//! legitimately change them, so if these tests fail after one, check that the
+//! decompressed content is unchanged before updating the values.
+
 use brust_bam::{Bam, BamWriter, SamToBamConverter};
 use flate2::Crc;
 use sam::SamReader;

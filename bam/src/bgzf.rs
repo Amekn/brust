@@ -763,6 +763,27 @@ mod tests {
         }
     }
 
+    /// Inner writer that keeps every byte written to it and records each
+    /// `flush` call, so a test can tell whether, and when, it was flushed.
+    #[derive(Debug, Default)]
+    struct FlushRecorder {
+        bytes: Vec<u8>,
+        /// One entry per `flush` call: how many bytes had been written by then.
+        flushed_at: Vec<usize>,
+    }
+
+    impl Write for FlushRecorder {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed_at.push(self.bytes.len());
+            Ok(())
+        }
+    }
+
     /// Inner writer that panics with "injected panic" once a write would take
     /// it past `panic_after` bytes.
     #[derive(Debug)]
@@ -942,6 +963,34 @@ mod tests {
         }
     }
 
+    /// How a test builds its writer: `None` is [`BgzfWriter::new`] and
+    /// `Some(n)` is [`BgzfWriter::with_threads`] with `n` threads.
+    type Mode = Option<usize>;
+
+    /// Inline, then two workers.
+    const MODES: [Mode; 2] = [None, Some(2)];
+
+    fn writer_in<W: Write>(mode: Mode, inner: W) -> BgzfWriter<W> {
+        match mode {
+            None => BgzfWriter::new(inner),
+            Some(threads) => BgzfWriter::with_threads(inner, threads),
+        }
+    }
+
+    /// Panics unless `out` is exactly `blocks`, each framed by
+    /// [`compress_block`], followed by one [`EOF_BLOCK`]: no empty block and no
+    /// second end-of-file marker.
+    fn assert_blocks_then_eof(out: &[u8], blocks: &[&[u8]], context: &str) {
+        let mut expected: Vec<u8> = blocks.iter().flat_map(|data| block(data)).collect();
+        expected.extend_from_slice(&EOF_BLOCK);
+        assert_eq!(
+            block_count(out),
+            blocks.len() + 1,
+            "{context}: data blocks and the EOF block"
+        );
+        assert_same_bytes(out, &expected, context);
+    }
+
     #[test]
     fn compress_block_frames_a_bgzf_block() {
         let data: Vec<u8> = (0..1_000).map(|i| (i % 7) as u8).collect();
@@ -1036,6 +1085,48 @@ mod tests {
     }
 
     #[test]
+    fn stream_ending_on_a_block_boundary_has_no_empty_block() {
+        within(30, || {
+            let m = MAX_BLOCK_DATA;
+            let data = noise(2 * m);
+
+            for mode in MODES {
+                let mut one = writer_in(mode, Vec::new());
+                one.write_all(&data[..m]).expect("write should succeed");
+                let out = one.finish().expect("finish should succeed");
+                assert_blocks_then_eof(&out, &[&data[..m]], &format!("{mode:?}, one block"));
+
+                let mut two = writer_in(mode, Vec::new());
+                two.write_all(&data).expect("write should succeed");
+                let out = two.finish().expect("finish should succeed");
+                assert_blocks_then_eof(
+                    &out,
+                    &[&data[..m], &data[m..]],
+                    &format!("{mode:?}, two blocks"),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn flush_on_a_block_boundary_writes_no_empty_block() {
+        within(30, || {
+            let m = MAX_BLOCK_DATA;
+            let data = noise(m + 10);
+
+            for mode in MODES {
+                let mut writer = writer_in(mode, Vec::new());
+                writer.write_all(&data[..m]).expect("write should succeed");
+                writer.flush().expect("flush should succeed");
+                writer.write_all(&data[m..]).expect("write should succeed");
+                let out = writer.finish().expect("finish should succeed");
+
+                assert_blocks_then_eof(&out, &[&data[..m], &data[m..]], &format!("{mode:?}"));
+            }
+        });
+    }
+
+    #[test]
     fn writer_output_decodes_to_input_for_any_write_sizes() {
         let data = noise(200_000);
         let sizes = [1, 7, 1_000, 65_280, 70_000];
@@ -1088,6 +1179,56 @@ mod tests {
             .expect("finish should succeed");
 
         assert_eq!(out, EOF_BLOCK);
+    }
+
+    #[test]
+    fn flush_flushes_the_inner_writer_after_writing_every_block() {
+        within(30, || {
+            let m = MAX_BLOCK_DATA;
+            // Three full blocks and a partial one, so a threaded writer still
+            // has blocks in flight when `flush` is called.
+            let data = noise(3 * m + 10);
+            let expected = [
+                block(&data[..m]),
+                block(&data[m..2 * m]),
+                block(&data[2 * m..3 * m]),
+                block(&data[3 * m..]),
+            ]
+            .concat();
+
+            for mode in MODES {
+                let mut writer = writer_in(mode, FlushRecorder::default());
+                writer.write_all(&data).expect("write should succeed");
+                writer.flush().expect("flush should succeed");
+
+                assert_same_bytes(&writer.inner.bytes, &expected, &format!("{mode:?}"));
+                assert_eq!(
+                    writer.inner.flushed_at,
+                    [expected.len()],
+                    "{mode:?}: one inner flush, after every block was written"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn finish_flushes_the_inner_writer_after_the_eof_block() {
+        within(30, || {
+            let data = noise(MAX_BLOCK_DATA + 10);
+
+            for mode in MODES {
+                let mut writer = writer_in(mode, FlushRecorder::default());
+                writer.write_all(&data).expect("write should succeed");
+                let inner = writer.finish().expect("finish should succeed");
+
+                assert!(inner.bytes.ends_with(&EOF_BLOCK), "{mode:?}: EOF block");
+                assert_eq!(
+                    inner.flushed_at,
+                    [inner.bytes.len()],
+                    "{mode:?}: one inner flush, after the EOF block"
+                );
+            }
+        });
     }
 
     #[test]
@@ -1167,20 +1308,32 @@ mod tests {
     #[test]
     fn threaded_writer_exceeds_the_in_flight_limit() {
         within(30, || {
-            // 41 data blocks through 2 workers, far past the limit of 4 in flight.
+            // 41 data blocks and no flush, so every count below is driven far
+            // past its limit of 2 blocks per worker in flight: 4 blocks at 2
+            // threads, 6 at 3 and 16 at 8.
             let data = text(40 * MAX_BLOCK_DATA + 5);
-            let mut writer = BgzfWriter::with_threads(Vec::new(), 2);
-            for chunk in data.chunks(10_000) {
-                writer.write_all(chunk).expect("write should succeed");
-                assert!(
-                    in_flight(&writer) <= 4,
-                    "no more than 2 blocks per worker may be in flight"
-                );
-            }
-            let out = writer.finish().expect("finish should succeed");
+            let expected = inline(&[Op::Write(data.len())]);
+            assert_eq!(
+                block_count(&expected),
+                42,
+                "41 data blocks and the EOF block"
+            );
 
-            assert_same_bytes(&out, &inline(&[Op::Write(data.len())]), "threads = 2");
-            assert_eq!(block_count(&out), 42, "41 data blocks and the EOF block");
+            for threads in [2, 3, 8] {
+                let mut writer = BgzfWriter::with_threads(Vec::new(), threads);
+                // A host that limits threads may start fewer workers.
+                let limit = 2 * worker_count(&writer) as u64;
+                for chunk in data.chunks(10_000) {
+                    writer.write_all(chunk).expect("write should succeed");
+                    assert!(
+                        in_flight(&writer) <= limit,
+                        "threads = {threads}: no more than 2 blocks per worker may be in flight"
+                    );
+                }
+                let out = writer.finish().expect("finish should succeed");
+
+                assert_same_bytes(&out, &expected, &format!("threads = {threads}"));
+            }
         });
     }
 

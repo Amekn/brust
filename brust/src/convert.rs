@@ -75,7 +75,7 @@ impl Conversion {
 /// Build one with [`ConvertOptions::default`] and the builder methods; the
 /// struct is `#[non_exhaustive]`, so it cannot be built with a struct literal
 /// outside this crate and new options can be added without breaking callers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ConvertOptions {
     /// BGZF compression threads used when the output is BAM.

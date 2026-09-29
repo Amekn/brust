@@ -4,7 +4,7 @@
 //! compares the bytes with the single-threaded output, which in turn must equal
 //! the plain `BamWriter::from_writer` output.
 
-use brust_bam::bgzf::MAX_BLOCK_DATA;
+use brust_bam::bgzf::{EOF_BLOCK, MAX_BLOCK_DATA};
 use brust_bam::{
     BamAuxArray, BamAuxValue, BamRecord, BamRecordAuxiliary, BamRecordFixed, BamRecordVariable,
     BamWriter, BgzfReader, SamToBamConverter,
@@ -150,6 +150,20 @@ fn decompress(bgzf: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Number of blocks in a BGZF stream, counted by following each block's BSIZE
+/// field.
+fn block_count(bgzf: &[u8]) -> usize {
+    let mut count = 0;
+    let mut offset = 0;
+    while offset < bgzf.len() {
+        let bsize = u16::from_le_bytes([bgzf[offset + 16], bgzf[offset + 17]]);
+        offset += usize::from(bsize) + 1;
+        count += 1;
+    }
+    assert_eq!(offset, bgzf.len(), "the last block must end the stream");
+    count
+}
+
 #[test]
 fn header_only_stream_matches_for_every_thread_count() {
     let converter = converter(0);
@@ -170,8 +184,10 @@ fn header_longer_than_a_block_matches_for_every_thread_count() {
 
 #[test]
 fn stream_ending_exactly_on_a_block_boundary_matches() {
-    // Header plus records fill exactly one block, then exactly two: no empty
-    // block is written, and exactly one end-of-file marker follows.
+    // Header plus records fill exactly one block, then exactly two. The stream
+    // must be those full blocks and one end-of-file marker, with no empty block
+    // between or after them. The unit tests in `bgzf.rs` check the same for the
+    // writer on its own.
     let converter = converter(0);
     let header_len = decompress(&write(1, &converter, &[])).len();
     let first = record_of_length(MAX_BLOCK_DATA - header_len);
@@ -179,6 +195,12 @@ fn stream_ending_exactly_on_a_block_boundary_matches() {
     for (records, blocks) in [(vec![first.clone()], 1), (vec![first, second], 2)] {
         let bytes = assert_matches_for_every_thread_count(&converter, &records);
         assert_eq!(decompress(&bytes).len(), blocks * MAX_BLOCK_DATA);
+        assert!(bytes.ends_with(&EOF_BLOCK), "{blocks} block(s): EOF block");
+        assert_eq!(
+            block_count(&bytes),
+            blocks + 1,
+            "{blocks} block(s): data blocks and one EOF block"
+        );
     }
 }
 
