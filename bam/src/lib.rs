@@ -15,13 +15,14 @@
 //! BGZF blocks and validates internal lengths before emitting records.
 
 use brust_core::{Error, Format};
-use flate2::read::DeflateDecoder;
-use flate2::write::DeflateEncoder;
-use flate2::{Compression, Crc};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
+
+pub mod bgzf;
+
+pub use bgzf::{BgzfReader, BgzfVirtualOffset};
 
 /// A fully materialized BAM payload.
 ///
@@ -77,38 +78,6 @@ pub struct SamToBamConverter {
     reference_ids: HashMap<String, i32>,
 }
 
-/// Packed BGZF virtual offset (`compressed_block_offset << 16 | block_offset`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BgzfVirtualOffset(u64);
-
-impl BgzfVirtualOffset {
-    /// Creates a virtual offset from a compressed block start and uncompressed
-    /// offset within that block.
-    pub fn new(compressed_offset: u64, uncompressed_offset: u16) -> Self {
-        Self((compressed_offset << 16) | u64::from(uncompressed_offset))
-    }
-
-    /// Creates a virtual offset from its packed `u64` representation.
-    pub fn from_raw(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// Returns the packed `u64` representation.
-    pub fn raw(self) -> u64 {
-        self.0
-    }
-
-    /// Returns the compressed BGZF block start offset.
-    pub fn compressed_offset(self) -> u64 {
-        self.0 >> 16
-    }
-
-    /// Returns the uncompressed offset inside the BGZF block.
-    pub fn uncompressed_offset(self) -> u16 {
-        (self.0 & 0xffff) as u16
-    }
-}
-
 /// BAM record paired with the BGZF virtual offset where the record begins.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionedBamRecord {
@@ -116,16 +85,6 @@ pub struct PositionedBamRecord {
     pub virtual_offset: BgzfVirtualOffset,
     /// Parsed BAM alignment record.
     pub record: BamRecord,
-}
-
-/// Reader for BGZF blocks with virtual-offset tracking.
-pub struct BgzfReader<R: Read> {
-    inner: R,
-    buffer: Vec<u8>,
-    position: usize,
-    current_block_start: u64,
-    next_block_start: u64,
-    eof: bool,
 }
 
 /// BAM header information from the binary file header.
@@ -832,6 +791,30 @@ impl BamRecord {
         })
     }
 
+    /// Appends this record in BAM binary form to `out`.
+    ///
+    /// The output is the `block_size` field (`u32`, little-endian) followed by
+    /// the record payload, which is what [`BamWriter::write_record`] feeds into
+    /// the BGZF stream. The record is validated the same way, and `out` is left
+    /// unchanged when it returns an error. A non-zero `fixed.block_size` must
+    /// equal the encoded payload length.
+    pub fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        let mut payload = Vec::new();
+        encode_bam_record_payload(self, &mut payload)?;
+
+        let block_size = payload.len() as u32;
+        if self.fixed.block_size != 0 && self.fixed.block_size != block_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BAM record block_size does not match encoded payload length",
+            ));
+        }
+
+        out.extend_from_slice(&block_size.to_le_bytes());
+        out.extend_from_slice(&payload);
+        Ok(())
+    }
+
     /// Returns this record's read name.
     pub fn read_name(&self) -> &str {
         &self.variable.read_name
@@ -1190,7 +1173,7 @@ impl<W: Write> BamWriter<W> {
     pub fn from_writer(writer: W) -> Self {
         Self {
             writer,
-            pending: Vec::with_capacity(BGZF_MAX_UNCOMPRESSED_BLOCK),
+            pending: Vec::with_capacity(bgzf::MAX_BLOCK_DATA),
             header_written: false,
         }
     }
@@ -1225,7 +1208,7 @@ impl<W: Write> BamWriter<W> {
             ));
         }
         let mut data = Vec::new();
-        write_bam_record(&mut data, record)?;
+        record.encode(&mut data)?;
         self.write_uncompressed(&data)
     }
 
@@ -1256,19 +1239,19 @@ impl<W: Write> BamWriter<W> {
     /// Finishes the BGZF stream, writes the EOF block, and returns the wrapped byte stream.
     pub fn finish(mut self) -> io::Result<W> {
         self.flush_pending()?;
-        self.writer.write_all(BGZF_EOF_BLOCK)?;
+        self.writer.write_all(&bgzf::EOF_BLOCK)?;
         self.writer.flush()?;
         Ok(self.writer)
     }
 
     fn write_uncompressed(&mut self, mut data: &[u8]) -> io::Result<()> {
         while !data.is_empty() {
-            let available = BGZF_MAX_UNCOMPRESSED_BLOCK - self.pending.len();
+            let available = bgzf::MAX_BLOCK_DATA - self.pending.len();
             let take = available.min(data.len());
             self.pending.extend_from_slice(&data[..take]);
             data = &data[take..];
 
-            if self.pending.len() == BGZF_MAX_UNCOMPRESSED_BLOCK {
+            if self.pending.len() == bgzf::MAX_BLOCK_DATA {
                 self.flush_pending()?;
             }
         }
@@ -1281,7 +1264,9 @@ impl<W: Write> BamWriter<W> {
             return Ok(());
         }
 
-        write_bgzf_block(&mut self.writer, &self.pending)?;
+        let mut block = Vec::new();
+        bgzf::compress_block(&self.pending, &mut block)?;
+        self.writer.write_all(&block)?;
         self.pending.clear();
         Ok(())
     }
@@ -1302,171 +1287,6 @@ impl<R: Read> Iterator for BamRecords<'_, R> {
             Err(err) => Some(Err(err)),
         }
     }
-}
-
-impl<R: Read> BgzfReader<R> {
-    /// Creates a BGZF reader over a compressed byte stream.
-    pub fn new(inner: R) -> Self {
-        Self {
-            inner,
-            buffer: Vec::new(),
-            position: 0,
-            current_block_start: 0,
-            next_block_start: 0,
-            eof: false,
-        }
-    }
-
-    /// Returns the current virtual offset.
-    pub fn virtual_offset(&self) -> BgzfVirtualOffset {
-        if self.position >= self.buffer.len() {
-            BgzfVirtualOffset::new(self.next_block_start, 0)
-        } else {
-            BgzfVirtualOffset::new(self.current_block_start, self.position as u16)
-        }
-    }
-
-    /// Consumes this reader and returns the wrapped stream.
-    pub fn into_inner(self) -> R {
-        self.inner
-    }
-
-    fn fill_block(&mut self) -> io::Result<bool> {
-        if self.eof {
-            return Ok(false);
-        }
-
-        loop {
-            let Some(block) = read_bgzf_block(&mut self.inner, self.next_block_start)? else {
-                self.eof = true;
-                self.buffer.clear();
-                self.position = 0;
-                return Ok(false);
-            };
-
-            self.current_block_start = self.next_block_start;
-            self.next_block_start = self
-                .next_block_start
-                .checked_add(block.compressed_size as u64)
-                .ok_or_else(|| invalid_data("BGZF compressed offset overflow"))?;
-            self.buffer = block.uncompressed;
-            self.position = 0;
-
-            if !self.buffer.is_empty() {
-                return Ok(true);
-            }
-        }
-    }
-}
-
-impl<R: Read> Read for BgzfReader<R> {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-
-        if self.position >= self.buffer.len() && !self.fill_block()? {
-            return Ok(0);
-        }
-
-        let available = self.buffer.len() - self.position;
-        let take = available.min(output.len());
-        output[..take].copy_from_slice(&self.buffer[self.position..self.position + take]);
-        self.position += take;
-        Ok(take)
-    }
-}
-
-struct BgzfBlock {
-    compressed_size: usize,
-    uncompressed: Vec<u8>,
-}
-
-fn read_bgzf_block<R: Read>(
-    reader: &mut R,
-    compressed_offset: u64,
-) -> io::Result<Option<BgzfBlock>> {
-    let mut prefix = [0u8; 12];
-    if !read_exact_or_eof(reader, &mut prefix)? {
-        return Ok(None);
-    }
-
-    if prefix[..4] != [0x1f, 0x8b, 0x08, 0x04] {
-        return Err(invalid_data("invalid BGZF gzip header"));
-    }
-
-    let xlen = u16::from_le_bytes([prefix[10], prefix[11]]) as usize;
-    if xlen < 6 {
-        return Err(invalid_data("BGZF extra field is too short"));
-    }
-
-    let mut extra = vec![0u8; xlen];
-    reader.read_exact(&mut extra)?;
-    let bsize = bgzf_bsize(&extra)?;
-    let compressed_size = usize::from(bsize) + 1;
-    let header_size = 12usize
-        .checked_add(xlen)
-        .ok_or_else(|| invalid_data("BGZF header size overflow"))?;
-    if compressed_size < header_size + 8 {
-        return Err(invalid_data("BGZF block size is too small"));
-    }
-
-    let remaining_len = compressed_size - header_size;
-    let mut remaining = vec![0u8; remaining_len];
-    reader.read_exact(&mut remaining)?;
-
-    let deflate_len = remaining_len - 8;
-    let deflate = &remaining[..deflate_len];
-    let footer = &remaining[deflate_len..];
-    let expected_crc = u32::from_le_bytes(footer[..4].try_into().unwrap());
-    let expected_isize = u32::from_le_bytes(footer[4..8].try_into().unwrap());
-
-    let mut decoder = DeflateDecoder::new(deflate);
-    let mut uncompressed = Vec::with_capacity(expected_isize as usize);
-    decoder.read_to_end(&mut uncompressed)?;
-    if uncompressed.len() != expected_isize as usize {
-        return Err(invalid_data(
-            "BGZF ISIZE does not match decompressed length",
-        ));
-    }
-
-    let mut crc = Crc::new();
-    crc.update(&uncompressed);
-    if crc.sum() != expected_crc {
-        return Err(invalid_data(format!(
-            "BGZF CRC mismatch at compressed offset {compressed_offset}"
-        )));
-    }
-
-    Ok(Some(BgzfBlock {
-        compressed_size,
-        uncompressed,
-    }))
-}
-
-fn bgzf_bsize(extra: &[u8]) -> io::Result<u16> {
-    let mut offset = 0usize;
-    while offset + 4 <= extra.len() {
-        let si1 = extra[offset];
-        let si2 = extra[offset + 1];
-        let slen = u16::from_le_bytes([extra[offset + 2], extra[offset + 3]]) as usize;
-        offset += 4;
-        let end = offset
-            .checked_add(slen)
-            .ok_or_else(|| invalid_data("BGZF extra subfield length overflow"))?;
-        if end > extra.len() {
-            return Err(invalid_data("BGZF extra subfield is truncated"));
-        }
-        if si1 == b'B' && si2 == b'C' {
-            if slen != 2 {
-                return Err(invalid_data("BGZF BC subfield has invalid length"));
-            }
-            return Ok(u16::from_le_bytes([extra[offset], extra[offset + 1]]));
-        }
-        offset = end;
-    }
-
-    Err(invalid_data("BGZF BC subfield is missing"))
 }
 
 impl BamHeader {
@@ -2011,40 +1831,6 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool
     Ok(true)
 }
 
-const BGZF_MAX_UNCOMPRESSED_BLOCK: usize = 64 * 1024 - 256;
-const BGZF_EOF_BLOCK: &[u8; 28] = b"\x1f\x8b\x08\x04\x00\x00\x00\x00\x00\xff\x06\x00BC\x02\x00\x1b\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-
-fn write_bgzf_block<W: Write>(writer: &mut W, input: &[u8]) -> io::Result<()> {
-    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(input)?;
-    let compressed = encoder.finish()?;
-    let block_size = 18usize
-        .checked_add(compressed.len())
-        .and_then(|size| size.checked_add(8))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "BGZF block size overflow"))?;
-
-    if block_size > 64 * 1024 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "BGZF compressed block exceeds 64 KiB",
-        ));
-    }
-
-    let bsize = u16::try_from(block_size - 1)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "BGZF block size exceeds u16"))?;
-    let mut crc = Crc::new();
-    crc.update(input);
-
-    writer.write_all(&[
-        0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, b'B', b'C', 0x02,
-        0x00,
-    ])?;
-    writer.write_all(&bsize.to_le_bytes())?;
-    writer.write_all(&compressed)?;
-    writer.write_all(&crc.sum().to_le_bytes())?;
-    writer.write_all(&(input.len() as u32).to_le_bytes())
-}
-
 fn write_bam_header<W: Write>(
     writer: &mut W,
     header: &BamHeader,
@@ -2112,22 +1898,6 @@ fn write_bam_ref<W: Write>(writer: &mut W, reference: &BamRef) -> io::Result<()>
         writer.write_all(&[0])?;
     }
     writer.write_all(&reference.l_seq.to_le_bytes())
-}
-
-fn write_bam_record<W: Write>(writer: &mut W, record: &BamRecord) -> io::Result<()> {
-    let mut payload = Vec::new();
-    encode_bam_record_payload(record, &mut payload)?;
-
-    let block_size = payload.len() as u32;
-    if record.fixed.block_size != 0 && record.fixed.block_size != block_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "BAM record block_size does not match encoded payload length",
-        ));
-    }
-
-    writer.write_all(&block_size.to_le_bytes())?;
-    writer.write_all(&payload)
 }
 
 fn encode_bam_record_payload(record: &BamRecord, payload: &mut Vec<u8>) -> io::Result<()> {
@@ -2565,8 +2335,107 @@ mod bam_tests {
 
         assert_eq!(&output[..4], b"\x1f\x8b\x08\x04");
         assert_eq!(&output[12..16], b"BC\x02\x00");
-        assert!(output.ends_with(BGZF_EOF_BLOCK));
+        assert!(output.ends_with(&bgzf::EOF_BLOCK));
         assert_eq!(round_tripped, bam);
+    }
+
+    #[test]
+    fn record_encode_matches_writer_bytes() {
+        use flate2::read::MultiGzDecoder;
+
+        fn decompress(bytes: &[u8]) -> Vec<u8> {
+            let mut decoded = Vec::new();
+            MultiGzDecoder::new(bytes)
+                .read_to_end(&mut decoded)
+                .expect("BGZF stream should decompress");
+            decoded
+        }
+
+        let bam = Bam::from_path(fixture_path(ALIGNED_BAM)).expect("Bam should materialize");
+
+        let mut header_only = BamWriter::from_writer(Vec::new());
+        header_only
+            .write_header(&bam.header, &bam.refs)
+            .expect("header should write");
+        let header_len = decompress(&header_only.finish().expect("writer should finish")).len();
+
+        let mut writer = BamWriter::from_writer(Vec::new());
+        writer.write_all(&bam).expect("Bam should write");
+        let stream = decompress(&writer.finish().expect("writer should finish"));
+
+        let mut encoded = Vec::new();
+        for record in &bam.records {
+            record.encode(&mut encoded).expect("record should encode");
+        }
+
+        assert_eq!(bam.records.len(), 100);
+        assert_eq!(&stream[header_len..], &encoded[..]);
+    }
+
+    #[test]
+    fn record_encode_rejects_what_write_record_rejects() {
+        let bam = Bam::from_path(fixture_path(ALIGNED_BAM)).expect("Bam should materialize");
+        let valid = bam.records[0].clone();
+        assert!(!valid.variable.qual.is_empty());
+        assert!(!valid.auxiliary.is_empty());
+
+        let mut short_name_len = valid.clone();
+        short_name_len.fixed.l_read_name = 1;
+        assert!(short_name_len.variable.read_name.len() > 1);
+
+        let mut extra_cigar_op = valid.clone();
+        extra_cigar_op.fixed.n_cigar_op += 1;
+
+        let mut longer_l_seq = valid.clone();
+        longer_l_seq.fixed.l_seq += 2;
+
+        let mut short_qual = valid.clone();
+        short_qual.variable.qual.pop();
+
+        let mut bad_aux_tag = valid.clone();
+        bad_aux_tag.auxiliary[0].tag = "X".to_string();
+
+        let mut wrong_block_size = valid.clone();
+        wrong_block_size.fixed.block_size = 1;
+
+        // The unmodified record is accepted by both paths.
+        let mut encoded = Vec::new();
+        valid
+            .encode(&mut encoded)
+            .expect("valid record should encode");
+        let mut writer = BamWriter::from_writer(Vec::new());
+        writer
+            .write_header(&bam.header, &bam.refs)
+            .expect("header should write");
+        writer
+            .write_record(&valid)
+            .expect("valid record should write");
+
+        for (name, record) in [
+            ("l_read_name", short_name_len),
+            ("n_cigar_op", extra_cigar_op),
+            ("l_seq", longer_l_seq),
+            ("qual", short_qual),
+            ("aux tag", bad_aux_tag),
+            ("block_size", wrong_block_size),
+        ] {
+            let mut out = Vec::new();
+            let encode_err = record
+                .encode(&mut out)
+                .expect_err(&format!("{name}: encode should fail"));
+            assert!(out.is_empty(), "{name}: a failed encode must not write");
+
+            // The header goes in first so write_record reaches record validation.
+            let mut writer = BamWriter::from_writer(Vec::new());
+            writer
+                .write_header(&bam.header, &bam.refs)
+                .expect("header should write");
+            let write_err = writer
+                .write_record(&record)
+                .expect_err(&format!("{name}: write_record should fail"));
+
+            assert_eq!(encode_err.to_string(), write_err.to_string(), "{name}");
+        }
     }
 
     #[test]
