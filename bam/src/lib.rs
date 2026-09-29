@@ -22,7 +22,7 @@ use std::path::Path;
 
 pub mod bgzf;
 
-pub use bgzf::{BgzfReader, BgzfVirtualOffset};
+pub use bgzf::{BgzfReader, BgzfVirtualOffset, BgzfWriter};
 
 /// A fully materialized BAM payload.
 ///
@@ -58,8 +58,7 @@ pub struct BamReader<R: Read = File> {
 /// BGZF EOF block from [`BamWriter::finish`]. Use [`BamWriter::write_all`] for
 /// a materialized [`Bam`], or write a header and then stream records manually.
 pub struct BamWriter<W: Write = File> {
-    writer: W,
-    pending: Vec<u8>,
+    writer: BgzfWriter<W>,
     header_written: bool,
 }
 
@@ -1172,8 +1171,7 @@ impl<W: Write> BamWriter<W> {
     /// Creates a BAM writer from a writable byte stream.
     pub fn from_writer(writer: W) -> Self {
         Self {
-            writer,
-            pending: Vec::with_capacity(bgzf::MAX_BLOCK_DATA),
+            writer: BgzfWriter::new(writer),
             header_written: false,
         }
     }
@@ -1191,7 +1189,7 @@ impl<W: Write> BamWriter<W> {
         }
         let mut data = Vec::new();
         write_bam_header(&mut data, header, refs)?;
-        self.write_uncompressed(&data)?;
+        self.writer.write_all(&data)?;
         self.header_written = true;
         Ok(())
     }
@@ -1209,7 +1207,7 @@ impl<W: Write> BamWriter<W> {
         }
         let mut data = Vec::new();
         record.encode(&mut data)?;
-        self.write_uncompressed(&data)
+        self.writer.write_all(&data)
     }
 
     /// Writes one BAM alignment record.
@@ -1232,43 +1230,12 @@ impl<W: Write> BamWriter<W> {
 
     /// Flushes pending BGZF blocks to the underlying writer.
     pub fn flush(&mut self) -> io::Result<()> {
-        self.flush_pending()?;
         self.writer.flush()
     }
 
     /// Finishes the BGZF stream, writes the EOF block, and returns the wrapped byte stream.
-    pub fn finish(mut self) -> io::Result<W> {
-        self.flush_pending()?;
-        self.writer.write_all(&bgzf::EOF_BLOCK)?;
-        self.writer.flush()?;
-        Ok(self.writer)
-    }
-
-    fn write_uncompressed(&mut self, mut data: &[u8]) -> io::Result<()> {
-        while !data.is_empty() {
-            let available = bgzf::MAX_BLOCK_DATA - self.pending.len();
-            let take = available.min(data.len());
-            self.pending.extend_from_slice(&data[..take]);
-            data = &data[take..];
-
-            if self.pending.len() == bgzf::MAX_BLOCK_DATA {
-                self.flush_pending()?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn flush_pending(&mut self) -> io::Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-
-        let mut block = Vec::new();
-        bgzf::compress_block(&self.pending, &mut block)?;
-        self.writer.write_all(&block)?;
-        self.pending.clear();
-        Ok(())
+    pub fn finish(self) -> io::Result<W> {
+        self.writer.finish()
     }
 }
 

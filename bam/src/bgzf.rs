@@ -6,6 +6,8 @@
 //!
 //! - [`BgzfReader`], which reads a BGZF stream and reports
 //!   [`BgzfVirtualOffset`]s.
+//! - [`BgzfWriter`], which writes any byte stream as BGZF blocks and ends it
+//!   with [`EOF_BLOCK`].
 //! - [`compress_block`], which frames one block of data as a BGZF block.
 //! - [`EOF_BLOCK`], the empty block that ends a BGZF stream.
 
@@ -277,12 +279,143 @@ pub fn compress_block(data: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
+/// Message for every call on a [`BgzfWriter`] after one of its calls failed.
+const FAILED_EARLIER: &str = "BGZF writer failed earlier";
+
+/// Writer that compresses a byte stream into BGZF blocks.
+///
+/// Bytes are buffered until [`MAX_BLOCK_DATA`] are held, then written to the
+/// wrapped writer as one BGZF block. [`Write::flush`] writes any partial block
+/// early and flushes the wrapped writer. [`BgzfWriter::finish`] writes the
+/// last partial block and [`EOF_BLOCK`], and returns the wrapped writer.
+///
+/// Block boundaries depend only on the bytes written and on where
+/// [`Write::flush`] is called, so the same calls always produce the same
+/// bytes. A block that is only partly full is written only by `flush` or
+/// `finish`, so avoid calling `flush` after every small write: each call
+/// produces a small, poorly compressed block.
+///
+/// Dropping a `BgzfWriter` without calling `finish` loses any buffered bytes
+/// and leaves the stream without its EOF block.
+///
+/// If any call returns an error, the stream is incomplete, so every later
+/// [`Write::write`], [`Write::flush`] or [`BgzfWriter::finish`] returns an
+/// error too. The call that hit the original error returns that error.
+pub struct BgzfWriter<W: Write> {
+    inner: W,
+    /// Uncompressed bytes not yet written as a block; never longer than
+    /// [`MAX_BLOCK_DATA`].
+    pending: Vec<u8>,
+    /// Scratch buffer that holds one framed block on its way to `inner`.
+    framed: Vec<u8>,
+    /// Set once any call has returned an error.
+    failed: bool,
+}
+
+impl<W: Write> BgzfWriter<W> {
+    /// Creates a BGZF writer that writes compressed blocks to `inner`.
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            pending: Vec::with_capacity(MAX_BLOCK_DATA),
+            framed: Vec::new(),
+            failed: false,
+        }
+    }
+
+    /// Writes the last partial block and [`EOF_BLOCK`], flushes the wrapped
+    /// writer, and returns it.
+    ///
+    /// Returns an error if an earlier call on this writer failed, or if
+    /// writing or flushing fails now.
+    pub fn finish(mut self) -> io::Result<W> {
+        // `self` is consumed, so there is nothing left to poison on error.
+        self.ensure_not_failed()?;
+        self.write_pending_partial()?;
+        self.inner.write_all(&EOF_BLOCK)?;
+        self.inner.flush()?;
+        Ok(self.inner)
+    }
+
+    fn ensure_not_failed(&self) -> io::Result<()> {
+        if self.failed {
+            Err(io::Error::other(FAILED_EARLIER))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Passes `result` through, marking the writer failed if it is an error.
+    fn track<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    /// Copies `data` into `pending`, writing a block each time it fills up.
+    fn buffer(&mut self, mut data: &[u8]) -> io::Result<()> {
+        while !data.is_empty() {
+            let take = (MAX_BLOCK_DATA - self.pending.len()).min(data.len());
+            self.pending.extend_from_slice(&data[..take]);
+            data = &data[take..];
+
+            if self.pending.len() == MAX_BLOCK_DATA {
+                self.write_pending()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes `pending`, if it holds anything, as one block.
+    fn write_pending_partial(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            Ok(())
+        } else {
+            self.write_pending()
+        }
+    }
+
+    /// Writes `pending` as one block and empties it.
+    fn write_pending(&mut self) -> io::Result<()> {
+        self.framed.clear();
+        compress_block(&self.pending, &mut self.framed)?;
+        self.inner.write_all(&self.framed)?;
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for BgzfWriter<W> {
+    /// Buffers all of `buf` and returns `buf.len()`.
+    ///
+    /// Each time [`MAX_BLOCK_DATA`] bytes have built up, they are written to the
+    /// wrapped writer as one block.
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.ensure_not_failed()?;
+        let result = self.buffer(buf).map(|()| buf.len());
+        self.track(result)
+    }
+
+    /// Writes any buffered bytes as a block, then flushes the wrapped writer.
+    ///
+    /// Nothing is written if no bytes are buffered.
+    fn flush(&mut self) -> io::Result<()> {
+        self.ensure_not_failed()?;
+        let result = self
+            .write_pending_partial()
+            .and_then(|()| self.inner.flush());
+        self.track(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use flate2::Crc;
     use flate2::read::MultiGzDecoder;
-    use std::io::{self, Read};
+    use std::fmt::Debug;
+    use std::io::{self, Read, Write};
 
     fn crc32(data: &[u8]) -> u32 {
         let mut crc = Crc::new();
@@ -296,6 +429,57 @@ mod tests {
             .read_to_end(&mut decoded)
             .expect("MultiGzDecoder should decode the stream");
         decoded
+    }
+
+    /// Frames `data` as one BGZF block.
+    fn block(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        compress_block(data, &mut out).expect("block should compress");
+        out
+    }
+
+    /// Deterministic bytes that deflate cannot shrink much.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Inner writer that accepts writes only until `fail_after` bytes are in.
+    ///
+    /// A write is accepted whole while `written + buf.len() <= fail_after`, and
+    /// fails with `"injected failure"` otherwise.
+    #[derive(Debug)]
+    struct FailingWriter {
+        written: usize,
+        fail_after: usize,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.written + buf.len() <= self.fail_after {
+                self.written += buf.len();
+                Ok(buf.len())
+            } else {
+                Err(io::Error::other("injected failure"))
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn assert_poisoned<T: Debug>(result: io::Result<T>) {
+        let err = result.expect_err("a failed writer must keep failing");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "BGZF writer failed earlier");
     }
 
     #[test]
@@ -366,5 +550,118 @@ mod tests {
         assert_eq!(read, 0);
 
         assert!(decode_all(&EOF_BLOCK).is_empty());
+    }
+
+    #[test]
+    fn writer_cuts_blocks_at_max_block_data() {
+        let m = MAX_BLOCK_DATA;
+        let data = noise(2 * m + 10);
+
+        let mut writer = BgzfWriter::new(Vec::new());
+        assert_eq!(
+            writer.write(&data).expect("write should succeed"),
+            data.len(),
+            "write should accept the whole buffer"
+        );
+        let out = writer.finish().expect("finish should succeed");
+
+        let expected = [
+            block(&data[..m]),
+            block(&data[m..2 * m]),
+            block(&data[2 * m..]),
+            EOF_BLOCK.to_vec(),
+        ]
+        .concat();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn writer_output_decodes_to_input_for_any_write_sizes() {
+        let data = noise(200_000);
+        let sizes = [1, 7, 1_000, 65_280, 70_000];
+
+        let mut writer = BgzfWriter::new(Vec::new());
+        let mut position = 0;
+        let mut turn = 0;
+        while position < data.len() {
+            let end = (position + sizes[turn % sizes.len()]).min(data.len());
+            writer
+                .write_all(&data[position..end])
+                .expect("write should succeed");
+            position = end;
+            turn += 1;
+        }
+        let out = writer.finish().expect("finish should succeed");
+
+        assert_eq!(decode_all(&out), data);
+        assert!(out.ends_with(&EOF_BLOCK));
+    }
+
+    #[test]
+    fn flush_emits_the_partial_block() {
+        let data = noise(20);
+
+        let mut writer = BgzfWriter::new(Vec::new());
+        writer.write_all(&data[..10]).expect("write should succeed");
+        writer.flush().expect("flush should succeed");
+        writer.write_all(&data[10..]).expect("write should succeed");
+        let out = writer.finish().expect("finish should succeed");
+
+        let expected = [block(&data[..10]), block(&data[10..]), EOF_BLOCK.to_vec()].concat();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn flush_with_nothing_pending_writes_no_block() {
+        let mut writer = BgzfWriter::new(Vec::new());
+        writer.flush().expect("flush should succeed");
+        writer.flush().expect("flush should succeed");
+        let out = writer.finish().expect("finish should succeed");
+
+        assert_eq!(out, EOF_BLOCK);
+    }
+
+    #[test]
+    fn finish_on_an_empty_writer_writes_only_eof() {
+        let out = BgzfWriter::new(Vec::new())
+            .finish()
+            .expect("finish should succeed");
+
+        assert_eq!(out, EOF_BLOCK);
+    }
+
+    #[test]
+    fn writer_is_poisoned_after_an_inner_error() {
+        let data = noise(3 * MAX_BLOCK_DATA);
+        let mut writer = BgzfWriter::new(FailingWriter {
+            written: 0,
+            fail_after: 100,
+        });
+
+        let first = writer
+            .write(&data)
+            .expect_err("the inner writer should fail");
+        assert_eq!(first.to_string(), "injected failure");
+
+        assert_poisoned(writer.write(b"more"));
+        assert_poisoned(writer.flush());
+        assert_poisoned(writer.finish());
+    }
+
+    #[test]
+    fn flush_error_poisons_the_writer() {
+        let mut writer = BgzfWriter::new(FailingWriter {
+            written: 0,
+            fail_after: 0,
+        });
+        writer
+            .write_all(b"pending")
+            .expect("buffering does not touch the inner writer");
+
+        let first = writer.flush().expect_err("the inner writer should fail");
+        assert_eq!(first.to_string(), "injected failure");
+
+        assert_poisoned(writer.write(b"more"));
+        assert_poisoned(writer.finish());
     }
 }
