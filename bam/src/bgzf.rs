@@ -16,6 +16,10 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use flate2::{Compression, Crc};
 use std::io::{self, Read, Write};
+use std::mem;
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::{Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
 
 /// Most uncompressed bytes [`compress_block`] accepts for one block (65,280).
 ///
@@ -279,8 +283,21 @@ pub fn compress_block(data: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
+/// Most worker threads [`BgzfWriter::with_threads`] starts (256).
+///
+/// Larger thread counts are clamped to this value. It limits threads and
+/// memory only; output does not depend on it.
+pub const MAX_THREADS: usize = 256;
+
 /// Message for every call on a [`BgzfWriter`] after one of its calls failed.
 const FAILED_EARLIER: &str = "BGZF writer failed earlier";
+
+/// Message for a worker thread that stopped before returning its blocks.
+const WORKER_STOPPED: &str = "BGZF worker stopped";
+
+/// Most blocks in flight per worker, and the capacity of each worker's job and
+/// result channels.
+const PER_WORKER: usize = 2;
 
 /// Writer that compresses a byte stream into BGZF blocks.
 ///
@@ -289,14 +306,23 @@ const FAILED_EARLIER: &str = "BGZF writer failed earlier";
 /// early and flushes the wrapped writer. [`BgzfWriter::finish`] writes the
 /// last partial block and [`EOF_BLOCK`], and returns the wrapped writer.
 ///
+/// [`BgzfWriter::new`] compresses on the calling thread.
+/// [`BgzfWriter::with_threads`] compresses on worker threads and still writes
+/// the blocks in order.
+///
 /// Block boundaries depend only on the bytes written and on where
 /// [`Write::flush`] is called, so the same calls always produce the same
-/// bytes. A block that is only partly full is written only by `flush` or
-/// `finish`, so avoid calling `flush` after every small write: each call
-/// produces a small, poorly compressed block.
+/// bytes, whatever the thread count. A block that is only partly full is
+/// written only by `flush` or `finish`, so avoid calling `flush` after every
+/// small write: each call produces a small, poorly compressed block.
+///
+/// Deflate output comes from flate2's backend. Bytes match within a build,
+/// but switching flate2 to another backend (for example zlib-ng) changes them.
+/// Output is still identical for every thread count.
 ///
 /// Dropping a `BgzfWriter` without calling `finish` loses any buffered bytes
-/// and leaves the stream without its EOF block.
+/// and leaves the stream without its EOF block, so `finish` is required for a
+/// complete stream. A dropped threaded writer stops and joins its workers.
 ///
 /// If any call returns an error, the stream is incomplete, so every later
 /// [`Write::write`], [`Write::flush`] or [`BgzfWriter::finish`] returns an
@@ -306,8 +332,11 @@ pub struct BgzfWriter<W: Write> {
     /// Uncompressed bytes not yet written as a block; never longer than
     /// [`MAX_BLOCK_DATA`].
     pending: Vec<u8>,
-    /// Scratch buffer that holds one framed block on its way to `inner`.
+    /// Scratch buffer that holds one framed block on its way to `inner`; used
+    /// only when compressing inline.
     framed: Vec<u8>,
+    /// Worker threads that compress blocks; `None` compresses inline.
+    pool: Option<Pool>,
     /// Set once any call has returned an error.
     failed: bool,
 }
@@ -319,21 +348,61 @@ impl<W: Write> BgzfWriter<W> {
             inner,
             pending: Vec::with_capacity(MAX_BLOCK_DATA),
             framed: Vec::new(),
+            pool: None,
             failed: false,
         }
+    }
+
+    /// Creates a BGZF writer that compresses blocks on `threads` worker
+    /// threads and writes them to `inner` in stream order.
+    ///
+    /// `threads` of 0 or 1 compresses on the calling thread, exactly like
+    /// [`BgzfWriter::new`]. Larger values start `threads` workers, clamped to
+    /// [`MAX_THREADS`]. If the system cannot start them all, the writer uses
+    /// the workers it did start, or compresses inline if it started none.
+    ///
+    /// Workers only compress. Every write to `inner` happens on the thread
+    /// that calls `write`, `flush` or `finish`, so `inner` need not be
+    /// [`Send`]. At most two blocks per worker are in flight at once, which
+    /// bounds memory use.
+    ///
+    /// Output does not depend on the thread count: given the same sequence of
+    /// `write`, `flush` and `finish` calls, every thread count gives the same
+    /// bytes as [`BgzfWriter::new`]. Deflate output comes from flate2's
+    /// backend, so bytes match within a build; another flate2 backend (for
+    /// example zlib-ng) gives different bytes, still identical across thread
+    /// counts.
+    ///
+    /// Call [`BgzfWriter::finish`] to complete the stream. Dropping the
+    /// writer stops and joins its workers, but discards blocks not yet
+    /// written and leaves the stream without its EOF block.
+    pub fn with_threads(inner: W, threads: usize) -> Self {
+        let mut writer = Self::new(inner);
+        if threads > 1 {
+            writer.pool = Pool::start(threads.min(MAX_THREADS));
+        }
+        writer
     }
 
     /// Writes the last partial block and [`EOF_BLOCK`], flushes the wrapped
     /// writer, and returns it.
     ///
-    /// Returns an error if an earlier call on this writer failed, or if
-    /// writing or flushing fails now.
+    /// A threaded writer first waits for every block its workers hold, and
+    /// joins the workers once the EOF block is written.
+    ///
+    /// Returns an error if an earlier call on this writer failed, if writing
+    /// or flushing fails now, or if a worker thread stopped unexpectedly.
     pub fn finish(mut self) -> io::Result<W> {
         // `self` is consumed, so there is nothing left to poison on error.
+        // Returning early drops `self`, which stops and joins any workers.
         self.ensure_not_failed()?;
         self.write_pending_partial()?;
+        self.write_in_flight()?;
         self.inner.write_all(&EOF_BLOCK)?;
         self.inner.flush()?;
+        if let Some(mut pool) = self.pool.take() {
+            pool.shut_down()?;
+        }
         Ok(self.inner)
     }
 
@@ -377,12 +446,31 @@ impl<W: Write> BgzfWriter<W> {
     }
 
     /// Writes `pending` as one block and empties it.
+    ///
+    /// A threaded writer sends the block to a worker instead, then writes any
+    /// finished blocks.
     fn write_pending(&mut self) -> io::Result<()> {
-        self.framed.clear();
-        compress_block(&self.pending, &mut self.framed)?;
-        self.inner.write_all(&self.framed)?;
-        self.pending.clear();
-        Ok(())
+        match &mut self.pool {
+            None => {
+                self.framed.clear();
+                compress_block(&self.pending, &mut self.framed)?;
+                self.inner.write_all(&self.framed)?;
+                self.pending.clear();
+                Ok(())
+            }
+            Some(pool) => {
+                let data = mem::replace(&mut self.pending, Vec::with_capacity(MAX_BLOCK_DATA));
+                pool.send(data, &mut self.inner)
+            }
+        }
+    }
+
+    /// Waits for every block the workers hold and writes them to `inner`.
+    fn write_in_flight(&mut self) -> io::Result<()> {
+        match &mut self.pool {
+            None => Ok(()),
+            Some(pool) => pool.write_in_flight(&mut self.inner),
+        }
     }
 }
 
@@ -390,7 +478,9 @@ impl<W: Write> Write for BgzfWriter<W> {
     /// Buffers all of `buf` and returns `buf.len()`.
     ///
     /// Each time [`MAX_BLOCK_DATA`] bytes have built up, they are written to the
-    /// wrapped writer as one block.
+    /// wrapped writer as one block. A threaded writer sends them to a worker
+    /// instead and writes any blocks already compressed, in order. If two
+    /// blocks per worker are already in flight, it waits for the oldest first.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.ensure_not_failed()?;
         let result = self.buffer(buf).map(|()| buf.len());
@@ -399,13 +489,187 @@ impl<W: Write> Write for BgzfWriter<W> {
 
     /// Writes any buffered bytes as a block, then flushes the wrapped writer.
     ///
-    /// Nothing is written if no bytes are buffered.
+    /// A threaded writer waits for and writes every block in flight before it
+    /// flushes. No block is added if no bytes are buffered.
     fn flush(&mut self) -> io::Result<()> {
         self.ensure_not_failed()?;
         let result = self
             .write_pending_partial()
+            .and_then(|()| self.write_in_flight())
             .and_then(|()| self.inner.flush());
         self.track(result)
+    }
+}
+
+/// Worker threads that compress blocks for a threaded [`BgzfWriter`].
+///
+/// Block `k` goes to worker `k % workers`. Each worker compresses its jobs in
+/// the order it gets them, so taking results from the workers in turn gives
+/// the blocks in stream order, with no reordering.
+///
+/// The blocks in flight are the run of sequence numbers from `written` up to
+/// `sent`, and `send` keeps that run at most `PER_WORKER × workers` long. So no
+/// worker ever holds more than `PER_WORKER` blocks, which is the capacity of
+/// both of its channels: a job send never blocks, and a worker never blocks
+/// sending a result. The block the writer waits for is always the oldest
+/// one its worker holds, so the wait always ends.
+struct Pool {
+    workers: Vec<Worker>,
+    /// Blocks sent to workers so far.
+    sent: u64,
+    /// Blocks written to the inner writer so far; never more than `sent`.
+    written: u64,
+}
+
+/// One compression thread and its channels.
+struct Worker {
+    jobs: SyncSender<Vec<u8>>,
+    /// In a `Mutex` only so that `BgzfWriter` stays `Sync` (a `Receiver` is
+    /// not). It is reached only through [`Mutex::get_mut`], which never locks.
+    results: Mutex<Receiver<io::Result<Vec<u8>>>>,
+    thread: JoinHandle<()>,
+}
+
+impl Worker {
+    /// This worker's result receiver.
+    fn results(&mut self) -> &Receiver<io::Result<Vec<u8>>> {
+        self.results
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Pool {
+    /// Starts up to `count` workers. Returns `None` if none could start.
+    fn start(count: usize) -> Option<Self> {
+        let mut workers = Vec::with_capacity(count);
+        for i in 0..count {
+            let (jobs, job_queue) = mpsc::sync_channel(PER_WORKER);
+            let (result_sender, results) = mpsc::sync_channel(PER_WORKER);
+            let spawned = thread::Builder::new()
+                .name(format!("bgzf-worker-{i}"))
+                .spawn(move || compress_jobs(job_queue, result_sender));
+            match spawned {
+                Ok(thread) => workers.push(Worker {
+                    jobs,
+                    results: Mutex::new(results),
+                    thread,
+                }),
+                // The workers already running give the same output.
+                Err(_) => break,
+            }
+        }
+
+        if workers.is_empty() {
+            None
+        } else {
+            Some(Self {
+                workers,
+                sent: 0,
+                written: 0,
+            })
+        }
+    }
+
+    /// Index of the worker that compresses block `block`.
+    fn worker_for(&self, block: u64) -> usize {
+        (block % self.workers.len() as u64) as usize
+    }
+
+    /// Sends `data` to the next worker as block `sent`, then writes any
+    /// blocks that are ready.
+    ///
+    /// If the limit of blocks in flight is reached, first waits for the
+    /// oldest block and writes it.
+    fn send<W: Write>(&mut self, data: Vec<u8>, inner: &mut W) -> io::Result<()> {
+        let limit = (PER_WORKER * self.workers.len()) as u64;
+        if self.sent - self.written == limit {
+            self.write_next(inner)?;
+        }
+
+        let index = self.worker_for(self.sent);
+        self.workers[index]
+            .jobs
+            .send(data)
+            .map_err(|_| io::Error::other(WORKER_STOPPED))?;
+        self.sent += 1;
+        self.write_ready(inner)
+    }
+
+    /// Waits for the oldest block in flight and writes it to `inner`.
+    fn write_next<W: Write>(&mut self, inner: &mut W) -> io::Result<()> {
+        let index = self.worker_for(self.written);
+        let block = self.workers[index]
+            .results()
+            .recv()
+            .map_err(|_| io::Error::other(WORKER_STOPPED))??;
+        inner.write_all(&block)?;
+        self.written += 1;
+        Ok(())
+    }
+
+    /// Writes blocks to `inner`, oldest first, while the oldest is already
+    /// compressed.
+    fn write_ready<W: Write>(&mut self, inner: &mut W) -> io::Result<()> {
+        while self.written < self.sent {
+            let index = self.worker_for(self.written);
+            let block = match self.workers[index].results().try_recv() {
+                Ok(result) => result?,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Err(io::Error::other(WORKER_STOPPED)),
+            };
+            inner.write_all(&block)?;
+            self.written += 1;
+        }
+        Ok(())
+    }
+
+    /// Waits for every block in flight and writes them to `inner` in order.
+    fn write_in_flight<W: Write>(&mut self, inner: &mut W) -> io::Result<()> {
+        while self.written < self.sent {
+            self.write_next(inner)?;
+        }
+        Ok(())
+    }
+
+    /// Closes every worker's channels, then joins every worker thread.
+    ///
+    /// Returns an error if any worker panicked. Calling it again does nothing.
+    fn shut_down(&mut self) -> io::Result<()> {
+        // Dropping a worker's job sender ends its loop, and dropping its result
+        // receiver ends it after the block it is on. All channels close before
+        // the first join, so the workers stop together.
+        let threads: Vec<JoinHandle<()>> =
+            self.workers.drain(..).map(|worker| worker.thread).collect();
+
+        let mut result = Ok(());
+        for thread in threads {
+            if thread.join().is_err() {
+                result = Err(io::Error::other(WORKER_STOPPED));
+            }
+        }
+        result
+    }
+}
+
+impl Drop for Pool {
+    /// Stops and joins the workers if [`BgzfWriter::finish`] did not.
+    fn drop(&mut self) {
+        // Nothing can report a worker panic from here, so it is ignored.
+        let _ = self.shut_down();
+    }
+}
+
+/// Worker loop: compresses each job and sends back the result, in order.
+///
+/// Returns when the job channel closes or the result receiver is dropped.
+fn compress_jobs(jobs: Receiver<Vec<u8>>, results: SyncSender<io::Result<Vec<u8>>>) {
+    for data in jobs {
+        let mut out = Vec::new();
+        let result = compress_block(&data, &mut out).map(|()| out);
+        if results.send(result).is_err() {
+            break;
+        }
     }
 }
 
@@ -416,6 +680,9 @@ mod tests {
     use flate2::read::MultiGzDecoder;
     use std::fmt::Debug;
     use std::io::{self, Read, Write};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use std::{panic, thread};
 
     fn crc32(data: &[u8]) -> u32 {
         let mut crc = Crc::new();
@@ -480,6 +747,127 @@ mod tests {
         let err = result.expect_err("a failed writer must keep failing");
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(err.to_string(), "BGZF writer failed earlier");
+    }
+
+    /// Runs `f` on its own thread and returns its result, panicking with
+    /// "timed out" if `f` takes longer than `secs` seconds, so a deadlock fails
+    /// the test instead of stalling the run.
+    fn within<T, F>(secs: u64, f: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let (done, finished) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            // The receiver is gone only if the test has already timed out.
+            let _ = done.send(f());
+        });
+        match finished.recv_timeout(Duration::from_secs(secs)) {
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("timed out after {secs} s"),
+            // `f` panicked: re-raise its panic so the test reports the real failure.
+            Err(mpsc::RecvTimeoutError::Disconnected) => match handle.join() {
+                Err(payload) => panic::resume_unwind(payload),
+                Ok(()) => unreachable!("the thread only exits without sending by panicking"),
+            },
+        }
+    }
+
+    /// One call in a sequence of writer calls replayed by [`replay`].
+    #[derive(Debug, Clone, Copy)]
+    enum Op {
+        /// Write the next `len` bytes of [`text`].
+        Write(usize),
+        Flush,
+    }
+
+    /// Deterministic DNA-like bytes: an LCG over `ACGT`, so blocks compress.
+    fn text(len: usize) -> Vec<u8> {
+        let mut state = 0x9e37_79b9_u32;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                b"ACGT"[(state >> 30) as usize]
+            })
+            .collect()
+    }
+
+    /// Replays `ops` on `writer` over the bytes of [`text`], then finishes it.
+    fn replay(mut writer: BgzfWriter<Vec<u8>>, ops: &[Op]) -> Vec<u8> {
+        let total = ops
+            .iter()
+            .map(|op| match op {
+                Op::Write(len) => *len,
+                Op::Flush => 0,
+            })
+            .sum();
+        let data = text(total);
+        let mut position = 0;
+        for op in ops {
+            match *op {
+                Op::Write(len) => {
+                    writer
+                        .write_all(&data[position..position + len])
+                        .expect("write should succeed");
+                    position += len;
+                }
+                Op::Flush => writer.flush().expect("flush should succeed"),
+            }
+        }
+        writer.finish().expect("finish should succeed")
+    }
+
+    /// Output of an inline writer for `ops`.
+    fn inline(ops: &[Op]) -> Vec<u8> {
+        replay(BgzfWriter::new(Vec::new()), ops)
+    }
+
+    /// Output of a `with_threads(threads)` writer for `ops`.
+    fn threaded(threads: usize, ops: &[Op]) -> Vec<u8> {
+        replay(BgzfWriter::with_threads(Vec::new(), threads), ops)
+    }
+
+    /// Worker threads `writer` runs; 0 means it compresses inline.
+    fn worker_count<W: Write>(writer: &BgzfWriter<W>) -> usize {
+        writer.pool.as_ref().map_or(0, |pool| pool.workers.len())
+    }
+
+    /// Blocks sent to workers but not yet written; 0 for an inline writer.
+    fn in_flight<W: Write>(writer: &BgzfWriter<W>) -> u64 {
+        writer
+            .pool
+            .as_ref()
+            .map_or(0, |pool| pool.sent - pool.written)
+    }
+
+    /// Number of blocks in a stream framed by [`compress_block`], counted by
+    /// following each block's BSIZE field.
+    fn block_count(bytes: &[u8]) -> usize {
+        let mut count = 0;
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let bsize = u16::from_le_bytes([bytes[offset + 16], bytes[offset + 17]]);
+            offset += usize::from(bsize) + 1;
+            count += 1;
+        }
+        assert_eq!(offset, bytes.len(), "the last block must end the stream");
+        count
+    }
+
+    /// Panics unless `actual == expected`, without printing megabytes of bytes.
+    fn assert_same_bytes(actual: &[u8], expected: &[u8], context: &str) {
+        if actual != expected {
+            let first = actual
+                .iter()
+                .zip(expected)
+                .position(|(a, e)| a != e)
+                .unwrap_or(actual.len().min(expected.len()));
+            panic!(
+                "{context}: {} bytes where {} were expected, first difference at byte {first}",
+                actual.len(),
+                expected.len()
+            );
+        }
     }
 
     #[test]
@@ -663,5 +1051,163 @@ mod tests {
 
         assert_poisoned(writer.write(b"more"));
         assert_poisoned(writer.finish());
+    }
+
+    #[test]
+    fn threaded_output_matches_inline_for_every_thread_count() {
+        within(30, || {
+            let sizes = [1, 7, 4_096, 65_280, 100_000];
+            let mut ops = Vec::new();
+            let mut remaining = 1_000_000;
+            let mut turn = 0;
+            while remaining > 0 {
+                let len = sizes[turn % sizes.len()].min(remaining);
+                ops.push(Op::Write(len));
+                remaining -= len;
+                turn += 1;
+                if turn == 3 {
+                    ops.push(Op::Flush);
+                }
+            }
+            let expected = inline(&ops);
+
+            for threads in [0, 1, 2, 3, 8] {
+                let writer = BgzfWriter::with_threads(Vec::new(), threads);
+                let workers = if threads < 2 { 0 } else { threads };
+                assert_eq!(worker_count(&writer), workers, "threads = {threads}");
+                assert_same_bytes(
+                    &replay(writer, &ops),
+                    &expected,
+                    &format!("threads = {threads}"),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn threaded_writer_exceeds_the_in_flight_limit() {
+        within(30, || {
+            // 41 data blocks through 2 workers, far past the limit of 4 in flight.
+            let data = text(40 * MAX_BLOCK_DATA + 5);
+            let mut writer = BgzfWriter::with_threads(Vec::new(), 2);
+            for chunk in data.chunks(10_000) {
+                writer.write_all(chunk).expect("write should succeed");
+                assert!(
+                    in_flight(&writer) <= 4,
+                    "no more than 2 blocks per worker may be in flight"
+                );
+            }
+            let out = writer.finish().expect("finish should succeed");
+
+            assert_same_bytes(&out, &inline(&[Op::Write(data.len())]), "threads = 2");
+            assert_eq!(block_count(&out), 42, "41 data blocks and the EOF block");
+        });
+    }
+
+    #[test]
+    fn one_huge_write_matches_inline() {
+        within(30, || {
+            let ops = [Op::Write(5_000_000)];
+            assert_same_bytes(&threaded(2, &ops), &inline(&ops), "threads = 2");
+        });
+    }
+
+    #[test]
+    fn inner_error_at_the_in_flight_limit_is_returned_without_hanging() {
+        within(30, || {
+            let inner = FailingWriter {
+                written: 0,
+                fail_after: 70_000,
+            };
+            let mut writer = BgzfWriter::with_threads(inner, 2);
+            let data = text(2_000_000);
+
+            let first = data
+                .chunks(10_000)
+                .find_map(|chunk| writer.write(chunk).err())
+                .expect("the inner writer should fail");
+            assert_eq!(first.to_string(), "injected failure");
+
+            assert_poisoned(writer.write(b"more"));
+            assert_poisoned(writer.flush());
+            assert_poisoned(writer.finish());
+        });
+    }
+
+    #[test]
+    fn flush_after_every_write_matches_inline() {
+        within(30, || {
+            let ops: Vec<Op> = (0..300).flat_map(|_| [Op::Write(97), Op::Flush]).collect();
+            let expected = inline(&ops);
+            assert_eq!(
+                block_count(&expected),
+                301,
+                "one block per flush and the EOF block"
+            );
+
+            for threads in [2, 8] {
+                assert_same_bytes(
+                    &threaded(threads, &ops),
+                    &expected,
+                    &format!("threads = {threads}"),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn absurd_thread_counts_are_clamped() {
+        within(30, || {
+            assert_eq!(MAX_THREADS, 256);
+            let writer = BgzfWriter::with_threads(Vec::new(), 100_000);
+            assert_eq!(worker_count(&writer), MAX_THREADS);
+
+            let ops = [Op::Write(200_000)];
+            assert_same_bytes(&replay(writer, &ops), &inline(&ops), "threads = 100_000");
+        });
+    }
+
+    #[test]
+    fn dropping_a_threaded_writer_without_finish_returns() {
+        within(30, || {
+            let mut writer = BgzfWriter::with_threads(Vec::new(), 4);
+            writer
+                .write_all(&text(500_000))
+                .expect("write should succeed");
+            drop(writer);
+        });
+    }
+
+    #[test]
+    fn threaded_output_reads_back() {
+        within(30, || {
+            let data = text(300_000);
+            let mut writer = BgzfWriter::with_threads(Vec::new(), 3);
+            writer
+                .write_all(&data[..1_000])
+                .expect("write should succeed");
+            writer.flush().expect("flush should succeed");
+            writer
+                .write_all(&data[1_000..])
+                .expect("write should succeed");
+            let out = writer.finish().expect("finish should succeed");
+
+            let mut read_back = Vec::new();
+            BgzfReader::new(&out[..])
+                .read_to_end(&mut read_back)
+                .expect("BgzfReader should read the stream");
+            assert!(read_back == data, "BgzfReader must give back the input");
+            assert!(
+                decode_all(&out) == data,
+                "MultiGzDecoder must give back the input"
+            );
+        });
+    }
+
+    #[test]
+    fn writer_is_send_and_sync_when_the_inner_writer_is() {
+        // BamWriter wraps BgzfWriter and was Send + Sync before worker threads.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<BgzfWriter<Vec<u8>>>();
     }
 }
