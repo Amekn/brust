@@ -70,17 +70,72 @@ impl Conversion {
     }
 }
 
+/// Options for [`convert_with`].
+///
+/// Build one with [`ConvertOptions::default`] and the builder methods; the
+/// struct is `#[non_exhaustive]`, so it cannot be built with a struct literal
+/// outside this crate and new options can be added without breaking callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConvertOptions {
+    /// BGZF compression threads used when the output is BAM.
+    ///
+    /// `0` and `1` compress on the calling thread. This has no effect on
+    /// conversions that do not write BAM. Output bytes are identical for any
+    /// thread count.
+    pub threads: usize,
+}
+
+impl Default for ConvertOptions {
+    /// One thread, so compression runs inline on the calling thread.
+    fn default() -> Self {
+        Self { threads: 1 }
+    }
+}
+
+impl ConvertOptions {
+    /// Sets the number of BGZF compression threads.
+    ///
+    /// `threads` affects only conversions that write BAM
+    /// ([`Conversion::FastqToBam`] and [`Conversion::SamToBam`]); every other
+    /// conversion ignores it. `0` and `1` compress on the calling thread. The
+    /// output is byte-identical for any thread count.
+    #[must_use]
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
+}
+
 /// Converts between supported formats selected at runtime.
+///
+/// This is [`convert_with`] using [`ConvertOptions::default`].
 pub fn convert<I: AsRef<Path>, O: AsRef<Path>>(
     conversion: Conversion,
     input: I,
     output: O,
 ) -> Result<()> {
+    convert_with(conversion, input, output, &ConvertOptions::default())
+}
+
+/// Converts between supported formats selected at runtime, with options.
+///
+/// `options.threads` affects only conversions that write BAM
+/// ([`Conversion::FastqToBam`] and [`Conversion::SamToBam`]); the other
+/// conversions ignore it. The output is byte-identical for any thread count.
+/// As with [`convert`], the output is written to a temporary file and renamed on
+/// success, so a failed conversion leaves an existing output file untouched.
+pub fn convert_with<I: AsRef<Path>, O: AsRef<Path>>(
+    conversion: Conversion,
+    input: I,
+    output: O,
+    options: &ConvertOptions,
+) -> Result<()> {
     match conversion {
         Conversion::FastqToFasta => fastq_to_fasta(input, output),
         Conversion::FastqToSam => fastq_to_sam(input, output),
-        Conversion::FastqToBam => fastq_to_bam(input, output),
-        Conversion::SamToBam => sam_to_bam(input, output),
+        Conversion::FastqToBam => fastq_to_bam_with(input, output, options.threads),
+        Conversion::SamToBam => sam_to_bam_with(input, output, options.threads),
         Conversion::BamToSam => bam_to_sam(input, output),
         Conversion::SamToFastq => sam_to_fastq(input, output),
         Conversion::BamToFastq => bam_to_fastq(input, output),
@@ -117,12 +172,20 @@ pub fn fastq_to_sam<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Resu
 
 /// Converts FASTQ reads to unmapped BAM records.
 pub fn fastq_to_bam<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result<()> {
+    fastq_to_bam_with(input, output, 1)
+}
+
+fn fastq_to_bam_with<I: AsRef<Path>, O: AsRef<Path>>(
+    input: I,
+    output: O,
+    threads: usize,
+) -> Result<()> {
     let input = input.as_ref();
     write_atomic(output.as_ref(), |temp_output| {
         let header = sam::SamHeader::default();
         let converter = bam::SamToBamConverter::new(&header)?;
         let mut reader = fastq::FastqReader::from_path(input)?;
-        let mut writer = bam::BamWriter::from_path(temp_output)?;
+        let mut writer = bam::BamWriter::from_path_with_threads(temp_output, threads)?;
 
         writer.write_header(converter.header(), converter.refs())?;
         while let Some(record) = reader.read_record()? {
@@ -137,11 +200,19 @@ pub fn fastq_to_bam<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Resu
 
 /// Converts a supported SAM payload to BAM.
 pub fn sam_to_bam<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result<()> {
+    sam_to_bam_with(input, output, 1)
+}
+
+fn sam_to_bam_with<I: AsRef<Path>, O: AsRef<Path>>(
+    input: I,
+    output: O,
+    threads: usize,
+) -> Result<()> {
     let input = input.as_ref();
     write_atomic(output.as_ref(), |temp_output| {
         let mut reader = sam::SamReader::from_path(input)?;
         let converter = bam::SamToBamConverter::new(&reader.header)?;
-        let mut writer = bam::BamWriter::from_path(temp_output)?;
+        let mut writer = bam::BamWriter::from_path_with_threads(temp_output, threads)?;
 
         writer.write_header(converter.header(), converter.refs())?;
         while let Some(record) = reader.read_record()? {

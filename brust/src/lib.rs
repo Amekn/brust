@@ -14,8 +14,8 @@ pub mod validate;
 pub use bam;
 /// Shared Brust compression, diagnostic, error, format, and result types.
 pub use brust_core::{Compression, Diagnostic, Error, Format, Result};
-/// Supported conversion paths.
-pub use convert::Conversion;
+/// Supported conversion paths and conversion options.
+pub use convert::{Conversion, ConvertOptions};
 /// Re-export of the FASTA format crate.
 pub use fasta;
 /// Re-export of the FASTQ format crate.

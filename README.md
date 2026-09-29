@@ -155,6 +155,29 @@ fn main() -> brust::Result<()> {
 }
 ```
 
+### Convert with Options
+
+`ConvertOptions::threads` sets the number of BGZF compression threads. It affects
+only conversions that write BAM (`FastqToBam` and `SamToBam`); other conversions
+ignore it. The output is byte-identical for any thread count.
+
+```rust
+use brust::{Conversion, ConvertOptions, convert};
+
+fn main() -> brust::Result<()> {
+    let options = ConvertOptions::default().threads(4);
+
+    convert::convert_with(
+        Conversion::SamToBam,
+        "aligned.sam",
+        "aligned.bam",
+        &options,
+    )?;
+
+    Ok(())
+}
+```
+
 ### Typed Statistics
 
 ```rust

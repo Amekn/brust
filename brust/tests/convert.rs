@@ -1,6 +1,6 @@
 mod common;
 
-use brust::{Conversion, Format, bam, convert, fasta, fastq, sam};
+use brust::{Conversion, ConvertOptions, Format, bam, convert, fasta, fastq, sam};
 use std::fs;
 
 #[test]
@@ -129,4 +129,96 @@ fn failed_conversion_preserves_existing_output_file() {
             .contains("cannot convert record without SEQ")
     );
     assert_eq!(fs::read_to_string(&output).unwrap(), "existing output\n");
+}
+
+#[test]
+fn convert_options_default_to_one_thread() {
+    assert_eq!(ConvertOptions::default().threads, 1);
+    assert_eq!(ConvertOptions::default().threads(8).threads, 8);
+}
+
+#[test]
+fn threaded_bam_conversions_match_default_bytes() {
+    let temp = common::TempDir::new("threaded-bam-conversions");
+    let cases = [
+        (Conversion::SamToBam, "sam/aligned.sam"),
+        (Conversion::SamToBam, "sam/unaligned.sam"),
+        (Conversion::FastqToBam, "fastq/UDP0057_sub100.fastq"),
+    ];
+
+    for (index, (conversion, fixture)) in cases.into_iter().enumerate() {
+        let input = common::fixture(fixture);
+        let expected_output = temp.join(&format!("expected-{index}.bam"));
+        convert::convert(conversion, &input, &expected_output).unwrap();
+        let expected = fs::read(&expected_output).unwrap();
+
+        // 0 and 1 compress inline; 4 uses worker threads. All must match.
+        for threads in [0, 4] {
+            let output = temp.join(&format!("threads-{threads}-{index}.bam"));
+            let options = ConvertOptions::default().threads(threads);
+            convert::convert_with(conversion, &input, &output, &options).unwrap();
+            assert_eq!(
+                fs::read(&output).unwrap(),
+                expected,
+                "{} on {fixture} with {threads} threads",
+                conversion.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn threads_do_not_change_non_bam_outputs() {
+    let temp = common::TempDir::new("threads-non-bam");
+    let input = common::fixture("fastq/UDP0057_sub100.fastq");
+    let expected_output = temp.join("expected.fasta");
+    let threaded_output = temp.join("threaded.fasta");
+
+    convert::convert(Conversion::FastqToFasta, &input, &expected_output).unwrap();
+    convert::convert_with(
+        Conversion::FastqToFasta,
+        &input,
+        &threaded_output,
+        &ConvertOptions::default().threads(4),
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read(&threaded_output).unwrap(),
+        fs::read(&expected_output).unwrap()
+    );
+}
+
+#[test]
+fn failed_threaded_conversion_preserves_existing_output() {
+    let temp = common::TempDir::new("threaded-conversion-failure");
+    let input = temp.join("bad-final-line.sam");
+    let output = temp.join("reads.bam");
+
+    // Valid header and records, then a final line that is not a SAM record.
+    let mut sam = fs::read_to_string(common::fixture("sam/aligned.sam")).unwrap();
+    if !sam.ends_with('\n') {
+        sam.push('\n');
+    }
+    sam.push_str("bad\tline\n");
+    fs::write(&input, sam).unwrap();
+    fs::write(&output, b"sentinel").unwrap();
+
+    let result = convert::convert_with(
+        Conversion::SamToBam,
+        &input,
+        &output,
+        &ConvertOptions::default().threads(4),
+    );
+
+    let error = result.unwrap_err();
+    assert_eq!(error.format(), Some(Format::Sam));
+    assert_eq!(fs::read(&output).unwrap(), b"sentinel");
+    // No temporary output is left beside the input and the output.
+    let mut names: Vec<_> = fs::read_dir(temp.join("."))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["bad-final-line.sam", "reads.bam"]);
 }
