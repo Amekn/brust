@@ -60,6 +60,23 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+## Atomic Write
+
+```rust
+use brust_fasta::FastaWriter;
+
+fn main() -> std::io::Result<()> {
+    let mut writer = FastaWriter::from_path_atomic("seqs.fasta")?;
+    // ... write to `writer` ...
+    writer.commit()
+}
+```
+
+`from_path_atomic` writes to a hidden temporary file beside the target and
+renames it into place on `commit`, so a crash or early return never leaves a
+half-written FASTA file. Dropping the writer without committing discards the
+output. `Fasta::to_path_atomic` does the same for an in-memory `Fasta`.
+
 ## Materialized Workflow
 
 ```rust

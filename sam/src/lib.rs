@@ -14,7 +14,7 @@
 //! reparses them before emitting text, so the same validation is applied on
 //! output.
 
-use brust_core::{Error, Format};
+use brust_core::{AtomicFile, Error, Format};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -372,6 +372,16 @@ impl Sam {
         writer.flush()
     }
 
+    /// Writes this SAM payload to a filesystem path atomically.
+    ///
+    /// Nothing appears at `path` unless the whole payload is written and
+    /// committed. See [`SamWriter::from_path_atomic`].
+    pub fn to_path_atomic<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let mut writer = SamWriter::from_path_atomic(path)?;
+        writer.write_all(self)?;
+        writer.commit()
+    }
+
     /// Writes this SAM payload to a writable byte stream.
     pub fn to_writer<W: Write>(&self, writer: W) -> io::Result<()> {
         let mut writer = SamWriter::from_writer(writer);
@@ -501,6 +511,9 @@ impl<R: Read> SamReader<R> {
 
 impl SamWriter<File> {
     /// Creates or truncates a SAM file at a filesystem path.
+    ///
+    /// Use [`SamWriter::from_path_atomic`] to keep an existing file intact until
+    /// the new one is complete.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::create(path)?;
         Ok(Self::from_writer(file))
@@ -511,6 +524,24 @@ impl SamWriter<File> {
     /// This is a convenience alias for [`SamWriter::from_path`].
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         Self::from_path(path)
+    }
+}
+
+impl SamWriter<AtomicFile> {
+    /// Creates a SAM writer that publishes its output atomically.
+    ///
+    /// Nothing appears at `path` until [`commit`](Self::commit) renames the
+    /// finished file into place; dropping the writer discards the output. See
+    /// [`AtomicFile`] for the one error `commit` can return after the rename.
+    pub fn from_path_atomic<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Ok(Self::from_writer(AtomicFile::create(path)?))
+    }
+
+    /// Flushes, syncs and renames the output into place.
+    ///
+    /// See [`AtomicFile::commit`] for the exact steps and errors.
+    pub fn commit(self) -> io::Result<()> {
+        self.into_inner().commit()
     }
 }
 

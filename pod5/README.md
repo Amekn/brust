@@ -50,6 +50,23 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+## Atomic Write
+
+```rust
+use brust_pod5::Pod5Writer;
+
+fn main() -> std::io::Result<()> {
+    let mut writer = Pod5Writer::from_path_atomic("out.pod5")?;
+    // ... write to `writer` ...
+    writer.commit()
+}
+```
+
+`from_path_atomic` writes to a hidden temporary file beside the target and
+renames it into place on `commit`, so a crash or early return never leaves a
+half-written POD5 file. Dropping the writer without committing discards the
+output. `Pod5::to_path_atomic` does the same for an in-memory `Pod5`.
+
 ## Signal Lookup
 
 ```rust
