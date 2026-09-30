@@ -1,7 +1,8 @@
 # Atomic writes and strict BAM reading — design
 
 Date: 01/10/2026
-Status: approved in conversation (including the 0.3.0 bump), awaiting written-spec review
+Status: approved by the user 01/10/2026, then amended after Codex reviewed the plan
+(01/10/2026): close and folder-sync semantics, the strict error's format, and error-once
 Branch: `feat/atomic-io`
 
 ## Background
@@ -123,14 +124,16 @@ impl Drop for AtomicFile { /* not committed: delete the temp file, ignore errors
 
 1. Flush the buffer and take back the `File`.
 2. `sync_all` the temp file.
-3. Close the temp file.
-4. `fs::rename` the temp file over the target.
+3. Close the temp file. This is unchecked: std ignores close errors, and the data is already
+   synced.
+4. `fs::rename` the temp file over the target. The new file is published here.
 5. On Unix, open the parent folder and `sync_all` it. Other platforms skip this step.
 
-If any of steps 1 to 4 fails, the temp file is deleted (best effort), the target is left as it
-was, and the original error is returned. If step 5 fails, the new file is already in place. The
-error keeps the original `io::ErrorKind`, and its message says the file was renamed but the
-folder sync failed.
+If step 1, 2 or 4 fails, the temp file is deleted (best effort), the target is left as it was,
+and the original error is returned. A failed flush never retries writing the buffer. If step 5
+fails, whether opening or syncing the folder, the new file is already in place. The error keeps
+the original `io::ErrorKind`, and its message says the file was renamed but the folder sync
+failed.
 
 **Drop without commit** covers returning an error, leaving early with `?`, and a panic that
 unwinds. The temp file is deleted and errors are ignored. Nothing appears at the target, and an
@@ -171,7 +174,8 @@ writer as it is.
 - `commit` for FASTQ writes the gzip trailer, and for BAM writes the EOF block and joins the
   workers, before committing the file.
 - The rustdoc on each `from_path_atomic` states that nothing appears at `path` until `commit()`
-  succeeds, and that dropping the writer discards the output. The compiler can't force a
+  renames the finished file into place, and that dropping the writer discards the output. It
+  points to `AtomicFile` for the one error `commit` can return after the rename. The compiler can't force a
   `commit` call, so the docs must be clear. Each existing `from_path` doc gains one line
   pointing to `from_path_atomic`.
 
@@ -199,11 +203,17 @@ impl<R: Read> BamReader<R>  { pub fn set_require_eof_block(&mut self, require: b
   block boundary), the last BGZF block read must be byte-for-byte `EOF_BLOCK`, the SAM spec's
   28-byte marker and the same check htslib makes. A stream with no blocks at all fails the rule.
 - **On failure,** the read that would have reported the end of the stream (`read` returning
-  `Ok(0)`, or `read_record` returning `Ok(None)`) returns `io::ErrorKind::InvalidData` with the
-  message "BGZF stream ended without the EOF block; the file may be truncated". The error comes
-  from `BgzfReader`, and `BamReader` passes it through unchanged.
+  `Ok(0)`, or `read_record` returning `Ok(None)`) returns an `io::ErrorKind::InvalidData` error.
+  - It carries a BAM diagnostic, built with the crate's `invalid_data`, so the facade sees
+    `error.format() == Some(Format::Bam)`.
+  - The diagnostic message is "BGZF stream ended without the EOF block; the file may be
+    truncated", and `to_string()` is "invalid BAM: " followed by that message.
+  - The error comes from `BgzfReader`, and `BamReader` passes it through unchanged.
+- **The error is reported once.** Later reads behave as at end of stream, as they already do
+  after other truncation errors, so `records()` ends and doesn't repeat the error forever.
 - Empty blocks in the middle of the stream are still skipped, so joined BGZF streams pass. Only
-  the final block counts.
+  the final block counts. As a result, joined streams cut exactly after an interior EOF marker
+  can't be detected. This is documented.
 - A cut in the middle of a block already fails in both modes, and that doesn't change.
 - The check runs at the end of the stream, so it also covers stdin and pipes. Callers only find
   out about truncation once they have read every record, as with truncated gzip today.
@@ -250,6 +260,9 @@ Written test-first.
      leaves the folder and its contents unchanged.
    - Two `AtomicFile`s for the same target have different temp paths. Committing both leaves
      the target holding exactly one of the two payloads, whichever committed last.
+   - On Unix, a folder that can't be opened for reading makes `commit` return the "into place"
+     error, with the new file in place and no temp file left. The test is skipped when running
+     as root.
    - A compile-time check that `AtomicFile` is `Send + Sync`.
 2. **Writer helpers** (each format crate):
    - For each of the five writers, `from_path_atomic` + `commit` gives byte-for-byte the same
@@ -268,9 +281,15 @@ Written test-first.
      `Ok(None)`, pinning today's behaviour. Strict mode returns every record and then
      `InvalidData` with the message above.
    - A BAM cut in the middle of a block fails in both modes.
-   - `BgzfReader`, strict: two complete BGZF streams joined together read fully; an empty input
-     fails; a stream whose last block is empty but differs from `EOF_BLOCK` in one header byte
-     fails, which pins the byte-for-byte rule.
+   - In strict mode, `records()` gives every record, then one error, then ends. A read after
+     that returns `Ok(None)`.
+   - `BgzfReader`, strict:
+     - two complete BGZF streams joined together read fully;
+     - data, then the marker, then more data with no final marker, fails;
+     - an altered empty block in the middle, followed by a proper final marker, passes;
+     - an empty input fails;
+     - a stream whose last block is empty but differs from `EOF_BLOCK` in one header byte
+       fails, which pins the byte-for-byte rule.
 4. **Regression pins:**
    - A gzip FASTQ with its last byte removed makes `FastqReader` return an error.
    - A POD5 fixture with its last byte removed makes `Pod5Reader::from_path` return an error.
@@ -297,8 +316,9 @@ Written test-first.
 - `fasta`, `fastq` and `sam` crate docs: a note that a plain file cut at a record boundary
   can't be detected when read, with a pointer to `from_path_atomic` for files you write.
 - Root `README.md` (the conversion paragraph at lines 149–150) and `brust/README.md` (line 84):
-  conversions now fsync before and after the rename, and BAM input without the EOF block is
-  rejected.
+  conversions now fsync the file before the rename, and on Unix the folder after it. A
+  folder-sync error after the rename is reported, with the new file already in place. BAM input
+  without the EOF block is rejected.
 - Rustdoc for every new public item.
 
 ## Follow-up (not in this work)
