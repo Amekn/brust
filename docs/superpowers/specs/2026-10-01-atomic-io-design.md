@@ -150,6 +150,9 @@ makes the leftover easy to spot.
   step. Don't change the current folder between `create` and `commit`.
 - The rename is atomic only within one filesystem. Putting the temp file beside the target
   guarantees that.
+- Only Unix syncs the folder after the rename. Elsewhere (for example Windows, where std's
+  rename doesn't write through), a power cut soon after `commit` can undo the rename. The
+  target then holds the old file, or is missing if it was new, but never a partial one.
 
 ### Writer helpers
 
@@ -316,9 +319,10 @@ Written test-first.
 - `fasta`, `fastq` and `sam` crate docs: a note that a plain file cut at a record boundary
   can't be detected when read, with a pointer to `from_path_atomic` for files you write.
 - Root `README.md` (the conversion paragraph at lines 149–150) and `brust/README.md` (line 84):
-  conversions now fsync the file before the rename, and on Unix the folder after it. A
-  folder-sync error after the rename is reported, with the new file already in place. BAM input
-  without the EOF block is rejected.
+  conversions now fsync the file before the rename, and on Unix the folder after it. Only Unix
+  guarantees the rename survives a power cut; other platforms never leave a partial file but
+  may lose the rename. A folder-sync error after the rename is reported, with the new file
+  already in place. BAM input without the EOF block is rejected.
 - Rustdoc for every new public item.
 
 ## Follow-up (not in this work)
