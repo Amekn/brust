@@ -112,6 +112,25 @@ for every thread count, and the same as `BamWriter::from_path` writes. Use
 `BamWriter::from_writer_with_threads` to write to any other `Write`, and call
 `finish` to write the last block and the BGZF EOF block.
 
+To publish the file atomically, use `BamWriter::from_path_atomic_with_threads`
+(or `from_path_atomic` for a single thread) and call `commit` instead of
+`finish`:
+
+```rust
+use brust_bam::BamWriter;
+
+fn main() -> std::io::Result<()> {
+    let mut writer = BamWriter::from_path_atomic_with_threads("copy.bam", 4)?;
+    // ... write the header and records to `writer` ...
+    writer.commit()
+}
+```
+
+The output is written to a hidden temporary file beside the target and renamed
+into place on `commit`, so a crash or early return never leaves a half-written
+BAM file. Dropping the writer without committing discards the output.
+`Bam::to_path_atomic` does the same for an in-memory `Bam`.
+
 ## Convert SAM to BAM
 
 ```rust

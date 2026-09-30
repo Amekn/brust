@@ -64,6 +64,24 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+To publish the file atomically, use `FastqWriter::from_path_atomic` and call
+`commit` instead of `finish`:
+
+```rust
+use brust_fastq::FastqWriter;
+
+fn main() -> std::io::Result<()> {
+    let mut writer = FastqWriter::from_path_atomic("reads.fastq.gz")?;
+    // ... write records to `writer` ...
+    writer.commit()
+}
+```
+
+`from_path_atomic` writes to a hidden temporary file beside the target and
+renames it into place on `commit`, so a crash or early return never leaves a
+half-written FASTQ file. Dropping the writer without committing discards the
+output. `Fastq::to_path_atomic` does the same for an in-memory `Fastq`.
+
 ## Convert to FASTA
 
 ```rust

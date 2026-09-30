@@ -20,7 +20,7 @@
 //! [`BamWriter::from_writer_with_threads`] compress on worker threads instead,
 //! with the same output bytes for any thread count.
 
-use brust_core::{Error, Format};
+use brust_core::{AtomicFile, Error, Format};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -1060,6 +1060,16 @@ impl Bam {
         self.write_with(writer)
     }
 
+    /// Writes this BAM payload to a filesystem path atomically.
+    ///
+    /// Nothing appears at `path` unless the whole payload is written and
+    /// committed. See [`BamWriter::from_path_atomic`].
+    pub fn to_path_atomic<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let mut writer = BamWriter::from_path_atomic(path)?;
+        writer.write_all(self)?;
+        writer.commit()
+    }
+
     /// Writes this BAM payload to a writable byte stream.
     pub fn to_writer<W: Write>(&self, writer: W) -> io::Result<()> {
         let writer = BamWriter::from_writer(writer);
@@ -1199,6 +1209,9 @@ impl<R: Read> BamReader<R> {
 
 impl BamWriter<File> {
     /// Creates or truncates a BAM file at a filesystem path.
+    ///
+    /// Use [`BamWriter::from_path_atomic`] to keep an existing file intact until
+    /// the new one is complete.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::create(path)?;
         Ok(Self::from_writer(file))
@@ -1222,6 +1235,41 @@ impl BamWriter<File> {
     pub fn from_path_with_threads<P: AsRef<Path>>(path: P, threads: usize) -> io::Result<Self> {
         let file = File::create(path)?;
         Ok(Self::from_writer_with_threads(file, threads))
+    }
+}
+
+impl BamWriter<AtomicFile> {
+    /// Creates a BAM writer that publishes its output atomically.
+    ///
+    /// Nothing appears at `path` until [`commit`](Self::commit) renames the
+    /// finished file into place; dropping the writer discards the output. See
+    /// [`AtomicFile`] for the one error `commit` can return after the rename.
+    pub fn from_path_atomic<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Ok(Self::from_writer(AtomicFile::create(path)?))
+    }
+
+    /// Like [`BamWriter::from_path_atomic`], compressing BGZF blocks on
+    /// `threads` worker threads.
+    ///
+    /// See [`BamWriter::from_path_with_threads`] for how `threads` is treated.
+    /// Dropping the writer without committing stops the workers and discards
+    /// the output.
+    pub fn from_path_atomic_with_threads<P: AsRef<Path>>(
+        path: P,
+        threads: usize,
+    ) -> io::Result<Self> {
+        Ok(Self::from_writer_with_threads(
+            AtomicFile::create(path)?,
+            threads,
+        ))
+    }
+
+    /// Finishes the stream, then flushes, syncs and renames the output into place.
+    ///
+    /// This writes the last block and the BGZF EOF block, and joins any worker
+    /// threads. See [`AtomicFile::commit`] for the exact steps and errors.
+    pub fn commit(self) -> io::Result<()> {
+        self.finish()?.commit()
     }
 }
 
