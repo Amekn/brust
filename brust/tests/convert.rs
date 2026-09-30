@@ -131,6 +131,159 @@ fn failed_conversion_preserves_existing_output_file() {
     assert_eq!(fs::read_to_string(&output).unwrap(), "existing output\n");
 }
 
+/// Writes a four-record SAM with one primary forward read, one primary reverse
+/// read and one secondary and one supplementary record.
+fn write_strand_sam(temp: &common::TempDir) -> std::path::PathBuf {
+    let input = temp.join("strands.sam");
+    fs::write(
+        &input,
+        concat!(
+            "@HD\tVN:1.6\tSO:unsorted\n",
+            "@SQ\tSN:ref\tLN:100\n",
+            "fwd\t0\tref\t1\t60\t4M\t*\t0\t0\tACGT\t!#%'\n",
+            "rev\t16\tref\t1\t60\t4M\t*\t0\t0\tAACG\t!#%'\n",
+            "sec\t256\tref\t1\t60\t4M\t*\t0\t0\t*\t*\n",
+            "sup\t2048\tref\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\n",
+        ),
+    )
+    .unwrap();
+    input
+}
+
+/// Reads a FASTQ file back as `(id, sequence, quality)` triples.
+fn fastq_triples(path: &std::path::Path) -> Vec<(String, String, String)> {
+    fastq::Fastq::from_path(path)
+        .unwrap()
+        .records
+        .into_iter()
+        .map(|record| (record.id, record.sequence, record.quality))
+        .collect()
+}
+
+fn triple(id: &str, sequence: &str, quality: &str) -> (String, String, String) {
+    (id.to_string(), sequence.to_string(), quality.to_string())
+}
+
+#[test]
+fn sam_to_fastq_writes_primary_reads_in_original_orientation() {
+    let temp = common::TempDir::new("sam-to-fastq-strands");
+    let input = write_strand_sam(&temp);
+    let output = temp.join("reads.fastq");
+
+    convert::sam_to_fastq(&input, &output).unwrap();
+
+    // The reverse read is restored; the secondary and supplementary are skipped.
+    assert_eq!(
+        fastq_triples(&output),
+        [triple("fwd", "ACGT", "!#%'"), triple("rev", "CGTT", "'%#!")]
+    );
+}
+
+#[test]
+fn bam_to_fastq_writes_primary_reads_in_original_orientation() {
+    let temp = common::TempDir::new("bam-to-fastq-strands");
+    let input = write_strand_sam(&temp);
+    let bam_output = temp.join("strands.bam");
+    let output = temp.join("reads.fastq");
+
+    convert::sam_to_bam(&input, &bam_output).unwrap();
+    convert::bam_to_fastq(&bam_output, &output).unwrap();
+
+    assert_eq!(
+        fastq_triples(&output),
+        [triple("fwd", "ACGT", "!#%'"), triple("rev", "CGTT", "'%#!")]
+    );
+}
+
+#[test]
+fn fixture_reverse_strand_reads_come_out_reverse_complemented() {
+    let temp = common::TempDir::new("fixture-reverse-strand");
+    let output = temp.join("reads.fastq");
+
+    // Independent of brust::seq: the fixture holds only A, C, G, T and N.
+    fn reverse_complement(sequence: &str) -> String {
+        sequence
+            .chars()
+            .rev()
+            .map(|base| match base {
+                'A' => 'T',
+                'C' => 'G',
+                'G' => 'C',
+                'T' => 'A',
+                'N' => 'N',
+                other => panic!("unexpected base {other:?} in fixture"),
+            })
+            .collect()
+    }
+
+    let sam = sam::Sam::from_path(common::fixture("sam/aligned.sam")).unwrap();
+    convert::sam_to_fastq(common::fixture("sam/aligned.sam"), &output).unwrap();
+    let fastq = fastq::Fastq::from_path(&output).unwrap();
+
+    assert_eq!(fastq.records.len(), 100);
+    let mut reverse = 0;
+    for (record, read) in sam.records.iter().zip(&fastq.records) {
+        assert_eq!(read.id, record.qname);
+        if record.flag == 16 {
+            reverse += 1;
+            assert_eq!(read.sequence, reverse_complement(&record.seq));
+            assert_eq!(read.quality, record.qual.chars().rev().collect::<String>());
+        } else {
+            assert_eq!(record.flag, 0);
+            assert_eq!(read.sequence, record.seq);
+            assert_eq!(read.quality, record.qual);
+        }
+    }
+    assert_eq!(reverse, 32);
+}
+
+#[test]
+fn soft_masked_iupac_reverse_read_keeps_case() {
+    let temp = common::TempDir::new("reverse-soft-masked");
+    let input = temp.join("masked.sam");
+    let output = temp.join("reads.fastq");
+    fs::write(
+        &input,
+        concat!(
+            "@SQ\tSN:ref\tLN:100\n",
+            "masked\t16\tref\t1\t60\t5M\t*\t0\t0\tacgRN\t!!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    convert::sam_to_fastq(&input, &output).unwrap();
+
+    assert_eq!(fastq_triples(&output), [triple("masked", "NYcgt", "!!!!!")]);
+}
+
+#[test]
+fn bam_to_fastq_rejects_primary_reverse_read_without_qualities() {
+    let temp = common::TempDir::new("bam-reverse-without-qual");
+    let input = temp.join("no-qual.sam");
+    let bam_output = temp.join("no-qual.bam");
+    let output = temp.join("reads.fastq");
+    fs::write(
+        &input,
+        concat!(
+            "@SQ\tSN:ref\tLN:100\n",
+            "noqual\t16\tref\t1\t60\t4M\t*\t0\t0\tACGT\t*\n",
+        ),
+    )
+    .unwrap();
+
+    convert::sam_to_bam(&input, &bam_output).unwrap();
+    let error = convert::bam_to_fastq(&bam_output, &output).unwrap_err();
+
+    assert_eq!(error.format(), Some(Format::Bam));
+    assert!(
+        error
+            .to_string()
+            .contains("cannot convert record without QUAL to FASTQ"),
+        "{error}"
+    );
+    assert!(!output.exists());
+}
+
 #[test]
 fn convert_options_default_to_one_thread() {
     assert_eq!(ConvertOptions::default().threads, 1);

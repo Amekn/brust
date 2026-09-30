@@ -31,8 +31,16 @@ pub enum Conversion {
     /// Convert BAM records to SAM.
     BamToSam,
     /// Convert SAM records with stored sequence and qualities to FASTQ.
+    ///
+    /// Reverse-strand reads are written in their original orientation,
+    /// secondary and supplementary records are skipped, and read names are
+    /// unchanged. See [`sam_to_fastq`].
     SamToFastq,
     /// Convert BAM records with stored sequence and qualities to FASTQ.
+    ///
+    /// Reverse-strand reads are written in their original orientation,
+    /// secondary and supplementary records are skipped, and read names are
+    /// unchanged. See [`bam_to_fastq`].
     BamToFastq,
 }
 
@@ -248,6 +256,12 @@ pub fn bam_to_sam<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result
 
 /// Converts SAM records with stored sequence and qualities to FASTQ.
 ///
+/// Reverse-strand reads (flag `0x10`) are written in their original
+/// orientation: SEQ is reverse-complemented and QUAL reversed, keeping case.
+/// Secondary (`0x100`) and supplementary (`0x800`) records are skipped, even
+/// when their SEQ or QUAL is `*`. Read names are unchanged, with no `/1` or
+/// `/2` suffix. Any other record without SEQ or QUAL is an error.
+///
 /// A `.fq.gz` or `.fastq.gz` output path is compressed while records stream.
 pub fn sam_to_fastq<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result<()> {
     let input = input.as_ref();
@@ -255,7 +269,9 @@ pub fn sam_to_fastq<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Resu
         let mut reader = sam::SamReader::from_path(input)?;
         let mut writer = fastq::FastqWriter::from_path(temp_output)?;
         while let Some(record) = reader.read_record()? {
-            writer.write_record(&sam_record_to_fastq(&record, Format::Sam)?)?;
+            if let Some(read) = sam_record_to_fastq(&record, Format::Sam)? {
+                writer.write_record(&read)?;
+            }
         }
         writer.finish()?;
         Ok(())
@@ -263,6 +279,12 @@ pub fn sam_to_fastq<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Resu
 }
 
 /// Converts BAM records with stored sequence and qualities to FASTQ.
+///
+/// Reverse-strand reads (flag `0x10`) are written in their original
+/// orientation: SEQ is reverse-complemented and QUAL reversed, keeping case.
+/// Secondary (`0x100`) and supplementary (`0x800`) records are skipped, even
+/// when their SEQ or QUAL is `*`. Read names are unchanged, with no `/1` or
+/// `/2` suffix. Any other record without SEQ or QUAL is an error.
 ///
 /// A `.fq.gz` or `.fastq.gz` output path is compressed while records stream.
 pub fn bam_to_fastq<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result<()> {
@@ -273,7 +295,9 @@ pub fn bam_to_fastq<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Resu
         let mut writer = fastq::FastqWriter::from_path(temp_output)?;
         while let Some(record) = reader.read_record()? {
             let record = record.to_sam_record(&refs)?;
-            writer.write_record(&sam_record_to_fastq(&record, Format::Bam)?)?;
+            if let Some(read) = sam_record_to_fastq(&record, Format::Bam)? {
+                writer.write_record(&read)?;
+            }
         }
         writer.finish()?;
         Ok(())
@@ -297,10 +321,15 @@ fn fastq_record_to_unmapped_sam(record: &fastq::FastqRecord) -> sam::SamRecord {
     )
 }
 
+/// Builds the FASTQ read for a SAM record, or `None` for a secondary or
+/// supplementary record, which repeats a read already written.
 fn sam_record_to_fastq(
     record: &sam::SamRecord,
     error_format: Format,
-) -> Result<fastq::FastqRecord> {
+) -> Result<Option<fastq::FastqRecord>> {
+    if record.flag & 0x900 != 0 {
+        return Ok(None);
+    }
     if record.seq == "*" {
         return Err(Error::invalid(
             error_format,
@@ -314,12 +343,12 @@ fn sam_record_to_fastq(
         ));
     }
 
-    Ok(fastq::FastqRecord::new(
+    Ok(Some(fastq::FastqRecord::new(
         record.qname.clone(),
         None,
-        record.seq.clone(),
-        record.qual.clone(),
-    ))
+        record.original_seq(),
+        record.original_qual(),
+    )))
 }
 
 fn write_atomic(output: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
