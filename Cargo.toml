@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["bam", "brust", "brust-core", "fasta", "fastq", "pod5", "sam"]
+members = ["bam", "brust", "brust-core", "fasta", "fastq", "pod5", "sam", "seq"]
 
 [workspace.package]
 version = "0.2.0"

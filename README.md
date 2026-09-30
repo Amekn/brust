@@ -15,12 +15,13 @@ format-specific crates:
 | `brust-sam` | `brust_sam` | SAM reader, writer, flags, CIGAR, and optional fields |
 | `brust-bam` | `brust_bam` | BAM/BGZF reader, writer, virtual offsets, and SAM conversion |
 | `brust-pod5` | `brust_pod5` | POD5 metadata, reads, signal rows, and VBZ helpers |
+| `brust-seq` | `brust_seq` | IUPAC reverse complement and matching, and codon translation |
 
 Most applications should depend on `brust`, which re-exports the format crates
 under one namespace:
 
 ```rust
-use brust::{bam, fasta, fastq, pod5, sam};
+use brust::{bam, fasta, fastq, pod5, sam, seq};
 ```
 
 ## Installation

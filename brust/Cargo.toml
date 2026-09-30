@@ -18,4 +18,5 @@ sam = { package = "brust-sam", path = "../sam", version = "0.2.0" }
 bam = { package = "brust-bam", path = "../bam", version = "0.2.0" }
 fastq = { package = "brust-fastq", path = "../fastq", version = "0.2.0" }
 pod5 = { package = "brust-pod5", path = "../pod5", version = "0.2.0" }
+seq = { package = "brust-seq", path = "../seq", version = "0.2.0" }
 clap = { version = "4.6.1", features = ["derive"] }
