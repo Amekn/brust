@@ -427,3 +427,31 @@ fn failed_threaded_conversion_preserves_existing_output() {
     names.sort();
     assert_eq!(names, ["bad-final-line.sam", "reads.bam"]);
 }
+
+fn names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn bam_conversions_reject_missing_eof_block() {
+    let temp = common::TempDir::new("bam-missing-eof");
+    let mut bytes = fs::read(common::fixture("bam/aligned.bam")).unwrap();
+    bytes.truncate(bytes.len() - 28);
+    let input = temp.join("no_eof.bam");
+    fs::write(&input, bytes).unwrap();
+
+    let error = convert::bam_to_sam(&input, temp.join("out.sam")).unwrap_err();
+    assert!(error.to_string().contains("EOF block"), "{error}");
+    assert_eq!(error.format(), Some(Format::Bam));
+
+    let error = convert::bam_to_fastq(&input, temp.join("out.fastq")).unwrap_err();
+    assert!(error.to_string().contains("EOF block"), "{error}");
+    assert_eq!(error.format(), Some(Format::Bam));
+
+    assert_eq!(names(&temp.join(".")), ["no_eof.bam"]);
+}

@@ -186,3 +186,17 @@ fn empty_fastq_has_empty_qscore_summary() {
     assert_eq!(qscore.max, None);
     assert_eq!(qscore.mean, None);
 }
+
+#[test]
+fn validate_and_stats_reject_missing_eof_block() {
+    let temp = common::TempDir::new("stats-validate-missing-eof");
+    let mut bytes = fs::read(common::fixture("bam/aligned.bam")).unwrap();
+    bytes.truncate(bytes.len() - 28);
+    let input = temp.join("no_eof.bam");
+    fs::write(&input, bytes).unwrap();
+
+    let error = validate::validate_bam(&input).unwrap_err();
+    assert!(error.to_string().contains("EOF block"), "{error}");
+    let error = stats::bam_stats(&input).unwrap_err();
+    assert!(error.to_string().contains("EOF block"), "{error}");
+}

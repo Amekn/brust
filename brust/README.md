@@ -53,6 +53,9 @@ brust validate bam aligned.bam
 brust validate pod5 reads.pod5
 ```
 
+BAM `validate` and `stats` (and the library's `validate_bam` and `bam_stats`) reject a BAM
+that doesn't end with the BGZF EOF block, as possibly truncated.
+
 Print human-readable statistics:
 
 ```bash
@@ -81,10 +84,17 @@ unchanged. Unmapped, QC-fail and duplicate records are still written. Output
 differs from 0.1.x for inputs with reverse-strand, secondary or supplementary
 records.
 
-Conversions stream records and write through a temporary output path before
-renaming, so an existing output file is not replaced by a partial file when
-parsing or writing fails. Temporary output names preserve the destination
-suffix, ensuring requested gzip FASTQ output is compressed before the rename.
+Conversions stream records into a temporary file beside the target path. On success the file
+is synced to disk and renamed over the target, so readers and crashes never see a partial
+output: the target holds either the old file or the complete new one. On Unix the folder is
+also synced before the conversion reports success, so the rename survives a power cut. Other
+platforms skip that step, so after a power cut the target may still hold the old file, or be
+missing if it was new, but never a partial one. If a conversion fails before the rename, the
+temporary file is deleted and an existing output is left untouched. A folder-sync error after
+the rename is reported, but the new file is already in place. BAM input must end with the BGZF
+EOF block; a BAM without it is rejected as possibly truncated.
+
+A `.gz` FASTQ target is written as gzip.
 
 ## Public API
 
@@ -174,7 +184,7 @@ paths use underscores:
 
 ```toml
 [dependencies]
-brust-fasta = "0.2.0"
+brust-fasta = "0.3.0"
 ```
 
 ```rust

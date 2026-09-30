@@ -12,6 +12,6 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-brust-core = { path = "../brust-core", version = "0.2.0" }
-fasta = { package = "brust-fasta", path = "../fasta", version = "0.2.0" }
+brust-core = { path = "../brust-core", version = "0.3.0" }
+fasta = { package = "brust-fasta", path = "../fasta", version = "0.3.0" }
 flate2 = "1.1.9"

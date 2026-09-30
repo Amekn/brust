@@ -30,7 +30,7 @@ use arrow_ipc::reader::FileReader;
 use arrow_ipc::writer::FileWriter;
 use arrow_ipc::{MessageHeader, root_as_footer, root_as_message};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use brust_core::{Error, Format};
+use brust_core::{AtomicFile, Error, Format};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -378,6 +378,16 @@ impl Pod5 {
         writer.flush()
     }
 
+    /// Writes this POD5 payload to a filesystem path atomically.
+    ///
+    /// Nothing appears at `path` unless the whole payload is written and
+    /// committed. See [`Pod5Writer::from_path_atomic`].
+    pub fn to_path_atomic<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let mut writer = Pod5Writer::from_path_atomic(path)?;
+        writer.write_all(self)?;
+        writer.commit()
+    }
+
     /// Writes this POD5 payload to a writable byte stream.
     pub fn to_writer<W: Write>(&self, writer: W) -> io::Result<()> {
         let mut writer = Pod5Writer::from_writer(writer);
@@ -651,6 +661,9 @@ impl<R: Read + Seek> Pod5Reader<R> {
 
 impl Pod5Writer<File> {
     /// Creates or truncates a POD5 file at a filesystem path.
+    ///
+    /// Use [`Pod5Writer::from_path_atomic`] to keep an existing file intact until
+    /// the new one is complete.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::create(path)?;
         Ok(Self::from_writer(file))
@@ -661,6 +674,24 @@ impl Pod5Writer<File> {
     /// This is a convenience alias for [`Pod5Writer::from_path`].
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         Self::from_path(path)
+    }
+}
+
+impl Pod5Writer<AtomicFile> {
+    /// Creates a POD5 writer that publishes its output atomically.
+    ///
+    /// Nothing appears at `path` until [`commit`](Self::commit) renames the
+    /// finished file into place; dropping the writer discards the output. See
+    /// [`AtomicFile`] for the one error `commit` can return after the rename.
+    pub fn from_path_atomic<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Ok(Self::from_writer(AtomicFile::create(path)?))
+    }
+
+    /// Flushes, syncs and renames the output into place.
+    ///
+    /// See [`AtomicFile::commit`] for the exact steps and errors.
+    pub fn commit(self) -> io::Result<()> {
+        self.into_inner().commit()
     }
 }
 

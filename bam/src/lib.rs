@@ -20,7 +20,7 @@
 //! [`BamWriter::from_writer_with_threads`] compress on worker threads instead,
 //! with the same output bytes for any thread count.
 
-use brust_core::{Error, Format};
+use brust_core::{AtomicFile, Error, Format};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -1060,6 +1060,16 @@ impl Bam {
         self.write_with(writer)
     }
 
+    /// Writes this BAM payload to a filesystem path atomically.
+    ///
+    /// Nothing appears at `path` unless the whole payload is written and
+    /// committed. See [`BamWriter::from_path_atomic`].
+    pub fn to_path_atomic<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let mut writer = BamWriter::from_path_atomic(path)?;
+        writer.write_all(self)?;
+        writer.commit()
+    }
+
     /// Writes this BAM payload to a writable byte stream.
     pub fn to_writer<W: Write>(&self, writer: W) -> io::Result<()> {
         let writer = BamWriter::from_writer(writer);
@@ -1136,6 +1146,30 @@ impl<R: Read> BamReader<R> {
         })
     }
 
+    /// Sets whether the BAM stream must end with the standard BGZF EOF block.
+    ///
+    /// The default is `false`: a stream that ends without the marker is read
+    /// as complete, as before. When `true`, reaching the end of the stream is
+    /// an [`io::ErrorKind::InvalidData`] error unless the last BGZF block is
+    /// byte-for-byte the 28-byte EOF block. A final empty block that differs
+    /// in any byte fails too.
+    ///
+    /// The check happens at the end of the stream and is reported once, by
+    /// [`BamReader::read_record`], [`BamReader::records`] or
+    /// [`BamReader::read_all`]. After it the reader behaves as at end of
+    /// stream. Set this before the reader reaches the end, because a lenient
+    /// end is cached and is not re-checked. Empty blocks in the middle of the
+    /// stream are still skipped.
+    ///
+    /// A block that fails to read, such as one cut short, is reported by its
+    /// own error, not also as a missing EOF block.
+    ///
+    /// A joined stream cut exactly after an interior EOF marker ends with a
+    /// valid marker, so this check cannot detect that truncation.
+    pub fn set_require_eof_block(&mut self, require: bool) {
+        self.reader.set_require_eof_block(require);
+    }
+
     /// Returns the current BGZF virtual offset.
     pub fn virtual_offset(&self) -> BgzfVirtualOffset {
         self.reader.virtual_offset()
@@ -1199,6 +1233,9 @@ impl<R: Read> BamReader<R> {
 
 impl BamWriter<File> {
     /// Creates or truncates a BAM file at a filesystem path.
+    ///
+    /// Use [`BamWriter::from_path_atomic`] to keep an existing file intact until
+    /// the new one is complete.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::create(path)?;
         Ok(Self::from_writer(file))
@@ -1222,6 +1259,41 @@ impl BamWriter<File> {
     pub fn from_path_with_threads<P: AsRef<Path>>(path: P, threads: usize) -> io::Result<Self> {
         let file = File::create(path)?;
         Ok(Self::from_writer_with_threads(file, threads))
+    }
+}
+
+impl BamWriter<AtomicFile> {
+    /// Creates a BAM writer that publishes its output atomically.
+    ///
+    /// Nothing appears at `path` until [`commit`](Self::commit) renames the
+    /// finished file into place; dropping the writer discards the output. See
+    /// [`AtomicFile`] for the one error `commit` can return after the rename.
+    pub fn from_path_atomic<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Ok(Self::from_writer(AtomicFile::create(path)?))
+    }
+
+    /// Like [`BamWriter::from_path_atomic`], compressing BGZF blocks on
+    /// `threads` worker threads.
+    ///
+    /// See [`BamWriter::from_path_with_threads`] for how `threads` is treated.
+    /// Dropping the writer without committing stops the workers and discards
+    /// the output.
+    pub fn from_path_atomic_with_threads<P: AsRef<Path>>(
+        path: P,
+        threads: usize,
+    ) -> io::Result<Self> {
+        Ok(Self::from_writer_with_threads(
+            AtomicFile::create(path)?,
+            threads,
+        ))
+    }
+
+    /// Finishes the stream, then flushes, syncs and renames the output into place.
+    ///
+    /// This writes the last block and the BGZF EOF block, and joins any worker
+    /// threads. See [`AtomicFile::commit`] for the exact steps and errors.
+    pub fn commit(self) -> io::Result<()> {
+        self.finish()?.commit()
     }
 }
 

@@ -2,20 +2,15 @@
 //!
 //! All public conversions stream records through the relevant readers and
 //! writers, avoiding whole-file materialization in the facade layer. Outputs are
-//! written through a temporary file that is renamed only after successful
-//! completion, protecting existing output files from being replaced by a partial
-//! conversion when parsing or writing fails. Temporary names preserve the final
-//! suffix so `.fq.gz` and `.fastq.gz` outputs select streaming gzip compression.
+//! written to a temporary file beside the target. On success the file is synced
+//! to disk and renamed over the target, so an existing output file is never
+//! replaced by a partial conversion when parsing or writing fails. A `.fq.gz` or
+//! `.fastq.gz` target selects streaming gzip compression. BAM input must end
+//! with the BGZF EOF block; a BAM without it is rejected as possibly truncated.
 
-use crate::{Error, Format, Result};
-use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use crate::{AtomicFile, Error, Format, Result};
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+use std::path::Path;
 
 /// Supported file conversion paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -133,8 +128,9 @@ pub fn convert<I: AsRef<Path>, O: AsRef<Path>>(
 /// `options.threads` affects only conversions that write BAM
 /// ([`Conversion::FastqToBam`] and [`Conversion::SamToBam`]); the other
 /// conversions ignore it. The output is byte-identical for any thread count.
-/// As with [`convert`], the output is written to a temporary file and renamed on
-/// success, so a failed conversion leaves an existing output file untouched.
+/// As with [`convert`], the output is written to a temporary file, synced to
+/// disk and renamed on success, so a failed conversion leaves an existing
+/// output file untouched. BAM input must end with the BGZF EOF block.
 pub fn convert_with<I: AsRef<Path>, O: AsRef<Path>>(
     conversion: Conversion,
     input: I,
@@ -155,29 +151,25 @@ pub fn convert_with<I: AsRef<Path>, O: AsRef<Path>>(
 /// Converts FASTQ records to FASTA records, dropping quality scores.
 pub fn fastq_to_fasta<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result<()> {
     let input = input.as_ref();
-    write_atomic(output.as_ref(), |temp_output| {
-        let mut reader = fastq::FastqReader::from_path(input)?;
-        let mut writer = fasta::FastaWriter::from_path(temp_output)?;
-        while let Some(record) = reader.read_record()? {
-            writer.write_record(&record.to_fasta_record())?;
-        }
-        writer.flush()?;
-        Ok(())
-    })
+    let mut reader = fastq::FastqReader::from_path(input)?;
+    let mut writer = fasta::FastaWriter::from_path_atomic(output.as_ref())?;
+    while let Some(record) = reader.read_record()? {
+        writer.write_record(&record.to_fasta_record())?;
+    }
+    writer.commit()?;
+    Ok(())
 }
 
 /// Converts FASTQ reads to unmapped SAM records.
 pub fn fastq_to_sam<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result<()> {
     let input = input.as_ref();
-    write_atomic(output.as_ref(), |temp_output| {
-        let mut reader = fastq::FastqReader::from_path(input)?;
-        let mut writer = sam::SamWriter::from_path(temp_output)?;
-        while let Some(record) = reader.read_record()? {
-            writer.write_record(&fastq_record_to_unmapped_sam(&record))?;
-        }
-        writer.flush()?;
-        Ok(())
-    })
+    let mut reader = fastq::FastqReader::from_path(input)?;
+    let mut writer = sam::SamWriter::from_path_atomic(output.as_ref())?;
+    while let Some(record) = reader.read_record()? {
+        writer.write_record(&fastq_record_to_unmapped_sam(&record))?;
+    }
+    writer.commit()?;
+    Ok(())
 }
 
 /// Converts FASTQ reads to unmapped BAM records.
@@ -191,21 +183,19 @@ fn fastq_to_bam_with<I: AsRef<Path>, O: AsRef<Path>>(
     threads: usize,
 ) -> Result<()> {
     let input = input.as_ref();
-    write_atomic(output.as_ref(), |temp_output| {
-        let header = sam::SamHeader::default();
-        let converter = bam::SamToBamConverter::new(&header)?;
-        let mut reader = fastq::FastqReader::from_path(input)?;
-        let mut writer = bam::BamWriter::from_path_with_threads(temp_output, threads)?;
+    let header = sam::SamHeader::default();
+    let converter = bam::SamToBamConverter::new(&header)?;
+    let mut reader = fastq::FastqReader::from_path(input)?;
+    let mut writer = bam::BamWriter::from_path_atomic_with_threads(output.as_ref(), threads)?;
 
-        writer.write_header(converter.header(), converter.refs())?;
-        while let Some(record) = reader.read_record()? {
-            let record = fastq_record_to_unmapped_sam(&record);
-            let record = converter.convert_record(&record)?;
-            writer.write_record(&record)?;
-        }
-        writer.finish()?;
-        Ok(())
-    })
+    writer.write_header(converter.header(), converter.refs())?;
+    while let Some(record) = reader.read_record()? {
+        let record = fastq_record_to_unmapped_sam(&record);
+        let record = converter.convert_record(&record)?;
+        writer.write_record(&record)?;
+    }
+    writer.commit()?;
+    Ok(())
 }
 
 /// Converts a supported SAM payload to BAM.
@@ -219,41 +209,40 @@ fn sam_to_bam_with<I: AsRef<Path>, O: AsRef<Path>>(
     threads: usize,
 ) -> Result<()> {
     let input = input.as_ref();
-    write_atomic(output.as_ref(), |temp_output| {
-        let mut reader = sam::SamReader::from_path(input)?;
-        let converter = bam::SamToBamConverter::new(&reader.header)?;
-        let mut writer = bam::BamWriter::from_path_with_threads(temp_output, threads)?;
+    let mut reader = sam::SamReader::from_path(input)?;
+    let converter = bam::SamToBamConverter::new(&reader.header)?;
+    let mut writer = bam::BamWriter::from_path_atomic_with_threads(output.as_ref(), threads)?;
 
-        writer.write_header(converter.header(), converter.refs())?;
-        while let Some(record) = reader.read_record()? {
-            let record = converter.convert_record(&record)?;
-            writer.write_record(&record)?;
-        }
-        writer.finish()?;
-        Ok(())
-    })
+    writer.write_header(converter.header(), converter.refs())?;
+    while let Some(record) = reader.read_record()? {
+        let record = converter.convert_record(&record)?;
+        writer.write_record(&record)?;
+    }
+    writer.commit()?;
+    Ok(())
 }
 
 /// Converts BAM to SAM.
+///
+/// The input must end with the BGZF EOF block.
 pub fn bam_to_sam<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result<()> {
     let input = input.as_ref();
-    write_atomic(output.as_ref(), |temp_output| {
-        let mut reader = bam::BamReader::from_path(input)?;
-        let mut file = File::create(temp_output)?;
-        if !reader.header.text.is_empty() {
-            file.write_all(reader.header.text.as_bytes())?;
-            if !reader.header.text.ends_with('\n') {
-                file.write_all(b"\n")?;
-            }
+    let mut reader = bam::BamReader::from_path(input)?;
+    reader.set_require_eof_block(true);
+    let mut file = AtomicFile::create(output.as_ref())?;
+    if !reader.header.text.is_empty() {
+        file.write_all(reader.header.text.as_bytes())?;
+        if !reader.header.text.ends_with('\n') {
+            file.write_all(b"\n")?;
         }
-        let refs = reader.refs.clone();
-        let mut writer = sam::SamWriter::from_writer(file);
-        while let Some(record) = reader.read_record()? {
-            writer.write_record(&record.to_sam_record(&refs)?)?;
-        }
-        writer.flush()?;
-        Ok(())
-    })
+    }
+    let refs = reader.refs.clone();
+    let mut writer = sam::SamWriter::from_writer(file);
+    while let Some(record) = reader.read_record()? {
+        writer.write_record(&record.to_sam_record(&refs)?)?;
+    }
+    writer.into_inner().commit()?;
+    Ok(())
 }
 
 /// Converts SAM records with stored sequence and qualities to FASTQ.
@@ -269,17 +258,15 @@ pub fn bam_to_sam<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result
 /// A `.fq.gz` or `.fastq.gz` output path is compressed while records stream.
 pub fn sam_to_fastq<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result<()> {
     let input = input.as_ref();
-    write_atomic(output.as_ref(), |temp_output| {
-        let mut reader = sam::SamReader::from_path(input)?;
-        let mut writer = fastq::FastqWriter::from_path(temp_output)?;
-        while let Some(record) = reader.read_record()? {
-            if let Some(read) = sam_record_to_fastq(&record, Format::Sam)? {
-                writer.write_record(&read)?;
-            }
+    let mut reader = sam::SamReader::from_path(input)?;
+    let mut writer = fastq::FastqWriter::from_path_atomic(output.as_ref())?;
+    while let Some(record) = reader.read_record()? {
+        if let Some(read) = sam_record_to_fastq(&record, Format::Sam)? {
+            writer.write_record(&read)?;
         }
-        writer.finish()?;
-        Ok(())
-    })
+    }
+    writer.commit()?;
+    Ok(())
 }
 
 /// Converts BAM records with stored sequence and qualities to FASTQ.
@@ -295,19 +282,18 @@ pub fn sam_to_fastq<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Resu
 /// A `.fq.gz` or `.fastq.gz` output path is compressed while records stream.
 pub fn bam_to_fastq<I: AsRef<Path>, O: AsRef<Path>>(input: I, output: O) -> Result<()> {
     let input = input.as_ref();
-    write_atomic(output.as_ref(), |temp_output| {
-        let mut reader = bam::BamReader::from_path(input)?;
-        let refs = reader.refs.clone();
-        let mut writer = fastq::FastqWriter::from_path(temp_output)?;
-        while let Some(record) = reader.read_record()? {
-            let record = record.to_sam_record(&refs)?;
-            if let Some(read) = sam_record_to_fastq(&record, Format::Bam)? {
-                writer.write_record(&read)?;
-            }
+    let mut reader = bam::BamReader::from_path(input)?;
+    reader.set_require_eof_block(true);
+    let refs = reader.refs.clone();
+    let mut writer = fastq::FastqWriter::from_path_atomic(output.as_ref())?;
+    while let Some(record) = reader.read_record()? {
+        let record = record.to_sam_record(&refs)?;
+        if let Some(read) = sam_record_to_fastq(&record, Format::Bam)? {
+            writer.write_record(&read)?;
         }
-        writer.finish()?;
-        Ok(())
-    })
+    }
+    writer.commit()?;
+    Ok(())
 }
 
 fn fastq_record_to_unmapped_sam(record: &fastq::FastqRecord) -> sam::SamRecord {
@@ -355,61 +341,6 @@ fn sam_record_to_fastq(
         None,
         record.original_seq(),
         record.original_qual(),
-    )))
-}
-
-fn write_atomic(output: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
-    let temp_output = create_temp_output_path(output)?;
-
-    match write(&temp_output) {
-        Ok(()) => {
-            if let Err(error) = fs::rename(&temp_output, output) {
-                let _ = fs::remove_file(&temp_output);
-                return Err(error.into());
-            }
-            Ok(())
-        }
-        Err(error) => {
-            let _ = fs::remove_file(&temp_output);
-            Err(error)
-        }
-    }
-}
-
-fn create_temp_output_path(output: &Path) -> Result<PathBuf> {
-    let parent = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file_name = output.file_name().ok_or_else(|| {
-        Error::Io(format!(
-            "output path {} must include a file name",
-            output.display()
-        ))
-    })?;
-
-    for _ in 0..100 {
-        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        // Keep the complete destination name at the end so suffix-driven
-        // writers see `.gz`, `.bam`, and other format indicators unchanged.
-        let mut temp_name = OsString::from(format!(".{}.{}.tmp.", process::id(), counter));
-        temp_name.push(file_name);
-        let temp_path = parent.join(temp_name);
-
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-        {
-            Ok(_) => return Ok(temp_path),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-
-    Err(Error::Io(format!(
-        "could not create temporary output beside {}",
-        output.display()
     )))
 }
 
@@ -489,17 +420,6 @@ mod tests {
         let fastq = fastq::Fastq::from_path(output).unwrap();
         assert_eq!(fastq.records.len(), 1);
         assert_eq!(fastq.records[0].sequence, "ACGT");
-    }
-
-    #[test]
-    fn temporary_output_keeps_destination_suffix() {
-        // Compression selection relies on the final extension of the temporary path.
-        let dir = TestDir::new();
-        let output = dir.path("reads.fastq.gz");
-        let temporary = create_temp_output_path(&output).unwrap();
-
-        assert!(temporary.to_string_lossy().ends_with("reads.fastq.gz"));
-        fs::remove_file(temporary).unwrap();
     }
 
     #[test]

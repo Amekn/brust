@@ -172,7 +172,7 @@ checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "brust"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "brust-bam",
  "brust-core",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "brust-bam"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "brust-core",
  "brust-sam",
@@ -196,18 +196,18 @@ dependencies = [
 
 [[package]]
 name = "brust-core"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "brust-fasta"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "brust-core",
 ]
 
 [[package]]
 name = "brust-fastq"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "brust-core",
  "brust-fasta",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "brust-pod5"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "brust-sam"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "brust-core",
  "brust-seq",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "brust-seq"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "bumpalo"

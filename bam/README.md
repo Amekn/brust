@@ -84,6 +84,26 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
+## Strict End-of-File Check
+
+A complete BAM ends with the 28-byte BGZF EOF block. Readers don't require it by
+default. To treat a missing marker as truncation, opt in before reading:
+
+```rust
+use brust_bam::BamReader;
+
+fn main() -> std::io::Result<()> {
+    let mut reader = BamReader::from_path("aligned.bam")?;
+    reader.set_require_eof_block(true);
+    let _bam = reader.read_all()?; // Err(InvalidData) if the EOF block is missing
+    Ok(())
+}
+```
+
+The last block must match the marker byte for byte. The error is reported once,
+then the reader behaves as at end of stream. `BgzfReader` has the same setter.
+Joined streams cut exactly after an interior EOF marker can't be detected.
+
 ## Parallel Compression
 
 Build the writer with `BamWriter::from_path_with_threads` to compress BGZF blocks
@@ -111,6 +131,25 @@ capped at `brust_bam::bgzf::MAX_THREADS`. The file is byte-for-byte the same
 for every thread count, and the same as `BamWriter::from_path` writes. Use
 `BamWriter::from_writer_with_threads` to write to any other `Write`, and call
 `finish` to write the last block and the BGZF EOF block.
+
+To publish the file atomically, use `BamWriter::from_path_atomic_with_threads`
+(or `from_path_atomic` for a single thread) and call `commit` instead of
+`finish`:
+
+```rust
+use brust_bam::BamWriter;
+
+fn main() -> std::io::Result<()> {
+    let mut writer = BamWriter::from_path_atomic_with_threads("copy.bam", 4)?;
+    // ... write the header and records to `writer` ...
+    writer.commit()
+}
+```
+
+The output is written to a hidden temporary file beside the target and renamed
+into place on `commit`, so a crash or early return never leaves a half-written
+BAM file. Dropping the writer without committing discards the output.
+`Bam::to_path_atomic` does the same for an in-memory `Bam`.
 
 ## Convert SAM to BAM
 

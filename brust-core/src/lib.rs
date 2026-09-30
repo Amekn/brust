@@ -1,13 +1,17 @@
-//! Shared error and result types for Brust crates.
+//! Shared error, result and atomic file output types for Brust crates.
 //!
 //! The format crates keep their existing `std::io::Result` APIs for now, but
 //! parse and validation failures can carry this domain error as the inner error
 //! of an `io::Error`. The public `brust` facade re-exports these types as
 //! `brust::Error`, `brust::Diagnostic`, and `brust::Format`.
 
+mod atomic_file;
+
 use std::fmt;
 use std::io;
 use std::path::Path;
+
+pub use atomic_file::AtomicFile;
 
 /// Compression applied around a biological format stream.
 ///

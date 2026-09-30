@@ -14,8 +14,12 @@
 //! quality lines are concatenated until their length exactly matches the
 //! sequence length. The writer emits a canonical four-line record with a bare
 //! `+` separator and validates that sequence and quality lengths match.
+//!
+//! A plain-text file cut at a record boundary looks complete, so a truncated
+//! file like that can't be detected when read. For files you write, use
+//! [`FastqWriter::from_path_atomic`] so a failed run never leaves a partial file.
 
-use brust_core::{Compression, Error, Format};
+use brust_core::{AtomicFile, Compression, Error, Format};
 use fasta::{Fasta, FastaRecord};
 use flate2::Compression as GzipLevel;
 use flate2::read::MultiGzDecoder;
@@ -318,6 +322,9 @@ impl FastqWriter<File> {
     ///
     /// A final `.gz` suffix selects streaming gzip compression. Other paths,
     /// including `.fq` and `.fastq`, remain plain text.
+    ///
+    /// Use [`FastqWriter::from_path_atomic`] to keep an existing file intact until
+    /// the new one is complete.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let compression = Compression::from_path(path.as_ref());
         Self::from_path_with_compression(path, compression)
@@ -340,6 +347,32 @@ impl FastqWriter<File> {
     /// This is a convenience alias for [`FastqWriter::from_path`].
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         Self::from_path(path)
+    }
+}
+
+impl FastqWriter<AtomicFile> {
+    /// Creates a FASTQ writer that publishes its output atomically.
+    ///
+    /// A final `.gz` suffix on `path` selects streaming gzip compression, as
+    /// for [`FastqWriter::from_path`]. Nothing appears at `path` until
+    /// [`commit`](Self::commit) renames the finished file into place; dropping
+    /// the writer discards the output. See [`AtomicFile`] for the one error
+    /// `commit` can return after the rename.
+    pub fn from_path_atomic<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path = path.as_ref();
+        let compression = Compression::from_path(path);
+        Ok(Self::from_writer_with_compression(
+            AtomicFile::create(path)?,
+            compression,
+        ))
+    }
+
+    /// Finishes the stream, then flushes, syncs and renames the output into place.
+    ///
+    /// For gzip output this writes the stream trailer first. See
+    /// [`AtomicFile::commit`] for the exact steps and errors.
+    pub fn commit(self) -> io::Result<()> {
+        self.finish()?.commit()
     }
 }
 
@@ -458,6 +491,17 @@ impl Fastq {
         let mut writer = FastqWriter::from_path(path)?;
         writer.write_all(self)?;
         writer.finish().map(drop)
+    }
+
+    /// Writes this FASTQ payload to a plain or gzip filesystem path atomically.
+    ///
+    /// A final `.gz` suffix selects streaming gzip compression. Nothing appears
+    /// at `path` unless the whole payload is written and committed. See
+    /// [`FastqWriter::from_path_atomic`].
+    pub fn to_path_atomic<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let mut writer = FastqWriter::from_path_atomic(path)?;
+        writer.write_all(self)?;
+        writer.commit()
     }
 
     /// Writes this FASTQ payload to a writable byte stream.

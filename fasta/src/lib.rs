@@ -12,8 +12,12 @@
 //! removed. The parser does not validate sequence alphabets; the writer only
 //! rejects records whose IDs, descriptions, or sequences cannot be represented
 //! as valid FASTA lines.
+//!
+//! A plain-text file cut at a record boundary looks complete, so a truncated
+//! file like that can't be detected when read. For files you write, use
+//! [`FastaWriter::from_path_atomic`] so a failed run never leaves a partial file.
 
-use brust_core::{Error, Format};
+use brust_core::{AtomicFile, Error, Format};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -179,6 +183,9 @@ impl<R: Read> FastaReader<R> {
 
 impl FastaWriter<File> {
     /// Creates or truncates a FASTA file at a filesystem path.
+    ///
+    /// Use [`FastaWriter::from_path_atomic`] to keep an existing file intact until
+    /// the new one is complete.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::create(path)?;
         Ok(Self::from_writer(file))
@@ -189,6 +196,24 @@ impl FastaWriter<File> {
     /// This is a convenience alias for [`FastaWriter::from_path`].
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         Self::from_path(path)
+    }
+}
+
+impl FastaWriter<AtomicFile> {
+    /// Creates a FASTA writer that publishes its output atomically.
+    ///
+    /// Nothing appears at `path` until [`commit`](Self::commit) renames the
+    /// finished file into place; dropping the writer discards the output. See
+    /// [`AtomicFile`] for the one error `commit` can return after the rename.
+    pub fn from_path_atomic<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Ok(Self::from_writer(AtomicFile::create(path)?))
+    }
+
+    /// Flushes, syncs and renames the output into place.
+    ///
+    /// See [`AtomicFile::commit`] for the exact steps and errors.
+    pub fn commit(self) -> io::Result<()> {
+        self.into_inner().commit()
     }
 }
 
@@ -293,6 +318,16 @@ impl Fasta {
         let mut writer = FastaWriter::from_path(path)?;
         writer.write_all(self)?;
         writer.flush()
+    }
+
+    /// Writes this FASTA payload to a filesystem path atomically.
+    ///
+    /// Nothing appears at `path` unless the whole payload is written and
+    /// committed. See [`FastaWriter::from_path_atomic`].
+    pub fn to_path_atomic<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let mut writer = FastaWriter::from_path_atomic(path)?;
+        writer.write_all(self)?;
+        writer.commit()
     }
 
     /// Writes this FASTA payload to a writable byte stream.

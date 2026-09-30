@@ -64,3 +64,14 @@ fn path_writer_compresses_fq_gz_and_round_trips() {
     assert_eq!(Fastq::from_path(output.path()).unwrap(), expected);
     assert_eq!(Compression::from_path(output.path()), Compression::Gzip);
 }
+
+#[test]
+fn truncated_gzip_is_an_error() {
+    let bytes = fs::read(fixture("UDP0057_sub100.fastq.gz")).unwrap();
+    let truncated = TempFile::new("fastq.gz");
+    fs::write(truncated.path(), &bytes[..bytes.len() - 1]).unwrap();
+
+    let result = FastqReader::from_path(truncated.path()).and_then(|reader| reader.read_all());
+
+    assert!(result.is_err());
+}

@@ -59,3 +59,40 @@ fn inspect(error: std::io::Error) {
     }
 }
 ```
+
+## Atomic File Output
+
+`AtomicFile` is a buffered file sink that publishes its contents at the target
+path only when `commit` succeeds. It writes to a hidden temporary file beside
+the target, then flushes, syncs, renames and (on Unix) syncs the folder.
+Dropping it without `commit` removes the temporary file and leaves any existing
+target unchanged.
+
+```rust
+use brust_core::AtomicFile;
+use std::io::Write;
+
+fn main() -> std::io::Result<()> {
+    let mut file = AtomicFile::create("out.txt")?;
+    file.write_all(b"hello\n")?;
+    file.commit()
+}
+```
+
+`commit` can return an error after the rename, if syncing the folder fails. The
+new file is already in place in that case.
+
+Known limits:
+
+- The rename replaces a symlink at the target with a plain file.
+- The new file gets default permissions (umask), not the old file's.
+- Hard links to the old file keep the old contents.
+- On Unix, a read-only existing target is replaced, as `mv` does; other
+  platforms may refuse the rename and keep the old file.
+- Paths are kept as given, so do not change the current folder between `create`
+  and `commit`.
+- The rename is atomic only within one filesystem. The temporary file is
+  created beside the target to guarantee that.
+- Only Unix syncs the folder after the rename. Elsewhere a power cut soon after
+  `commit` can undo the rename, leaving the old file (or no file if the target
+  was new), but never a partial one.
