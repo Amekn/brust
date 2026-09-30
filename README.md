@@ -15,7 +15,7 @@ format-specific crates:
 | `brust-sam` | `brust_sam` | SAM reader, writer, flags, CIGAR, and optional fields |
 | `brust-bam` | `brust_bam` | BAM/BGZF reader, writer, virtual offsets, and SAM conversion |
 | `brust-pod5` | `brust_pod5` | POD5 metadata, reads, signal rows, and VBZ helpers |
-| `brust-seq` | `brust_seq` | IUPAC reverse complement and matching, and codon translation |
+| `brust-seq` | `brust_seq` | IUPAC reverse complement and matching, codon translation, and Phred means |
 
 Most applications should depend on `brust`, which re-exports the format crates
 under one namespace:
@@ -107,7 +107,9 @@ Examples of reported values include:
 
 - FASTA and FASTQ record counts, sequence length distributions, N50/N90, base
   composition, duplicate ID counts, and GC fraction.
-- FASTQ quality summaries including Phred min/max/mean and Q20/Q30 fractions.
+- FASTQ quality summaries including Phred min/max/mean, Q20/Q30 fractions, and
+  per-read qscore (the Phred value of each read's mean base error probability,
+  reported next to the per-read arithmetic mean Phred).
 - SAM and BAM header/reference summaries, alignment flags, MAPQ, template
   lengths, CIGAR operation totals, optional tag counts, and records by
   reference.

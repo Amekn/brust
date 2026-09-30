@@ -10,10 +10,11 @@ path ends in `.gz`, supporting both `.fq.gz` and `.fastq.gz` while retaining the
 streaming behavior of the plain-text APIs.
 
 The crate is designed for applications that want one dependency for FASTA,
-FASTQ, SAM, BAM, and POD5 handling:
+FASTQ, SAM, BAM, and POD5 handling, plus the sequence and quality helpers in
+`seq`:
 
 ```rust
-use brust::{bam, fasta, fastq, pod5, sam};
+use brust::{bam, fasta, fastq, pod5, sam, seq};
 ```
 
 ## Installation
@@ -159,6 +160,8 @@ same domain error as the inner `InvalidData` error when possible.
 - `brust-sam`: SAM reader, writer, flags, CIGAR, and optional fields.
 - `brust-bam`: BAM/BGZF reader, writer, virtual offsets, and SAM conversion.
 - `brust-pod5`: POD5 metadata, reads, signal rows, and VBZ helpers.
+- `brust-seq`: IUPAC reverse complement and matching, codon translation, and
+  Phred means.
 
 Direct subcrate dependencies use the published package names, while Rust import
 paths use underscores:
