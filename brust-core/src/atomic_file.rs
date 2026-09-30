@@ -24,8 +24,8 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// 5. on Unix, open the parent folder and `sync_all` it.
 ///
 /// The new contents appear at the target only when `commit` reaches the
-/// rename. If flush, sync or rename fails, the temporary file is removed, the
-/// target is left as it was, and the error is returned. `commit` can also
+/// rename. If flush, sync or rename fails, the temporary file is removed (best
+/// effort), the target is left as it was, and the error is returned. `commit` can also
 /// return an error after the rename: if opening or syncing the parent folder
 /// fails, the new file is already in place. That error keeps the original
 /// [`io::ErrorKind`] and its message says the file was renamed but the folder
@@ -42,8 +42,9 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// - The rename replaces a symlink at the target with a plain file.
 /// - The new file gets default permissions (umask), not the old file's.
 /// - Hard links to the old file keep the old contents.
-/// - A read-only existing target is replaced, because `rename` does not need
-///   write access to the old file. This is deliberate and matches `mv`.
+/// - On Unix, a read-only existing target is replaced, because `rename` does
+///   not need write access to the old file. This is deliberate and matches
+///   `mv`. Other platforms may refuse the rename and keep the old file.
 /// - Paths are kept as given, so a relative path is resolved against the
 ///   current folder at each step. Don't change the current folder between
 ///   `create` and `commit`.
@@ -115,7 +116,7 @@ impl AtomicFile {
     /// Flushes, syncs and renames the temporary file over the target.
     ///
     /// On an error from the flush, sync or rename, the temporary file is
-    /// removed and the target is unchanged. An error about syncing the parent
+    /// removed (best effort) and the target is unchanged. An error about syncing the parent
     /// folder (Unix only) comes after the rename: the new file is already in
     /// place. See the type documentation for details.
     pub fn commit(mut self) -> io::Result<()> {

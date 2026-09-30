@@ -87,7 +87,8 @@ Known limits:
 - The rename replaces a symlink at the target with a plain file.
 - The new file gets default permissions (umask), not the old file's.
 - Hard links to the old file keep the old contents.
-- A read-only existing target is replaced, as `mv` does.
+- On Unix, a read-only existing target is replaced, as `mv` does; other
+  platforms may refuse the rename and keep the old file.
 - Paths are kept as given, so do not change the current folder between `create`
   and `commit`.
 - The rename is atomic only within one filesystem. The temporary file is

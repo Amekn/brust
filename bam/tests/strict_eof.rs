@@ -115,6 +115,30 @@ fn cut_inside_a_block_fails_in_both_modes() {
 }
 
 #[test]
+fn strict_mid_block_cut_reports_one_error() {
+    let bytes = bytes();
+    let cut = &bytes[..bytes.len() - 38];
+    let full = full();
+
+    let lenient: Vec<_> = BamReader::from_reader(cut)
+        .unwrap()
+        .records()
+        .take(full + 3)
+        .collect();
+    let mut strict = strict_reader(cut);
+    let items: Vec<_> = strict.records().take(full + 3).collect();
+
+    let oks = |items: &[io::Result<_>]| items.iter().filter(|item| item.is_ok()).count();
+    let errs = |items: &[io::Result<_>]| items.iter().filter(|item| item.is_err()).count();
+    assert_eq!(errs(&lenient), 1);
+    assert_eq!(errs(&items), 1);
+    assert_eq!(oks(&items), oks(&lenient));
+    assert_eq!(items.len(), lenient.len());
+    assert!(items.last().unwrap().is_err());
+    assert!(strict.read_record().unwrap().is_none());
+}
+
+#[test]
 fn strict_bgzf_accepts_joined_streams() {
     let stream = [
         block(b"abc"),

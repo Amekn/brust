@@ -90,9 +90,14 @@ A complete BAM ends with the 28-byte BGZF EOF block. Readers don't require it by
 default. To treat a missing marker as truncation, opt in before reading:
 
 ```rust
-let mut reader = brust_bam::BamReader::from_path("aligned.bam")?;
-reader.set_require_eof_block(true);
-let bam = reader.read_all()?; // Err(InvalidData) if the EOF block is missing
+use brust_bam::BamReader;
+
+fn main() -> std::io::Result<()> {
+    let mut reader = BamReader::from_path("aligned.bam")?;
+    reader.set_require_eof_block(true);
+    let _bam = reader.read_all()?; // Err(InvalidData) if the EOF block is missing
+    Ok(())
+}
 ```
 
 The last block must match the marker byte for byte. The error is reported once,

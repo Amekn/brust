@@ -196,6 +196,7 @@ fn folder_sync_failure_reports_published_file() {
     let result = file.commit();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let error = result.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::PermissionDenied);
     assert!(error.to_string().contains("into place"));
     assert_eq!(fs::read(dir.join("out.txt")).unwrap(), b"new");
     assert_eq!(names(dir.path()), ["out.txt"]);

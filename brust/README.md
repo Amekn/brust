@@ -53,6 +53,9 @@ brust validate bam aligned.bam
 brust validate pod5 reads.pod5
 ```
 
+BAM `validate` and `stats` (and the library's `validate_bam` and `bam_stats`) reject a BAM
+that doesn't end with the BGZF EOF block, as possibly truncated.
+
 Print human-readable statistics:
 
 ```bash
@@ -91,8 +94,7 @@ temporary file is deleted and an existing output is left untouched. A folder-syn
 the rename is reported, but the new file is already in place. BAM input must end with the BGZF
 EOF block; a BAM without it is rejected as possibly truncated.
 
-Temporary output names preserve the destination suffix, ensuring requested gzip FASTQ
-output is compressed before the rename.
+A `.gz` FASTQ target is written as gzip.
 
 ## Public API
 

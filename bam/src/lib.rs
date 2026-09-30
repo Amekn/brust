@@ -1151,8 +1151,8 @@ impl<R: Read> BamReader<R> {
     /// The default is `false`: a stream that ends without the marker is read
     /// as complete, as before. When `true`, reaching the end of the stream is
     /// an [`io::ErrorKind::InvalidData`] error unless the last BGZF block is
-    /// byte-for-byte the 28-byte EOF block. An empty stream fails too, and so
-    /// does a final empty block that differs in any byte.
+    /// byte-for-byte the 28-byte EOF block. A final empty block that differs
+    /// in any byte fails too.
     ///
     /// The check happens at the end of the stream and is reported once, by
     /// [`BamReader::read_record`], [`BamReader::records`] or
@@ -1160,6 +1160,9 @@ impl<R: Read> BamReader<R> {
     /// stream. Set this before the reader reaches the end, because a lenient
     /// end is cached and is not re-checked. Empty blocks in the middle of the
     /// stream are still skipped.
+    ///
+    /// A block that fails to read, such as one cut short, is reported by its
+    /// own error, not also as a missing EOF block.
     ///
     /// A joined stream cut exactly after an interior EOF marker ends with a
     /// valid marker, so this check cannot detect that truncation.

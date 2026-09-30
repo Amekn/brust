@@ -90,6 +90,9 @@ brust validate pod5 reads.pod5
 On malformed input the command exits non-zero and prints structured context when
 the parser can identify it, such as line and field details.
 
+BAM `validate` and `stats` (and the library's `validate_bam` and `bam_stats`) reject a BAM
+that doesn't end with the BGZF EOF block, as possibly truncated.
+
 ### Statistics
 
 Statistics are streamed where possible and returned by the library as typed

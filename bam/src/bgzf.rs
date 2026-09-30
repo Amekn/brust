@@ -73,6 +73,7 @@ pub struct BgzfReader<R: Read> {
     eof: bool,
     require_eof_block: bool,
     last_block_is_eof_marker: bool,
+    last_read_failed: bool,
 }
 
 /// Diagnostic for a strict reader that ran out of input without the EOF block.
@@ -91,6 +92,7 @@ impl<R: Read> BgzfReader<R> {
             eof: false,
             require_eof_block: false,
             last_block_is_eof_marker: false,
+            last_read_failed: false,
         }
     }
 
@@ -98,16 +100,19 @@ impl<R: Read> BgzfReader<R> {
     ///
     /// The default is `false`: a stream that ends without the marker is read
     /// as complete, as before. When `true`, reaching the end of the input is an
-    /// [`io::ErrorKind::InvalidData`] error unless the last block read, empty
-    /// or not, is byte-for-byte the 28-byte [`EOF_BLOCK`]. An empty input fails
-    /// too. A final empty block that differs in any byte, such as its MTIME, is
-    /// not accepted.
+    /// [`io::ErrorKind::InvalidData`] error unless the last block read is
+    /// byte-for-byte the 28-byte [`EOF_BLOCK`]. An empty input fails too. A
+    /// final empty block that differs in any byte, such as its MTIME, is not
+    /// accepted.
     ///
     /// The check happens at the end of the stream and is reported once; later
     /// reads return `Ok(0)`, as they do after a lenient end. Set this before
     /// the reader reaches the end, because a lenient end is cached and is not
     /// re-checked. Empty blocks in the middle of the stream are still skipped,
     /// and only the last block has to be the marker.
+    ///
+    /// A block that fails to read, such as one cut short, is reported by its
+    /// own error, not also as a missing EOF block.
     ///
     /// A joined stream cut exactly after an interior EOF marker ends with a
     /// valid marker, so this check cannot detect that truncation.
@@ -135,17 +140,28 @@ impl<R: Read> BgzfReader<R> {
         }
 
         loop {
-            let Some(block) = read_bgzf_block(&mut self.inner, self.next_block_start)? else {
+            let block = match read_bgzf_block(&mut self.inner, self.next_block_start) {
+                Ok(block) => block,
+                Err(error) => {
+                    self.last_read_failed = true;
+                    return Err(error);
+                }
+            };
+            let Some(block) = block else {
                 self.eof = true;
                 self.buffer.clear();
                 self.position = 0;
-                if self.require_eof_block && !self.last_block_is_eof_marker {
+                if self.require_eof_block
+                    && !self.last_block_is_eof_marker
+                    && !self.last_read_failed
+                {
                     return Err(invalid_data(MISSING_EOF_BLOCK));
                 }
                 return Ok(false);
             };
 
             self.last_block_is_eof_marker = block.is_eof_marker;
+            self.last_read_failed = false;
 
             self.current_block_start = self.next_block_start;
             self.next_block_start = self
