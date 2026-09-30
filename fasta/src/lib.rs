@@ -12,6 +12,10 @@
 //! removed. The parser does not validate sequence alphabets; the writer only
 //! rejects records whose IDs, descriptions, or sequences cannot be represented
 //! as valid FASTA lines.
+//!
+//! A plain-text file cut at a record boundary looks complete, so a truncated
+//! file like that can't be detected when read. For files you write, use
+//! [`FastaWriter::from_path_atomic`] so a failed run never leaves a partial file.
 
 use brust_core::{AtomicFile, Error, Format};
 use std::fs::File;

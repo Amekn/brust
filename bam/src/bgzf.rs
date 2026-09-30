@@ -71,7 +71,13 @@ pub struct BgzfReader<R: Read> {
     current_block_start: u64,
     next_block_start: u64,
     eof: bool,
+    require_eof_block: bool,
+    last_block_is_eof_marker: bool,
 }
+
+/// Diagnostic for a strict reader that ran out of input without the EOF block.
+const MISSING_EOF_BLOCK: &str =
+    "BGZF stream ended without the EOF block; the file may be truncated";
 
 impl<R: Read> BgzfReader<R> {
     /// Creates a BGZF reader over a compressed byte stream.
@@ -83,7 +89,30 @@ impl<R: Read> BgzfReader<R> {
             current_block_start: 0,
             next_block_start: 0,
             eof: false,
+            require_eof_block: false,
+            last_block_is_eof_marker: false,
         }
+    }
+
+    /// Sets whether the stream must end with the standard BGZF EOF block.
+    ///
+    /// The default is `false`: a stream that ends without the marker is read
+    /// as complete, as before. When `true`, reaching the end of the input is an
+    /// [`io::ErrorKind::InvalidData`] error unless the last block read, empty
+    /// or not, is byte-for-byte the 28-byte [`EOF_BLOCK`]. An empty input fails
+    /// too. A final empty block that differs in any byte, such as its MTIME, is
+    /// not accepted.
+    ///
+    /// The check happens at the end of the stream and is reported once; later
+    /// reads return `Ok(0)`, as they do after a lenient end. Set this before
+    /// the reader reaches the end, because a lenient end is cached and is not
+    /// re-checked. Empty blocks in the middle of the stream are still skipped,
+    /// and only the last block has to be the marker.
+    ///
+    /// A joined stream cut exactly after an interior EOF marker ends with a
+    /// valid marker, so this check cannot detect that truncation.
+    pub fn set_require_eof_block(&mut self, require: bool) {
+        self.require_eof_block = require;
     }
 
     /// Returns the current virtual offset.
@@ -110,8 +139,13 @@ impl<R: Read> BgzfReader<R> {
                 self.eof = true;
                 self.buffer.clear();
                 self.position = 0;
+                if self.require_eof_block && !self.last_block_is_eof_marker {
+                    return Err(invalid_data(MISSING_EOF_BLOCK));
+                }
                 return Ok(false);
             };
+
+            self.last_block_is_eof_marker = block.is_eof_marker;
 
             self.current_block_start = self.next_block_start;
             self.next_block_start = self
@@ -149,6 +183,8 @@ impl<R: Read> Read for BgzfReader<R> {
 struct BgzfBlock {
     compressed_size: usize,
     uncompressed: Vec<u8>,
+    /// Whether the raw block bytes equal [`EOF_BLOCK`] exactly.
+    is_eof_marker: bool,
 }
 
 fn read_bgzf_block<R: Read>(
@@ -184,6 +220,11 @@ fn read_bgzf_block<R: Read>(
     let mut remaining = vec![0u8; remaining_len];
     reader.read_exact(&mut remaining)?;
 
+    let is_eof_marker = compressed_size == EOF_BLOCK.len()
+        && prefix[..] == EOF_BLOCK[..12]
+        && extra[..] == EOF_BLOCK[12..12 + xlen]
+        && remaining[..] == EOF_BLOCK[12 + xlen..];
+
     let deflate_len = remaining_len - 8;
     let deflate = &remaining[..deflate_len];
     let footer = &remaining[deflate_len..];
@@ -210,6 +251,7 @@ fn read_bgzf_block<R: Read>(
     Ok(Some(BgzfBlock {
         compressed_size,
         uncompressed,
+        is_eof_marker,
     }))
 }
 

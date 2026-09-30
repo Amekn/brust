@@ -14,6 +14,10 @@
 //! quality lines are concatenated until their length exactly matches the
 //! sequence length. The writer emits a canonical four-line record with a bare
 //! `+` separator and validates that sequence and quality lengths match.
+//!
+//! A plain-text file cut at a record boundary looks complete, so a truncated
+//! file like that can't be detected when read. For files you write, use
+//! [`FastqWriter::from_path_atomic`] so a failed run never leaves a partial file.
 
 use brust_core::{AtomicFile, Compression, Error, Format};
 use fasta::{Fasta, FastaRecord};

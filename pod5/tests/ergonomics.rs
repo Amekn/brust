@@ -1,4 +1,4 @@
-use brust_pod5::Pod5;
+use brust_pod5::{Pod5, Pod5Reader};
 
 const A_100_POD5: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/A_100.pod5");
 const FIRST_READ_ID: &str = "1cadb1e9-592f-4e22-9285-4626f2b7da9f";
@@ -37,4 +37,15 @@ fn materialized_signal_cache_reuses_decompressed_rows() {
 
     assert_eq!(first, second);
     assert_eq!(cache.cached_row_count(), record.signal_rows.len());
+}
+
+#[test]
+fn truncated_pod5_is_rejected() {
+    let bytes = std::fs::read(A_100_POD5).unwrap();
+    let truncated = &bytes[..bytes.len() - 1];
+
+    // `Pod5Reader::from_path` only opens the file and calls `from_reader`.
+    let result = Pod5Reader::from_reader(std::io::Cursor::new(truncated));
+
+    assert!(result.is_err());
 }

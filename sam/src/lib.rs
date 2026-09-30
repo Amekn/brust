@@ -13,6 +13,10 @@
 //! string, hex, and numeric-array values. The writer formats records and
 //! reparses them before emitting text, so the same validation is applied on
 //! output.
+//!
+//! A plain-text file cut at a record boundary looks complete, so a truncated
+//! file like that can't be detected when read. For files you write, use
+//! [`SamWriter::from_path_atomic`] so a failed run never leaves a partial file.
 
 use brust_core::{AtomicFile, Error, Format};
 use std::collections::HashSet;
