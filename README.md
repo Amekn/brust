@@ -133,8 +133,9 @@ brust convert bam-to-fastq aligned.bam reads.fastq
 
 `sam-to-fastq` and `bam-to-fastq` write reverse-strand reads in their original
 orientation, skip secondary and supplementary records, and leave read names
-unchanged. Output differs from 0.1.x for inputs with reverse-strand, secondary
-or supplementary records.
+unchanged. Unmapped, QC-fail and duplicate records are still written. Output
+differs from 0.1.x for inputs with reverse-strand, secondary or supplementary
+records.
 
 Add `-t`/`--threads` to compress BAM output on several threads:
 

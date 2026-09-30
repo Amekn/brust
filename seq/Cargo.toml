@@ -8,5 +8,5 @@ repository.workspace = true
 license.workspace = true
 readme = "README.md"
 description = "Sequence and quality primitives for Brust: IUPAC reverse complement and matching, codon translation, and Phred means."
-keywords.workspace = true
-categories.workspace = true
+keywords = ["bioinformatics", "dna", "iupac", "codon", "phred"]
+categories = ["science::bioinformatics"]

@@ -131,6 +131,12 @@ mod tests {
     }
 
     #[test]
+    fn translate_codon_does_not_resolve_degenerate_codons() {
+        // CTN is always leucine, but there is no degenerate-codon resolution.
+        assert_eq!(translate_codon(b"CTN"), None);
+    }
+
+    #[test]
     fn translate_codon_rejects_ambiguous_and_wrong_length() {
         assert_eq!(translate_codon(b"NNK"), None);
         assert_eq!(translate_codon(b"AT"), None);

@@ -34,7 +34,7 @@ converts to a `String` without loss.
 - `translate(seq)`: reading frame 0, with `X` for codons that cannot be
   translated. A trailing 1 or 2 bases are ignored, and translation continues
   past `*`.
-- `PhredMean`: running Phred mean of finished Phred values (not Phred+33
+- `PhredMean`: running Phred mean of decoded Phred values (not Phred+33
   bytes), taken over error probabilities: `-10 * log10(mean(10^(-Q/10)))`. Use
   `add(phred)` and `mean()`, which is `None` until a value is added. The result
   is never below 0.0.

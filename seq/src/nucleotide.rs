@@ -130,6 +130,12 @@ mod tests {
     }
 
     #[test]
+    fn complement_turns_lowercase_unknown_bytes_into_uppercase_n() {
+        // Unknown bytes become uppercase N, even when the input is lowercase.
+        assert_eq!(complement(b'x'), b'N');
+    }
+
+    #[test]
     fn reverse_complement_keeps_case_and_reverses() {
         assert_eq!(reverse_complement(b"acgtRykm"), b"kmrYacgt");
         assert_eq!(reverse_complement(b""), b"");

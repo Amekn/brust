@@ -56,7 +56,21 @@ fn stats_cli_prints_per_read_qscore() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("per_read_qscore:"));
+    let block = stdout
+        .split("  per_read_qscore:\n")
+        .nth(1)
+        .expect("per_read_qscore block");
+    let block: Vec<&str> = block.lines().take(5).collect();
+    assert_eq!(
+        block,
+        [
+            "    count: 0",
+            "    non_finite_count: 0",
+            "    min: -",
+            "    max: -",
+            "    mean: -",
+        ]
+    );
 }
 
 #[test]

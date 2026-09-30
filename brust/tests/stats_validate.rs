@@ -151,6 +151,31 @@ fn per_read_qscore_matches_independent_values_on_the_fixture() {
 }
 
 #[test]
+fn every_fixture_read_has_qscore_at_most_its_arithmetic_mean_phred() {
+    let mut reader =
+        brust::fastq::FastqReader::from_path(common::fixture("fastq/UDP0057_sub100.fastq"))
+            .unwrap();
+
+    let mut reads = 0;
+    while let Some(record) = reader.read_record().unwrap() {
+        let quality = record.quality.as_bytes();
+        let qscore = brust::seq::read_mean_phred(quality).unwrap();
+        let arithmetic = quality
+            .iter()
+            .map(|byte| f64::from(byte.saturating_sub(33)))
+            .sum::<f64>()
+            / quality.len() as f64;
+        assert!(
+            qscore <= arithmetic + 1e-9,
+            "read {}: qscore {qscore} above arithmetic mean {arithmetic}",
+            record.id
+        );
+        reads += 1;
+    }
+    assert_eq!(reads, 100);
+}
+
+#[test]
 fn empty_fastq_has_empty_qscore_summary() {
     let temp = common::TempDir::new("qscore-empty");
     let stats = fastq_qscore_stats(&temp, "empty.fastq", "");

@@ -75,6 +75,12 @@ brust convert bam-to-fastq aligned.bam reads.fastq
 brust convert bam-to-fastq aligned.bam reads.fastq.gz
 ```
 
+`sam-to-fastq` and `bam-to-fastq` write reverse-strand reads in their original
+orientation, skip secondary and supplementary records, and leave read names
+unchanged. Unmapped, QC-fail and duplicate records are still written. Output
+differs from 0.1.x for inputs with reverse-strand, secondary or supplementary
+records.
+
 Conversions stream records and write through a temporary output path before
 renaming, so an existing output file is not replaced by a partial file when
 parsing or writing fails. Temporary output names preserve the destination

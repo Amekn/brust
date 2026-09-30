@@ -269,8 +269,10 @@ impl SamRecord {
     /// Returns SEQ in its original sequencing orientation.
     ///
     /// A record on the reverse strand (flag `0x10`) stores SEQ reverse-complemented, so this
-    /// reverse-complements it back, keeping case and mapping bytes that are not IUPAC
-    /// nucleotide codes to `N`. Any other record's SEQ is returned unchanged, and `*` stays `*`.
+    /// reverse-complements it back. Case and the gap symbols `-` and `.` are kept, `U` becomes
+    /// `A`, and any other byte that is not an IUPAC nucleotide code becomes `N`. See
+    /// [`seq::complement`] for the exact rules. Any other record's SEQ is returned unchanged,
+    /// and `*` stays `*`.
     pub fn original_seq(&self) -> String {
         if !self.is_reverse_complemented() || self.seq == "*" {
             return self.seq.clone();

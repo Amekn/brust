@@ -208,7 +208,8 @@ pub struct QualityStats {
     pub per_read_mean_phred: FloatStats,
     /// Summary of per-read quality scores: the Phred value of each read's mean base error
     /// probability, −10·log10(mean(10^(−Q/10))). Never above the read's arithmetic mean
-    /// Phred, and noticeably lower when its base qualities vary.
+    /// Phred (apart from floating-point rounding), and noticeably lower when its base
+    /// qualities vary.
     pub per_read_qscore: FloatStats,
 }
 

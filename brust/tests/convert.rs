@@ -195,6 +195,57 @@ fn bam_to_fastq_writes_primary_reads_in_original_orientation() {
     );
 }
 
+/// Writes a SAM with an unmapped record, a QC-fail reverse-strand record and a
+/// duplicate record, none of which may be skipped.
+fn write_unmapped_qcfail_duplicate_sam(temp: &common::TempDir) -> std::path::PathBuf {
+    let input = temp.join("other-flags.sam");
+    fs::write(
+        &input,
+        concat!(
+            "@HD\tVN:1.6\tSO:unsorted\n",
+            "@SQ\tSN:ref\tLN:100\n",
+            "unmapped\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\n",
+            "qcfail\t528\tref\t1\t60\t4M\t*\t0\t0\tAACG\t!#%'\n",
+            "dup\t1024\tref\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\n",
+        ),
+    )
+    .unwrap();
+    input
+}
+
+fn unmapped_qcfail_duplicate_triples() -> [(String, String, String); 3] {
+    // The QC-fail record is on the reverse strand, so it comes out restored.
+    [
+        triple("unmapped", "ACGT", "IIII"),
+        triple("qcfail", "CGTT", "'%#!"),
+        triple("dup", "ACGT", "IIII"),
+    ]
+}
+
+#[test]
+fn sam_to_fastq_still_writes_unmapped_qc_fail_and_duplicate_reads() {
+    let temp = common::TempDir::new("sam-to-fastq-other-flags");
+    let input = write_unmapped_qcfail_duplicate_sam(&temp);
+    let output = temp.join("reads.fastq");
+
+    convert::sam_to_fastq(&input, &output).unwrap();
+
+    assert_eq!(fastq_triples(&output), unmapped_qcfail_duplicate_triples());
+}
+
+#[test]
+fn bam_to_fastq_still_writes_unmapped_qc_fail_and_duplicate_reads() {
+    let temp = common::TempDir::new("bam-to-fastq-other-flags");
+    let input = write_unmapped_qcfail_duplicate_sam(&temp);
+    let bam_output = temp.join("other-flags.bam");
+    let output = temp.join("reads.fastq");
+
+    convert::sam_to_bam(&input, &bam_output).unwrap();
+    convert::bam_to_fastq(&bam_output, &output).unwrap();
+
+    assert_eq!(fastq_triples(&output), unmapped_qcfail_duplicate_triples());
+}
+
 #[test]
 fn fixture_reverse_strand_reads_come_out_reverse_complemented() {
     let temp = common::TempDir::new("fixture-reverse-strand");
@@ -221,6 +272,7 @@ fn fixture_reverse_strand_reads_come_out_reverse_complemented() {
     let fastq = fastq::Fastq::from_path(&output).unwrap();
 
     assert_eq!(fastq.records.len(), 100);
+    assert_eq!(sam.records.len(), 100);
     let mut reverse = 0;
     for (record, read) in sam.records.iter().zip(&fastq.records) {
         assert_eq!(read.id, record.qname);

@@ -25,7 +25,8 @@ fn phred_of_mean_error(error_sum: f64, count: u64) -> f64 {
 /// matter more than many good ones. `PhredMean` averages the error probabilities
 /// `10^(-Q/10)` instead and converts the mean back to a Phred value:
 /// `-10 * log10(mean(10^(-Q/10)))`. The result is clamped at 0.0, so it is never
-/// `-0.0`.
+/// `-0.0`. [`read_mean_phred`] gives the same value for one read's Phred+33
+/// quality bytes.
 ///
 /// ```
 /// use brust_seq::PhredMean;
@@ -63,6 +64,13 @@ impl PhredMean {
 
 /// Phred value of the mean base error probability of one read, from its
 /// Phred+33 quality bytes: `-10 * log10(mean(10^(-Q/10)))`.
+///
+/// This is the error-space value that FASTQ stats summarise as
+/// `per_read_qscore`. It is not the arithmetic mean of the Phred values, which
+/// is what `per_read_mean_phred` reports. It is never above the arithmetic mean
+/// (apart from floating-point rounding), and is lower when the read's base
+/// qualities vary: `!I` (Q0 and Q40) gives about 3.01, where the arithmetic mean
+/// is 20.
 ///
 /// Each byte is decoded with `saturating_sub(33)`, so a byte below 33 counts as
 /// Phred 0. Returns `None` for an empty quality string. The result is never

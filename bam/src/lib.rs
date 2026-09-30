@@ -883,9 +883,11 @@ impl BamRecord {
     /// Returns the sequence in its original sequencing orientation.
     ///
     /// A record on the reverse strand (flag `0x10`) stores its sequence reverse-complemented,
-    /// so this reverse-complements [`sequence_string`](Self::sequence_string) back, mapping
-    /// bytes that are not IUPAC nucleotide codes (such as `=`) to `N`. Any other record's
-    /// sequence is returned unchanged, and a record with no sequence gives an empty string.
+    /// so this reverse-complements [`sequence_string`](Self::sequence_string) back. Case and
+    /// the gap symbols `-` and `.` are kept, `U` becomes `A`, and any other byte that is not an
+    /// IUPAC nucleotide code (such as `=`) becomes `N`. See [`seq::complement`] for the exact
+    /// rules. Any other record's sequence is returned unchanged, and a record with no sequence
+    /// gives an empty string.
     pub fn original_sequence_string(&self) -> String {
         let sequence = self.sequence_string();
         if !self.is_reverse_complemented() {
