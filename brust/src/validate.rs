@@ -47,9 +47,11 @@ pub fn validate_sam<P: AsRef<Path>>(input: P) -> Result<()> {
     Ok(())
 }
 
-/// Validates BAM headers, references, BGZF blocks, and records by streaming.
+/// Validates BAM headers, references, BGZF blocks, and records by streaming,
+/// and requires the BGZF EOF block.
 pub fn validate_bam<P: AsRef<Path>>(input: P) -> Result<()> {
     let mut reader = bam::BamReader::from_path(input.as_ref())?;
+    reader.set_require_eof_block(true);
     while let Some(_record) = reader.read_record()? {
         // Reading is validation; parser errors carry context where available.
     }

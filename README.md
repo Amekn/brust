@@ -146,9 +146,15 @@ brust convert sam-to-bam aligned.sam aligned.bam --threads 4
 Only the `*-to-bam` conversions take `--threads`. The default is 1, and the
 output is identical at any thread count.
 
-Conversions stream records and write through a temporary file beside the target
-path. The temporary file is renamed only after a successful conversion, so an
-existing output is not replaced by a partial file if parsing or writing fails.
+Conversions stream records into a temporary file beside the target path. On success the file
+is synced to disk and renamed over the target, so readers and crashes never see a partial
+output: the target holds either the old file or the complete new one. On Unix the folder is
+also synced before the conversion reports success, so the rename survives a power cut. Other
+platforms skip that step, so after a power cut the target may still hold the old file, or be
+missing if it was new, but never a partial one. If a conversion fails before the rename, the
+temporary file is deleted and an existing output is left untouched. A folder-sync error after
+the rename is reported, but the new file is already in place. BAM input must end with the BGZF
+EOF block; a BAM without it is rejected as possibly truncated.
 
 ## Library API
 

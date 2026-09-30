@@ -603,11 +603,12 @@ pub fn sam_stats<P: AsRef<Path>>(input: P) -> Result<SamStats> {
     })
 }
 
-/// Computes typed BAM statistics.
+/// Computes typed BAM statistics, and requires the BGZF EOF block.
 pub fn bam_stats<P: AsRef<Path>>(input: P) -> Result<BamStats> {
     let path = input.as_ref();
     let file_size_bytes = fs::metadata(path)?.len();
     let mut reader = bam::BamReader::from_path(path)?;
+    reader.set_require_eof_block(true);
     let header = summarize_bam_header(&reader.header, &reader.refs);
     let mut alignments = AlignmentAccumulator::default();
     let mut record_block_sizes = LengthAccumulator::default();

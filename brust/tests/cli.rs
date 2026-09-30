@@ -271,3 +271,63 @@ fn convert_cli_help_describes_threads() {
             .contains("BGZF compression threads")
     );
 }
+
+fn names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn cli_rejects_bam_without_eof_block() {
+    let temp = common::TempDir::new("cli-missing-eof");
+    let mut bytes = fs::read(common::fixture("bam/aligned.bam")).unwrap();
+    bytes.truncate(bytes.len() - 28);
+    let input = temp.join("no_eof.bam");
+    fs::write(&input, bytes).unwrap();
+    let input = input.to_str().unwrap();
+    let out_sam = temp.join("out.sam");
+    let out_fastq = temp.join("out.fastq");
+
+    let commands: [Vec<&str>; 4] = [
+        vec!["validate", "bam", input],
+        vec!["stats", "bam", input],
+        vec!["convert", "bam-to-sam", input, out_sam.to_str().unwrap()],
+        vec![
+            "convert",
+            "bam-to-fastq",
+            input,
+            out_fastq.to_str().unwrap(),
+        ],
+    ];
+    for args in commands {
+        let output = brust().args(&args).output().unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("EOF block"), "{args:?}: {stderr}");
+    }
+    assert_eq!(names(&temp.join(".")), ["no_eof.bam"]);
+}
+
+#[test]
+fn cli_convert_accepts_bare_relative_output() {
+    let temp = common::TempDir::new("cli-relative-output");
+    let input = std::path::absolute(common::fixture("fastq/UDP0057_sub100.fastq")).unwrap();
+
+    let output = brust()
+        .current_dir(temp.join("."))
+        .args([
+            "convert",
+            "fastq-to-fasta",
+            input.to_str().unwrap(),
+            "out.fasta",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(names(&temp.join(".")), ["out.fasta"]);
+}
