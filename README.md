@@ -354,7 +354,7 @@ Brust is structured around a few product-grade reliability choices:
 - The workspace has unit and integration tests across parsing, writing,
   validation, conversion, stats, and CLI behavior.
 
-The project is still early at version `0.1.1`, so users should validate behavior
+The project is still early at version `0.2.0`, so users should validate behavior
 against their production data and report edge cases. The intended direction is a
 robust, reliable bioinformatics toolkit that can serve both command-line and
 Rust application workflows.

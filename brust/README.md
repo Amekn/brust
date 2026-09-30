@@ -165,7 +165,7 @@ paths use underscores:
 
 ```toml
 [dependencies]
-brust-fasta = "0.1.1"
+brust-fasta = "0.2.0"
 ```
 
 ```rust
