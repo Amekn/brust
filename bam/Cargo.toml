@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-brust-core = { path = "../brust-core", version = "0.1.1" }
+brust-core = { path = "../brust-core", version = "0.2.0" }
 flate2 = "1.1.9"
-sam = { package = "brust-sam", path = "../sam", version = "0.1.1" }
+sam = { package = "brust-sam", path = "../sam", version = "0.2.0" }
+seq = { package = "brust-seq", path = "../seq", version = "0.2.0" }

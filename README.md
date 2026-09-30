@@ -15,12 +15,13 @@ format-specific crates:
 | `brust-sam` | `brust_sam` | SAM reader, writer, flags, CIGAR, and optional fields |
 | `brust-bam` | `brust_bam` | BAM/BGZF reader, writer, virtual offsets, and SAM conversion |
 | `brust-pod5` | `brust_pod5` | POD5 metadata, reads, signal rows, and VBZ helpers |
+| `brust-seq` | `brust_seq` | IUPAC reverse complement and matching, codon translation, and Phred means |
 
 Most applications should depend on `brust`, which re-exports the format crates
 under one namespace:
 
 ```rust
-use brust::{bam, fasta, fastq, pod5, sam};
+use brust::{bam, fasta, fastq, pod5, sam, seq};
 ```
 
 ## Installation
@@ -106,7 +107,9 @@ Examples of reported values include:
 
 - FASTA and FASTQ record counts, sequence length distributions, N50/N90, base
   composition, duplicate ID counts, and GC fraction.
-- FASTQ quality summaries including Phred min/max/mean and Q20/Q30 fractions.
+- FASTQ quality summaries including Phred min/max/mean, Q20/Q30 fractions, and
+  per-read qscore (the Phred value of each read's mean base error probability,
+  reported next to the per-read arithmetic mean Phred).
 - SAM and BAM header/reference summaries, alignment flags, MAPQ, template
   lengths, CIGAR operation totals, optional tag counts, and records by
   reference.
@@ -127,6 +130,12 @@ brust convert bam-to-sam aligned.bam aligned.sam
 brust convert sam-to-fastq aligned.sam reads.fastq
 brust convert bam-to-fastq aligned.bam reads.fastq
 ```
+
+`sam-to-fastq` and `bam-to-fastq` write reverse-strand reads in their original
+orientation, skip secondary and supplementary records, and leave read names
+unchanged. Unmapped, QC-fail and duplicate records are still written. Output
+differs from 0.1.x for inputs with reverse-strand, secondary or supplementary
+records.
 
 Add `-t`/`--threads` to compress BAM output on several threads:
 
@@ -354,7 +363,7 @@ Brust is structured around a few product-grade reliability choices:
 - The workspace has unit and integration tests across parsing, writing,
   validation, conversion, stats, and CLI behavior.
 
-The project is still early at version `0.1.1`, so users should validate behavior
+The project is still early at version `0.2.0`, so users should validate behavior
 against their production data and report edge cases. The intended direction is a
 robust, reliable bioinformatics toolkit that can serve both command-line and
 Rust application workflows.

@@ -880,6 +880,36 @@ impl BamRecord {
             .collect()
     }
 
+    /// Returns the sequence in its original sequencing orientation.
+    ///
+    /// A record on the reverse strand (flag `0x10`) stores its sequence reverse-complemented,
+    /// so this reverse-complements [`sequence_string`](Self::sequence_string) back. Case and
+    /// the gap symbols `-` and `.` are kept, `U` becomes `A`, and any other byte that is not an
+    /// IUPAC nucleotide code (such as `=`) becomes `N`. See [`seq::complement`] for the exact
+    /// rules. Any other record's sequence is returned unchanged, and a record with no sequence
+    /// gives an empty string.
+    pub fn original_sequence_string(&self) -> String {
+        let sequence = self.sequence_string();
+        if !self.is_reverse_complemented() {
+            return sequence;
+        }
+        String::from_utf8(seq::reverse_complement(sequence.as_bytes()))
+            .expect("reverse_complement output is ASCII")
+    }
+
+    /// Returns the quality string in its original sequencing orientation.
+    ///
+    /// A record on the reverse strand (flag `0x10`) stores its qualities reversed, so this
+    /// reverses [`quality_string`](Self::quality_string) back. Any other record's qualities are
+    /// returned unchanged, and the unavailable-quality marker `*` stays `*`.
+    pub fn original_quality_string(&self) -> String {
+        let quality = self.quality_string();
+        if !self.is_reverse_complemented() || quality == "*" {
+            return quality;
+        }
+        quality.chars().rev().collect()
+    }
+
     /// Returns the first auxiliary tag value matching `tag`.
     pub fn aux(&self, tag: &str) -> Option<&BamAuxValue> {
         self.auxiliary
@@ -2508,6 +2538,59 @@ mod bam_tests {
 
         assert_eq!(streamed_record_count, 100);
         assert_eq!(streamed, materialized);
+    }
+
+    const ORIENTATION_SAM: &[u8] = b"@HD\tVN:1.6\n\
+@SQ\tSN:ref\tLN:100\n\
+fwd\t0\tref\t1\t60\t9M\t*\t0\t0\tAACGRYKMN\t!#%')+-/1\n\
+rev\t16\tref\t1\t60\t9M\t*\t0\t0\tAACGRYKMN\t!#%')+-/1\n\
+revstar\t16\tref\t1\t60\t9M\t*\t0\t0\tAACGRYKMN\t*\n";
+
+    fn orientation_records() -> (Vec<sam::SamRecord>, Vec<BamRecord>) {
+        let sam = sam::Sam::from_reader(ORIENTATION_SAM).expect("orientation SAM should parse");
+        let converter =
+            SamToBamConverter::new(&sam.header).expect("converter should derive BAM metadata");
+        let bam = sam
+            .records
+            .iter()
+            .map(|record| converter.convert_record(record))
+            .collect::<io::Result<Vec<_>>>()
+            .expect("SAM records should convert to BAM");
+        (sam.records, bam)
+    }
+
+    #[test]
+    fn bam_original_orientation_matches_sam() {
+        let (sam_records, bam_records) = orientation_records();
+
+        assert_eq!(sam_records[0].flag, 0);
+        assert_eq!(sam_records[1].flag, 16);
+        for (sam_record, bam_record) in sam_records.iter().zip(&bam_records) {
+            assert_eq!(
+                bam_record.original_sequence_string(),
+                sam_record.original_seq()
+            );
+            assert_eq!(
+                bam_record.original_quality_string(),
+                sam_record.original_qual()
+            );
+        }
+
+        assert_eq!(bam_records[0].original_sequence_string(), "AACGRYKMN");
+        assert_eq!(bam_records[0].original_quality_string(), "!#%')+-/1");
+        assert_eq!(bam_records[1].original_sequence_string(), "NKMRYCGTT");
+        assert_eq!(bam_records[1].original_quality_string(), "1/-+)'%#!");
+    }
+
+    #[test]
+    fn bam_reverse_record_without_qualities_reports_star() {
+        let (_, bam_records) = orientation_records();
+        let record = &bam_records[2];
+
+        assert!(record.is_reverse_complemented());
+        assert_eq!(record.quality_string(), "*");
+        assert_eq!(record.original_quality_string(), "*");
+        assert_eq!(record.original_sequence_string(), "NKMRYCGTT");
     }
 
     #[test]

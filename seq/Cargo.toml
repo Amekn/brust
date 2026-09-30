@@ -1,0 +1,12 @@
+[package]
+name = "brust-seq"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+readme = "README.md"
+description = "Sequence and quality primitives for Brust: IUPAC reverse complement and matching, codon translation, and Phred means."
+keywords = ["bioinformatics", "dna", "iupac", "codon", "phred"]
+categories = ["science::bioinformatics"]

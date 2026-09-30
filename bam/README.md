@@ -35,6 +35,10 @@ cargo add brust-sam
   `from_sam`.
 - `BamRecord`: decoded fixed, variable, and auxiliary record fields.
   `BamRecord::encode` appends the record in BAM binary form.
+  `BamRecord::original_sequence_string` and `BamRecord::original_quality_string`
+  return the sequence and qualities in the original sequencing orientation:
+  reverse-complemented and reversed for reverse-strand records (flag `0x10`),
+  unchanged otherwise.
 - `BamAuxValue` and `BamAuxArray`: parsed BAM auxiliary tags.
 - `BgzfVirtualOffset`: compressed/uncompressed BGZF virtual offset.
 - `BgzfWriter`: writes any byte stream as BGZF blocks, on the calling thread or

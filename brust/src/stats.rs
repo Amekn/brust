@@ -183,6 +183,7 @@ impl BaseComposition {
 
 /// Quality-score summary for FASTQ-like Phred+33 qualities.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct QualityStats {
     /// Number of reads contributing quality data.
     pub read_count: u64,
@@ -202,8 +203,14 @@ pub struct QualityStats {
     pub q20_fraction: Option<f64>,
     /// Fraction of bases with Phred score at least 30.
     pub q30_fraction: Option<f64>,
-    /// Summary of per-read mean Phred scores.
+    /// Summary of per-read mean Phred scores: the arithmetic mean of each read's
+    /// Phred values.
     pub per_read_mean_phred: FloatStats,
+    /// Summary of per-read quality scores: the Phred value of each read's mean base error
+    /// probability, −10·log10(mean(10^(−Q/10))). Never above the read's arithmetic mean
+    /// Phred (apart from floating-point rounding), and noticeably lower when its base
+    /// qualities vary.
+    pub per_read_qscore: FloatStats,
 }
 
 /// FASTA-specific statistics.
@@ -882,6 +889,7 @@ struct QualityAccumulator {
     q20_bases: u64,
     q30_bases: u64,
     per_read_mean_phred: FloatAccumulator,
+    per_read_qscore: FloatAccumulator,
 }
 
 impl QualityAccumulator {
@@ -910,6 +918,9 @@ impl QualityAccumulator {
             self.per_read_mean_phred
                 .push(read_sum as f64 / read_bases as f64);
         }
+        if let Some(qscore) = seq::read_mean_phred(quality.as_bytes()) {
+            self.per_read_qscore.push(qscore);
+        }
     }
 
     fn finish(self) -> QualityStats {
@@ -927,6 +938,7 @@ impl QualityAccumulator {
             q30_fraction: (self.base_count > 0)
                 .then(|| self.q30_bases as f64 / self.base_count as f64),
             per_read_mean_phred: self.per_read_mean_phred.finish(),
+            per_read_qscore: self.per_read_qscore.finish(),
         }
     }
 }
@@ -1478,7 +1490,8 @@ fn write_quality_stats(formatter: &mut fmt::Formatter<'_>, quality: &QualityStat
         formatter,
         "per_read_mean_phred",
         &quality.per_read_mean_phred,
-    )
+    )?;
+    write_float_stats(formatter, "per_read_qscore", &quality.per_read_qscore)
 }
 
 fn write_sam_header_stats(
@@ -1768,5 +1781,22 @@ mod tests {
         assert_eq!(stats.runs.len(), 1);
         assert_eq!(stats.pore_types.get("not_set"), Some(&100));
         assert_eq!(stats.end_reasons.get("signal_positive"), Some(&100));
+    }
+
+    #[test]
+    fn zero_length_reads_are_left_out_of_qscore() {
+        // The FASTQ parser rejects blank sequence lines, so the public API cannot produce a
+        // zero-length read. This pins the accumulator's own rule that such a read is skipped.
+        let mut accumulator = QualityAccumulator::default();
+        accumulator.push("");
+        accumulator.push("IIII");
+        let qualities = accumulator.finish();
+
+        let qscore = qualities.per_read_qscore;
+        assert_eq!(qscore.count, 1);
+        assert_eq!(qscore.non_finite_count, 0);
+        assert!((qscore.mean.unwrap() - 40.0).abs() < 1e-9);
+        assert!(!qscore.min.unwrap().is_nan());
+        assert!(!qscore.max.unwrap().is_nan());
     }
 }

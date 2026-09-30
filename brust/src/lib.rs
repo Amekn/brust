@@ -24,6 +24,8 @@ pub use fastq;
 pub use pod5;
 /// Re-export of the SAM format crate.
 pub use sam;
+/// Re-export of the sequence helper crate.
+pub use seq;
 /// Runtime-dispatched statistics value.
 pub use stats::Stats;
 

@@ -1,4 +1,4 @@
-use brust::{Compression, Conversion, Error, Format, Stats, bam, fasta, fastq, pod5, sam};
+use brust::{Compression, Conversion, Error, Format, Stats, bam, fasta, fastq, pod5, sam, seq};
 
 #[test]
 fn facade_reexports_format_crates_and_shared_error() {
@@ -36,4 +36,10 @@ fn facade_reexports_format_crates_and_shared_error() {
     let error = Error::invalid(Format::Fasta, "empty ID");
     assert_eq!(error.to_string(), "invalid FASTA: empty ID");
     assert_eq!(Compression::from_path("reads.fq.gz"), Compression::Gzip);
+}
+
+#[test]
+fn facade_reexports_seq_helpers() {
+    assert_eq!(seq::reverse_complement(b"AACG"), b"CGTT");
+    assert_eq!(seq::translate(b"ATG"), b"M");
 }

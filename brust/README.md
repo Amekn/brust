@@ -10,10 +10,11 @@ path ends in `.gz`, supporting both `.fq.gz` and `.fastq.gz` while retaining the
 streaming behavior of the plain-text APIs.
 
 The crate is designed for applications that want one dependency for FASTA,
-FASTQ, SAM, BAM, and POD5 handling:
+FASTQ, SAM, BAM, and POD5 handling, plus the sequence and quality helpers in
+`seq`:
 
 ```rust
-use brust::{bam, fasta, fastq, pod5, sam};
+use brust::{bam, fasta, fastq, pod5, sam, seq};
 ```
 
 ## Installation
@@ -73,6 +74,12 @@ brust convert sam-to-fastq aligned.sam reads.fastq
 brust convert bam-to-fastq aligned.bam reads.fastq
 brust convert bam-to-fastq aligned.bam reads.fastq.gz
 ```
+
+`sam-to-fastq` and `bam-to-fastq` write reverse-strand reads in their original
+orientation, skip secondary and supplementary records, and leave read names
+unchanged. Unmapped, QC-fail and duplicate records are still written. Output
+differs from 0.1.x for inputs with reverse-strand, secondary or supplementary
+records.
 
 Conversions stream records and write through a temporary output path before
 renaming, so an existing output file is not replaced by a partial file when
@@ -159,13 +166,15 @@ same domain error as the inner `InvalidData` error when possible.
 - `brust-sam`: SAM reader, writer, flags, CIGAR, and optional fields.
 - `brust-bam`: BAM/BGZF reader, writer, virtual offsets, and SAM conversion.
 - `brust-pod5`: POD5 metadata, reads, signal rows, and VBZ helpers.
+- `brust-seq`: IUPAC reverse complement and matching, codon translation, and
+  Phred means.
 
 Direct subcrate dependencies use the published package names, while Rust import
 paths use underscores:
 
 ```toml
 [dependencies]
-brust-fasta = "0.1.1"
+brust-fasta = "0.2.0"
 ```
 
 ```rust

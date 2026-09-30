@@ -29,6 +29,51 @@ fn stats_cli_prints_human_readable_summary() {
 }
 
 #[test]
+fn stats_cli_prints_per_read_qscore() {
+    let output = brust()
+        .args([
+            "stats",
+            "fastq",
+            common::fixture("fastq/UDP0057_sub100.fastq")
+                .to_str()
+                .unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("per_read_qscore:"));
+
+    // An empty FASTQ also succeeds, with an empty qscore summary.
+    let temp = common::TempDir::new("cli-qscore-empty");
+    let empty = temp.join("empty.fastq");
+    fs::write(&empty, "").unwrap();
+    let output = brust()
+        .args(["stats", "fastq", empty.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let block = stdout
+        .split("  per_read_qscore:\n")
+        .nth(1)
+        .expect("per_read_qscore block");
+    let block: Vec<&str> = block.lines().take(5).collect();
+    assert_eq!(
+        block,
+        [
+            "    count: 0",
+            "    non_finite_count: 0",
+            "    min: -",
+            "    max: -",
+            "    mean: -",
+        ]
+    );
+}
+
+#[test]
 fn validate_cli_reports_structured_errors_and_nonzero_exit() {
     let temp = common::TempDir::new("cli-validate");
     let input = temp.join("bad.fastq");

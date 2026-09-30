@@ -266,6 +266,32 @@ impl SamRecord {
         self.flag & flags::SUPPLEMENTARY != 0
     }
 
+    /// Returns SEQ in its original sequencing orientation.
+    ///
+    /// A record on the reverse strand (flag `0x10`) stores SEQ reverse-complemented, so this
+    /// reverse-complements it back. Case and the gap symbols `-` and `.` are kept, `U` becomes
+    /// `A`, and any other byte that is not an IUPAC nucleotide code becomes `N`. See
+    /// [`seq::complement`] for the exact rules. Any other record's SEQ is returned unchanged,
+    /// and `*` stays `*`.
+    pub fn original_seq(&self) -> String {
+        if !self.is_reverse_complemented() || self.seq == "*" {
+            return self.seq.clone();
+        }
+        String::from_utf8(seq::reverse_complement(self.seq.as_bytes()))
+            .expect("reverse_complement output is ASCII")
+    }
+
+    /// Returns QUAL in its original sequencing orientation.
+    ///
+    /// A record on the reverse strand (flag `0x10`) stores QUAL reversed, so this reverses it
+    /// back. Any other record's QUAL is returned unchanged, and `*` stays `*`.
+    pub fn original_qual(&self) -> String {
+        if !self.is_reverse_complemented() || self.qual == "*" {
+            return self.qual.clone();
+        }
+        self.qual.chars().rev().collect()
+    }
+
     /// Returns the optional field matching `tag`, if present.
     pub fn aux(&self, tag: &str) -> Option<&SamOptionalValue> {
         self.optional
@@ -1587,5 +1613,72 @@ mod sam_tests {
         assert!(record.is_filtered());
         assert!(record.is_duplicate());
         assert!(record.is_supplementary());
+    }
+
+    fn record_with(flag: u16, seq: &str, qual: &str) -> SamRecord {
+        SamRecord::new(
+            "r1".to_string(),
+            flag,
+            "*".to_string(),
+            0,
+            0,
+            "*".to_string(),
+            "*".to_string(),
+            0,
+            0,
+            seq.to_string(),
+            qual.to_string(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn original_orientation_leaves_forward_records_unchanged() {
+        let record = record_with(0, "ACgtN", "!#%'+");
+
+        assert_eq!(record.original_seq(), "ACgtN");
+        assert_eq!(record.original_qual(), "!#%'+");
+    }
+
+    #[test]
+    fn original_orientation_reverses_reverse_strand_records() {
+        let record = record_with(flags::REVERSE_COMPLEMENTED, "AACGr", "!#%')");
+
+        assert_eq!(record.original_seq(), "yCGTT");
+        assert_eq!(record.original_qual(), ")'%#!");
+        // The record itself is not modified.
+        assert_eq!(record.seq, "AACGr");
+        assert_eq!(record.qual, "!#%')");
+    }
+
+    #[test]
+    fn original_orientation_keeps_star() {
+        let record = record_with(flags::REVERSE_COMPLEMENTED, "*", "*");
+
+        assert_eq!(record.original_seq(), "*");
+        assert_eq!(record.original_qual(), "*");
+    }
+
+    #[test]
+    fn original_orientation_handles_star_qual_with_sequence() {
+        let record = record_with(flags::REVERSE_COMPLEMENTED, "AACG", "*");
+
+        assert_eq!(record.original_seq(), "CGTT");
+        assert_eq!(record.original_qual(), "*");
+    }
+
+    #[test]
+    fn original_orientation_ignores_other_flag_bits() {
+        let forward = record_with(flags::SECONDARY | flags::DUPLICATE, "AACG", "!#%'");
+        let reverse = record_with(
+            flags::SECONDARY | flags::REVERSE_COMPLEMENTED,
+            "AACG",
+            "!#%'",
+        );
+
+        assert_eq!(forward.original_seq(), "AACG");
+        assert_eq!(forward.original_qual(), "!#%'");
+        assert_eq!(reverse.original_seq(), "CGTT");
+        assert_eq!(reverse.original_qual(), "'%#!");
     }
 }

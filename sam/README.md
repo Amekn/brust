@@ -23,6 +23,9 @@ use brust_sam::SamReader;
 - `Sam`: materialized SAM payload with header and records.
 - `SamHeader`, `SamHeaderRecord`, `SamHeaderField`: parsed header data.
 - `SamRecord`: mandatory fields plus parsed optional fields.
+  `SamRecord::original_seq` and `SamRecord::original_qual` return SEQ and QUAL
+  in the original sequencing orientation: reverse-complemented and reversed for
+  reverse-strand records (flag `0x10`), unchanged otherwise.
 - `SamOptionalValue` and `SamOptionalArray`: optional `TAG:TYPE:VALUE` data.
 - `flags`: standard SAM bit flags.
 
