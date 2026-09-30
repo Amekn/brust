@@ -12,8 +12,8 @@ pub mod validate;
 
 /// Re-export of the BAM format crate.
 pub use bam;
-/// Shared Brust compression, diagnostic, error, format, and result types.
-pub use brust_core::{Compression, Diagnostic, Error, Format, Result};
+/// Shared Brust atomic file, compression, diagnostic, error, format, and result types.
+pub use brust_core::{AtomicFile, Compression, Diagnostic, Error, Format, Result};
 /// Supported conversion paths and conversion options.
 pub use convert::{Conversion, ConvertOptions};
 /// Re-export of the FASTA format crate.

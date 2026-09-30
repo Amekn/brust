@@ -43,3 +43,15 @@ fn facade_reexports_seq_helpers() {
     assert_eq!(seq::reverse_complement(b"AACG"), b"CGTT");
     assert_eq!(seq::translate(b"ATG"), b"M");
 }
+
+#[test]
+fn atomic_file_is_reexported() {
+    use std::io::Write;
+
+    let path = std::env::temp_dir().join(format!("brust-facade-atomic-{}.txt", std::process::id()));
+    let mut file = brust::AtomicFile::create(&path).unwrap();
+    file.write_all(b"atomic\n").unwrap();
+    file.commit().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"atomic\n");
+    std::fs::remove_file(&path).unwrap();
+}
