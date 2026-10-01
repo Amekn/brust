@@ -12,4 +12,4 @@ keywords = ["bioinformatics", "fasta", "sequence", "genomics", "parser"]
 categories = ["science::bioinformatics", "science::bioinformatics::sequence-analysis", "parser-implementations"]
 
 [dependencies]
-brust-core = { path = "../brust-core", version = "0.3.0" }
+brust-core = { path = "../brust-core", version = "0.3.1" }

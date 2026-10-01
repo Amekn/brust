@@ -12,11 +12,11 @@ keywords = ["bioinformatics", "fasta", "fastq", "bam", "pod5"]
 categories = ["science::bioinformatics", "science::bioinformatics::genomics", "command-line-utilities", "parser-implementations"]
 
 [dependencies]
-brust-core = { path = "../brust-core", version = "0.3.0" }
-fasta = { package = "brust-fasta", path = "../fasta", version = "0.3.0" }
-sam = { package = "brust-sam", path = "../sam", version = "0.3.0" }
-bam = { package = "brust-bam", path = "../bam", version = "0.3.0" }
-fastq = { package = "brust-fastq", path = "../fastq", version = "0.3.0" }
-pod5 = { package = "brust-pod5", path = "../pod5", version = "0.3.0" }
-seq = { package = "brust-seq", path = "../seq", version = "0.3.0" }
+brust-core = { path = "../brust-core", version = "0.3.1" }
+fasta = { package = "brust-fasta", path = "../fasta", version = "0.3.1" }
+sam = { package = "brust-sam", path = "../sam", version = "0.3.1" }
+bam = { package = "brust-bam", path = "../bam", version = "0.3.1" }
+fastq = { package = "brust-fastq", path = "../fastq", version = "0.3.1" }
+pod5 = { package = "brust-pod5", path = "../pod5", version = "0.3.1" }
+seq = { package = "brust-seq", path = "../seq", version = "0.3.1" }
 clap = { version = "4.6.1", features = ["derive"] }
