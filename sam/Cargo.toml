@@ -8,9 +8,9 @@ repository.workspace = true
 license.workspace = true
 readme = "README.md"
 description = "SAM reader, writer, parser validation, and flag helpers for Brust."
-keywords.workspace = true
-categories.workspace = true
+keywords = ["bioinformatics", "sam", "alignment", "cigar", "genomics"]
+categories = ["science::bioinformatics", "science::bioinformatics::genomics", "parser-implementations"]
 
 [dependencies]
-brust-core = { path = "../brust-core", version = "0.3.0" }
-seq = { package = "brust-seq", path = "../seq", version = "0.3.0" }
+brust-core = { path = "../brust-core", version = "0.3.1" }
+seq = { package = "brust-seq", path = "../seq", version = "0.3.1" }

@@ -8,8 +8,8 @@ repository.workspace = true
 license.workspace = true
 readme = "README.md"
 description = "FASTA reader and writer primitives for Brust."
-keywords.workspace = true
-categories.workspace = true
+keywords = ["bioinformatics", "fasta", "sequence", "genomics", "parser"]
+categories = ["science::bioinformatics", "science::bioinformatics::sequence-analysis", "parser-implementations"]
 
 [dependencies]
-brust-core = { path = "../brust-core", version = "0.3.0" }
+brust-core = { path = "../brust-core", version = "0.3.1" }

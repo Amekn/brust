@@ -8,13 +8,13 @@ repository.workspace = true
 license.workspace = true
 readme = "README.md"
 description = "POD5 reader, writer, signal extraction, and metadata summaries for Brust."
-keywords.workspace = true
-categories.workspace = true
+keywords = ["bioinformatics", "pod5", "nanopore", "arrow", "signal"]
+categories = ["science::bioinformatics", "parser-implementations"]
 
 [dependencies]
 arrow-array = "58.3.0"
 arrow-ipc = "58.3.0"
 arrow-schema = "58.3.0"
-brust-core = { path = "../brust-core", version = "0.3.0" }
+brust-core = { path = "../brust-core", version = "0.3.1" }
 flatbuffers = "25.12.19"
 zstd = { version = "0.13", default-features = false }

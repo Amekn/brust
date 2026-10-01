@@ -8,7 +8,7 @@ repository.workspace = true
 license.workspace = true
 readme = "README.md"
 description = "Shared error and result types and atomic file output for Brust bioinformatics format crates."
-keywords.workspace = true
-categories.workspace = true
+keywords = ["bioinformatics", "error-handling", "diagnostics", "atomic-write", "file-format"]
+categories = ["science::bioinformatics", "filesystem"]
 
 [dependencies]
