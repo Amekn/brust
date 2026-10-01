@@ -8,8 +8,8 @@ repository.workspace = true
 license.workspace = true
 readme = "README.md"
 description = "POD5 reader, writer, signal extraction, and metadata summaries for Brust."
-keywords.workspace = true
-categories.workspace = true
+keywords = ["bioinformatics", "pod5", "nanopore", "arrow", "signal"]
+categories = ["science::bioinformatics", "parser-implementations"]
 
 [dependencies]
 arrow-array = "58.3.0"

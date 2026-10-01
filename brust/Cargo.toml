@@ -8,8 +8,8 @@ repository.workspace = true
 license.workspace = true
 readme = "README.md"
 description = "Public facade for Brust bioinformatics format readers, writers, and conversion helpers."
-keywords.workspace = true
-categories.workspace = true
+keywords = ["bioinformatics", "fasta", "fastq", "bam", "pod5"]
+categories = ["science::bioinformatics", "science::bioinformatics::genomics", "command-line-utilities", "parser-implementations"]
 
 [dependencies]
 brust-core = { path = "../brust-core", version = "0.3.0" }

@@ -9,5 +9,3 @@ rust-version = "1.96"
 authors = ["Kang Zhou"]
 repository = "https://github.com/Amekn/brust"
 license = "MIT OR Apache-2.0"
-keywords = ["bioinformatics", "fasta", "fastq", "sam", "bam"]
-categories = ["science::bioinformatics", "parser-implementations"]

@@ -8,8 +8,8 @@ repository.workspace = true
 license.workspace = true
 readme = "README.md"
 description = "FASTQ reader, writer, and FASTA conversion helpers for Brust."
-keywords.workspace = true
-categories.workspace = true
+keywords = ["bioinformatics", "fastq", "sequencing", "phred", "gzip"]
+categories = ["science::bioinformatics", "science::bioinformatics::sequence-analysis", "parser-implementations"]
 
 [dependencies]
 brust-core = { path = "../brust-core", version = "0.3.0" }
