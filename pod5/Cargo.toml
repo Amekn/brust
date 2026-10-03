@@ -15,6 +15,10 @@ categories = ["science::bioinformatics", "parser-implementations"]
 arrow-array = "58.3.0"
 arrow-ipc = "58.3.0"
 arrow-schema = "58.3.0"
-brust-core = { path = "../brust-core", version = "0.3.1" }
+brust-core = { path = "../brust-core", version = "0.4.0" }
 flatbuffers = "25.12.19"
 zstd = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+# Lets tests write zstd-compressed Arrow bodies, which the reader must reject.
+arrow-ipc = { version = "58.3.0", features = ["zstd"] }

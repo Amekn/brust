@@ -18,12 +18,12 @@
 
 use arrow_array::builder::{
     FixedSizeBinaryBuilder, LargeBinaryBuilder, ListBuilder, MapBuilder, StringBuilder,
-    StringDictionaryBuilder, TimestampMillisecondBuilder, UInt64Builder,
+    StringDictionaryBuilder, UInt64Builder,
 };
 use arrow_array::types::Int16Type;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, DictionaryArray, FixedSizeBinaryArray, Float32Array, Int16Array,
-    LargeBinaryArray, LargeListArray, ListArray, RecordBatch, StringArray,
+    LargeBinaryArray, LargeListArray, ListArray, MapArray, RecordBatch, StringArray,
     TimestampMillisecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_ipc::reader::FileReader;
@@ -34,7 +34,7 @@ use brust_core::{AtomicFile, Error, Format};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -98,13 +98,6 @@ pub const RUN_INFO_TABLE_FIELDS: &[&str] = &[
     "tracking_id",
 ];
 
-type ParsedPod5 = (
-    Pod5Header,
-    Vec<Pod5RunInfo>,
-    Vec<Pod5Signal>,
-    Vec<Pod5Record>,
-);
-
 /// A fully materialized POD5 payload.
 ///
 /// `Pod5` owns its header, run-info rows, and all parsed read records, so
@@ -140,16 +133,27 @@ pub struct Pod5Reader<R: Read + Seek = File> {
     read_reader: Option<FileReader<SectionReader<R>>>,
     read_buffer: VecDeque<Pod5Record>,
     signal_cursor: Pod5SignalCursor<R>,
+    // Samples of the last read served by `signal_for_record`, so asking for the
+    // same read again doesn't read its batch again. One read, not the file.
+    last_signal: Option<LastSignal>,
+}
+
+struct LastSignal {
+    read_id: String,
+    signal_rows: Vec<u64>,
+    samples: Vec<i16>,
 }
 
 /// POD5 file writer over any writable byte stream.
 ///
-/// POD5 is a container of Arrow IPC files plus a footer, so this writer emits a
-/// complete materialized [`Pod5`] value at a time rather than streaming
-/// individual reads. Missing writer metadata is filled with deterministic
-/// defaults.
+/// POD5 is a container of Arrow IPC files plus a footer, so this writer emits
+/// one complete materialized [`Pod5`] payload rather than streaming individual
+/// reads. The Signal table is written a batch at a time, not built in memory
+/// first. Missing writer metadata is filled with deterministic defaults.
 pub struct Pod5Writer<W: Write = File> {
     writer: W,
+    // A POD5 file holds exactly one payload; a second one would corrupt it.
+    payload_written: bool,
 }
 
 /// High-level counts and rollups for a POD5 payload.
@@ -223,6 +227,9 @@ pub struct Pod5Header {
     /// `MINKNOW:software` Arrow schema metadata, when present.
     pub software: Option<String>,
     /// `MINKNOW:pod5_version` Arrow schema metadata, when present.
+    ///
+    /// Writers stamp this version (`0.3.34` when `None`) and write the Reads
+    /// columns it requires: `open_pore_level` from 0.3.30 on.
     pub pod5_version: Option<String>,
 }
 
@@ -256,7 +263,7 @@ pub enum Pod5SectionKind {
     Unknown,
 }
 
-/// Selected fields from a POD5 Run Info table row.
+/// A POD5 Run Info table row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pod5RunInfo {
     /// Acquisition/run identifier.
@@ -273,6 +280,32 @@ pub struct Pod5RunInfo {
     pub sample_rate: u16,
     /// MinKNOW/software string from the row.
     pub software: String,
+    /// Acquisition start, in milliseconds since the Unix epoch (UTC).
+    pub acquisition_start_time: i64,
+    /// Maximum ADC value.
+    pub adc_max: i16,
+    /// Minimum ADC value.
+    pub adc_min: i16,
+    /// MinKNOW context tags, as key/value pairs in file order.
+    pub context_tags: Vec<(String, String)>,
+    /// Flow-cell product code, such as `FLO-MIN114`.
+    pub flow_cell_product_code: String,
+    /// Sequencing protocol name.
+    pub protocol_name: String,
+    /// Protocol run identifier.
+    pub protocol_run_id: String,
+    /// Protocol start, in milliseconds since the Unix epoch (UTC).
+    pub protocol_start_time: i64,
+    /// Sequencer position, such as a device or flow-cell slot name.
+    pub sequencer_position: String,
+    /// Sequencer position type, such as `MinION Mk1B`.
+    pub sequencer_position_type: String,
+    /// Host system name.
+    pub system_name: String,
+    /// Host system type.
+    pub system_type: String,
+    /// MinKNOW tracking ID, as key/value pairs in file order.
+    pub tracking_id: Vec<(String, String)>,
 }
 
 /// A POD5 Reads table row.
@@ -320,6 +353,9 @@ pub struct Pod5Record {
     pub end_reason_forced: bool,
     /// Run Info acquisition identifier referenced by this read.
     pub run_info: String,
+    /// Open pore level, or `None` when unknown. Files older than POD5 0.3.30
+    /// have no such column; a stored NaN also reads as `None`.
+    pub open_pore_level: Option<f32>,
 }
 
 /// A POD5 Signal table row.
@@ -355,27 +391,24 @@ impl Pod5 {
     /// Materializes a POD5 byte stream into memory.
     ///
     /// Non-seekable streams cannot use the POD5 footer for section offsets, so
-    /// this compatibility API buffers the input before parsing. Use
-    /// [`Pod5Reader::from_reader`] for seekable streaming reads.
+    /// this compatibility API buffers the input, then parses it exactly as
+    /// [`Pod5::from_path`] does. Use [`Pod5Reader::from_reader`] for seekable
+    /// streaming reads.
     pub fn from_reader<R: Read>(reader: R) -> io::Result<Self> {
         let mut data = Vec::new();
         let mut reader = reader;
         reader.read_to_end(&mut data)?;
-        let (header, run_infos, signals, records) = parse_pod5(&data)?;
-
-        Ok(Self {
-            header,
-            run_infos,
-            signals,
-            records,
-        })
+        Pod5Reader::from_reader(Cursor::new(data))?.read_all()
     }
 
     /// Writes this POD5 payload to a filesystem path.
+    ///
+    /// The payload is validated before the file is opened, so an invalid
+    /// payload leaves an existing file untouched. A failed write can still
+    /// leave a partial file; use [`Pod5::to_path_atomic`] to avoid that.
     pub fn to_path<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
-        let mut writer = Pod5Writer::from_path(path)?;
-        writer.write_all(self)?;
-        writer.flush()
+        let prepared = prepare_pod5(self)?;
+        prepared.write_to(File::create(path)?)
     }
 
     /// Writes this POD5 payload to a filesystem path atomically.
@@ -430,8 +463,13 @@ impl Pod5 {
     }
 
     /// Returns the sum of `num_samples` across all reads.
+    ///
+    /// The counts come from the file, so the sum saturates at `u64::MAX`
+    /// rather than overflowing; so do the per-channel and per-run sums.
     pub fn total_samples(&self) -> u64 {
-        self.records.iter().map(|record| record.num_samples).sum()
+        self.records.iter().fold(0u64, |total, record| {
+            total.saturating_add(record.num_samples)
+        })
     }
 
     /// Returns per-channel read and sample summaries sorted by channel.
@@ -440,7 +478,7 @@ impl Pod5 {
         for record in &self.records {
             let entry = counts.entry(record.channel).or_default();
             entry.0 += 1;
-            entry.1 += record.num_samples;
+            entry.1 = entry.1.saturating_add(record.num_samples);
         }
 
         let mut summaries = counts
@@ -461,7 +499,7 @@ impl Pod5 {
         for record in &self.records {
             let entry = counts.entry(record.run_info.as_str()).or_default();
             entry.0 += 1;
-            entry.1 += record.num_samples;
+            entry.1 = entry.1.saturating_add(record.num_samples);
         }
 
         self.run_infos
@@ -523,7 +561,7 @@ impl<R: Read + Seek> Pod5Reader<R> {
     /// Signal rows are loaded batch-by-batch on demand.
     pub fn from_reader(reader: R) -> io::Result<Self> {
         let shared = Rc::new(RefCell::new(reader));
-        let (header, run_infos) = inspect_pod5(shared.clone())?;
+        let (header, run_infos, section_batch_rows) = inspect_pod5(shared.clone())?;
         let read_sections = header
             .sections
             .iter()
@@ -536,7 +574,16 @@ impl<R: Read + Seek> Pod5Reader<R> {
             .filter(|section| section.kind == Pod5SectionKind::Signal)
             .cloned()
             .collect::<Vec<_>>();
-        let signal_cursor = Pod5SignalCursor::new(shared.clone(), signal_sections.clone());
+        let signal_cursor = Pod5SignalCursor::new(
+            shared.clone(),
+            header
+                .sections
+                .iter()
+                .zip(section_batch_rows)
+                .filter(|(section, _)| section.kind == Pod5SectionKind::Signal)
+                .map(|(section, batch_rows)| (section.clone(), batch_rows))
+                .collect(),
+        );
 
         Ok(Self {
             header,
@@ -548,6 +595,7 @@ impl<R: Read + Seek> Pod5Reader<R> {
             read_reader: None,
             read_buffer: VecDeque::new(),
             signal_cursor,
+            last_signal: None,
         })
     }
 
@@ -581,22 +629,38 @@ impl<R: Read + Seek> Pod5Reader<R> {
 
     /// Decompresses and concatenates the signal rows referenced by `record`.
     ///
-    /// Signal rows are read lazily from the Signal table. Sequential reads are
-    /// served with a forward cursor; if a record references an earlier Signal
-    /// row, the Signal cursor is restarted and advanced to that row. Once a row
-    /// has been decompressed, its samples are cached for later requests.
+    /// Signal rows are read lazily from the Signal table, one Arrow batch at a
+    /// time: a row is found from the batch row counts in the file's Arrow
+    /// metadata, so reads can be asked for in any order without reading the
+    /// batches before them. Only the last read's samples are kept, so memory
+    /// stays bounded while streaming and asking for the same read twice doesn't
+    /// re-read the file.
     pub fn signal_for_record(&mut self, record: &Pod5Record) -> io::Result<Vec<i16>> {
         let total = usize::try_from(record.num_samples)
             .map_err(|_| invalid_data("POD5 read sample count exceeds usize"))?;
-        let mut samples = Vec::with_capacity(total);
-
-        for &index in &record.signal_rows {
-            let signal = self.signal_cursor.signal_samples_at(index)?;
-            if signal.read_id != record.read_id {
-                return Err(invalid_data("POD5 signal row read_id does not match read"));
+        let samples = match &self.last_signal {
+            Some(last)
+                if last.read_id == record.read_id && last.signal_rows == record.signal_rows =>
+            {
+                last.samples.clone()
             }
-            samples.extend_from_slice(&signal.samples);
-        }
+            _ => {
+                let mut samples = Vec::new();
+                for &index in &record.signal_rows {
+                    let signal = self.signal_cursor.signal_row_at(index)?;
+                    if signal.read_id != record.read_id {
+                        return Err(invalid_data("POD5 signal row read_id does not match read"));
+                    }
+                    samples.extend(signal.decompress()?);
+                }
+                self.last_signal = Some(LastSignal {
+                    read_id: record.read_id.clone(),
+                    signal_rows: record.signal_rows.clone(),
+                    samples: samples.clone(),
+                });
+                samples
+            }
+        };
 
         if samples.len() != total {
             return Err(invalid_data(
@@ -631,9 +695,8 @@ impl<R: Read + Seek> Pod5Reader<R> {
     fn next_reads_batch(&mut self) -> io::Result<Option<RecordBatch>> {
         loop {
             if let Some(reader) = &mut self.read_reader {
-                match reader.next() {
-                    Some(Ok(batch)) => return Ok(Some(batch)),
-                    Some(Err(error)) => return Err(arrow_error(error)),
+                match arrow_call(|| reader.next().transpose())? {
+                    Some(batch) => return Ok(Some(batch)),
                     None => {
                         self.read_reader = None;
                         self.read_section_index += 1;
@@ -648,11 +711,14 @@ impl<R: Read + Seek> Pod5Reader<R> {
     }
 
     fn read_all_signals_from_start(&self) -> io::Result<Vec<Pod5Signal>> {
-        let mut cursor = Pod5SignalCursor::new(self.shared.clone(), self.signal_sections.clone());
-        let mut signals = Vec::with_capacity(self.header.signal_count());
+        // The declared count comes from the file, so let the vector grow.
+        let mut signals = Vec::new();
 
-        while let Some(signal) = cursor.read_next_signal()? {
-            signals.push(signal);
+        for section in &self.signal_sections {
+            let mut reader = open_arrow_reader(self.shared.clone(), section)?;
+            while let Some(batch) = arrow_call(|| reader.next().transpose())? {
+                signals.extend(parse_signal_batch(&batch)?);
+            }
         }
 
         Ok(signals)
@@ -689,8 +755,16 @@ impl Pod5Writer<AtomicFile> {
 
     /// Flushes, syncs and renames the output into place.
     ///
-    /// See [`AtomicFile::commit`] for the exact steps and errors.
+    /// Returns an [`io::ErrorKind::InvalidInput`] error and publishes nothing
+    /// if no payload was written, since an empty file is not a valid POD5. See
+    /// [`AtomicFile::commit`] for the exact steps and errors.
     pub fn commit(self) -> io::Result<()> {
+        if !self.payload_written {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "POD5 writer has no payload to commit",
+            ));
+        }
         self.into_inner().commit()
     }
 }
@@ -698,17 +772,34 @@ impl Pod5Writer<AtomicFile> {
 impl<W: Write> Pod5Writer<W> {
     /// Creates a POD5 writer from a writable byte stream.
     pub fn from_writer(writer: W) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            payload_written: false,
+        }
     }
 
     /// Writes a complete materialized POD5 payload.
     ///
-    /// The writer validates UUIDs, signal row references, read sample counts,
-    /// and run-info references before encoding Arrow sections and the POD5
-    /// footer.
+    /// Before writing anything, the writer checks UUIDs and header metadata,
+    /// that every signal row decodes to its declared `samples` (VBZ rows are
+    /// decompressed to check), that each read's signal rows exist and carry
+    /// the read's ID, read sample counts, end reasons, and run-info
+    /// references. Signal rows are then written in Arrow batches of 100 rows,
+    /// as official POD5 writers do. A POD5 file holds one payload, so a second
+    /// call returns an [`io::ErrorKind::InvalidInput`] error without writing
+    /// anything.
     pub fn write_all(&mut self, pod5: &Pod5) -> io::Result<()> {
-        let data = encode_pod5(pod5)?;
-        self.writer.write_all(&data)
+        if self.payload_written {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "POD5 writer already wrote a payload; a POD5 file holds one payload",
+            ));
+        }
+        let prepared = prepare_pod5(pod5)?;
+        // Set before writing: after a failed write the output is already
+        // partial, and appending another payload would not repair it.
+        self.payload_written = true;
+        prepared.write_to(&mut self.writer)
     }
 
     /// Writes a complete materialized POD5 payload.
@@ -737,7 +828,7 @@ impl Pod5Record {
     pub fn signal(&self, signals: &[Pod5Signal]) -> io::Result<Vec<i16>> {
         let total = usize::try_from(self.num_samples)
             .map_err(|_| invalid_data("POD5 read sample count exceeds usize"))?;
-        let mut samples = Vec::with_capacity(total);
+        let mut samples = Vec::new();
 
         for &index in &self.signal_rows {
             let signal = signals
@@ -818,7 +909,7 @@ impl<'a> Pod5SignalCache<'a> {
     pub fn signal_for_record(&self, record: &Pod5Record) -> io::Result<Vec<i16>> {
         let total = usize::try_from(record.num_samples)
             .map_err(|_| invalid_data("POD5 read sample count exceeds usize"))?;
-        let mut samples = Vec::with_capacity(total);
+        let mut samples = Vec::new();
 
         for &row in &record.signal_rows {
             let signal = self
@@ -946,103 +1037,155 @@ impl<R: Read + Seek> Seek for SectionReader<R> {
     }
 }
 
+/// Random access to Signal table rows.
+///
+/// Every Signal batch's row count, read from the Arrow block metadata when the
+/// file was opened, maps a row number to its batch, so the cursor reads only
+/// that batch. Rows are handed out once: the batch read last keeps the rows
+/// not yet handed out, so reading on through it, or back to one of those rows,
+/// doesn't read the file again, and it is dropped once all are handed out.
 struct Pod5SignalCursor<R: Read + Seek> {
     shared: SharedReader<R>,
     sections: Vec<Pod5Section>,
-    section_index: usize,
-    reader: Option<FileReader<SectionReader<R>>>,
-    buffer: VecDeque<Pod5Signal>,
-    decoded_cache: HashMap<u64, CachedSignalSamples>,
-    next_row: u64,
+    /// Every Signal batch, in row order.
+    batches: Vec<SignalBatch>,
+    /// An Arrow reader and the index of the section it reads.
+    reader: Option<(usize, FileReader<SectionReader<R>>)>,
+    loaded: Option<LoadedSignalBatch>,
 }
 
-#[derive(Clone)]
-struct CachedSignalSamples {
-    read_id: String,
-    samples: Vec<i16>,
+/// The rows of the batch read last that haven't been handed out yet.
+struct LoadedSignalBatch {
+    /// The batch's index in `Pod5SignalCursor::batches`.
+    number: usize,
+    rows: Vec<Option<Pod5Signal>>,
+    /// How many of `rows` are still `Some`.
+    remaining: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SignalBatch {
+    /// Index of the batch's section in `Pod5SignalCursor::sections`.
+    section: usize,
+    /// Index of the batch within its section.
+    index: usize,
+    first_row: u64,
+    rows: u64,
 }
 
 impl<R: Read + Seek> Pod5SignalCursor<R> {
-    fn new(shared: SharedReader<R>, sections: Vec<Pod5Section>) -> Self {
+    /// Takes the Signal sections in file order with their batch row counts.
+    fn new(shared: SharedReader<R>, sections: Vec<(Pod5Section, Vec<usize>)>) -> Self {
+        let mut batches = Vec::new();
+        let mut first_row = 0u64;
+        for (section, (_, batch_rows)) in sections.iter().enumerate() {
+            for (index, &rows) in batch_rows.iter().enumerate() {
+                let rows = rows as u64;
+                batches.push(SignalBatch {
+                    section,
+                    index,
+                    first_row,
+                    rows,
+                });
+                // Row counts are bounded by the bytes in the file.
+                first_row = first_row.saturating_add(rows);
+            }
+        }
+
         Self {
             shared,
-            sections,
-            section_index: 0,
+            sections: sections.into_iter().map(|(section, _)| section).collect(),
+            batches,
             reader: None,
-            buffer: VecDeque::new(),
-            decoded_cache: HashMap::new(),
-            next_row: 0,
+            loaded: None,
         }
     }
 
-    fn restart(&mut self) {
-        self.section_index = 0;
-        self.reader = None;
-        self.buffer.clear();
-        self.next_row = 0;
-    }
-
+    /// Returns Signal row `row`, reading only the batch that holds it.
+    ///
+    /// Asking for a row in a batch whose rows fail to parse returns the parse
+    /// error; rows in other batches are unaffected.
     fn signal_row_at(&mut self, row: u64) -> io::Result<Pod5Signal> {
-        if row < self.next_row {
-            self.restart();
-        }
+        // The last batch starting at or before `row`; empty batches share the
+        // next batch's first row, so they are never picked for a row inside it.
+        let number = self
+            .batches
+            .partition_point(|batch| batch.first_row <= row)
+            .checked_sub(1)
+            .filter(|&number| row - self.batches[number].first_row < self.batches[number].rows)
+            .ok_or_else(|| invalid_data("POD5 signal row index is out of bounds"))?;
+        let batch = self.batches[number];
+        let offset = (row - batch.first_row) as usize;
 
-        while let Some(signal) = self.read_next_signal()? {
-            let index = self.next_row - 1;
-            if index == row {
-                return Ok(signal);
-            }
-        }
-
-        Err(invalid_data("POD5 signal row index is out of bounds"))
-    }
-
-    fn signal_samples_at(&mut self, row: u64) -> io::Result<CachedSignalSamples> {
-        if let Some(cached) = self.decoded_cache.get(&row) {
-            return Ok(cached.clone());
-        }
-
-        let signal = self.signal_row_at(row)?;
-        let samples = signal.decompress()?;
-        let cached = CachedSignalSamples {
-            read_id: signal.read_id,
-            samples,
-        };
-        self.decoded_cache.insert(row, cached.clone());
-        Ok(cached)
-    }
-
-    fn read_next_signal(&mut self) -> io::Result<Option<Pod5Signal>> {
-        loop {
-            if let Some(signal) = self.buffer.pop_front() {
-                self.next_row += 1;
-                return Ok(Some(signal));
-            }
-
-            let Some(batch) = self.next_signal_batch()? else {
-                return Ok(None);
-            };
-            self.buffer.extend(parse_signal_batch(&batch)?);
-        }
-    }
-
-    fn next_signal_batch(&mut self) -> io::Result<Option<RecordBatch>> {
-        loop {
-            if let Some(reader) = &mut self.reader {
-                match reader.next() {
-                    Some(Ok(batch)) => return Ok(Some(batch)),
-                    Some(Err(error)) => return Err(arrow_error(error)),
-                    None => {
-                        self.reader = None;
-                        self.section_index += 1;
-                    }
+        let kept = self
+            .loaded
+            .as_mut()
+            .filter(|loaded| loaded.number == number)
+            .and_then(|loaded| loaded.rows[offset].take());
+        let signal = match kept {
+            Some(signal) => {
+                if let Some(loaded) = &mut self.loaded {
+                    loaded.remaining -= 1;
                 }
-            } else if let Some(section) = self.sections.get(self.section_index) {
-                self.reader = Some(open_arrow_reader(self.shared.clone(), section)?);
-            } else {
-                return Ok(None);
+                signal
             }
+            None => {
+                self.loaded = None;
+                let mut rows = self
+                    .read_batch(batch)?
+                    .into_iter()
+                    .map(Some)
+                    .collect::<Vec<_>>();
+                let signal = rows[offset].take().expect("the row is in its batch");
+                self.loaded = Some(LoadedSignalBatch {
+                    number,
+                    remaining: rows.len() - 1,
+                    rows,
+                });
+                signal
+            }
+        };
+        if self
+            .loaded
+            .as_ref()
+            .is_some_and(|loaded| loaded.remaining == 0)
+        {
+            self.loaded = None;
         }
+        Ok(signal)
+    }
+
+    fn read_batch(&mut self, batch: SignalBatch) -> io::Result<Vec<Pod5Signal>> {
+        if self
+            .reader
+            .as_ref()
+            .is_none_or(|(section, _)| *section != batch.section)
+        {
+            self.reader = None;
+            let reader = open_arrow_reader(self.shared.clone(), &self.sections[batch.section])?;
+            self.reader = Some((batch.section, reader));
+        }
+        let (_, reader) = self.reader.as_mut().expect("the reader was just opened");
+        let record_batch = match arrow_call(|| {
+            reader.set_index(batch.index)?;
+            reader.next().transpose()
+        }) {
+            Ok(record_batch) => record_batch,
+            Err(error) => {
+                // The reader may be part-way through a failed read; reopen it.
+                self.reader = None;
+                return Err(error);
+            }
+        };
+        let record_batch =
+            record_batch.ok_or_else(|| invalid_data("POD5 Signal batch is missing"))?;
+        let signals = parse_signal_batch(&record_batch)?;
+        if signals.len() as u64 != batch.rows {
+            return Err(invalid_data(
+                "POD5 Signal batch row count disagrees with its block metadata",
+            ));
+        }
+        Ok(signals)
     }
 }
 
@@ -1050,12 +1193,27 @@ fn open_arrow_reader<R: Read + Seek>(
     shared: SharedReader<R>,
     section: &Pod5Section,
 ) -> io::Result<FileReader<SectionReader<R>>> {
-    FileReader::try_new(SectionReader::new(shared, section), None).map_err(arrow_error)
+    arrow_call(|| FileReader::try_new(SectionReader::new(shared, section), None))
 }
 
+/// Runs an arrow-ipc read on file data, turning a panic into `InvalidData`.
+///
+/// arrow-ipc panics instead of returning an error on some malformed schemas
+/// and buffers. [`validate_arrow_section`] rejects what would make it allocate
+/// without bound, since an aborted allocation can't be caught, and explains
+/// the common cases; this catches the rest.
+fn arrow_call<T>(read: impl FnOnce() -> Result<T, ArrowError>) -> io::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(read))
+        .map_err(|_| invalid_data("embedded Arrow data is malformed"))?
+        .map_err(arrow_error)
+}
+
+/// Reads and checks a POD5 file's wrapper, footer and embedded Arrow
+/// sections. Also returns each section's record batch row counts, in the
+/// order of `Pod5Header::sections` (none for the footer).
 fn inspect_pod5<R: Read + Seek>(
     shared: SharedReader<R>,
-) -> io::Result<(Pod5Header, Vec<Pod5RunInfo>)> {
+) -> io::Result<(Pod5Header, Vec<Pod5RunInfo>, Vec<Vec<usize>>)> {
     let file_len = shared.borrow_mut().seek(SeekFrom::End(0))?;
     if file_len < 8 + 16 + 8 + 16 + 8 {
         return Err(invalid_data("POD5 file is too short"));
@@ -1103,6 +1261,7 @@ fn inspect_pod5<R: Read + Seek>(
     let footer_padding = read_exact_at(shared.clone(), footer_payload_start, footer_len as usize)?;
     let footer = parse_pod5_footer(&footer_padding)?;
     let mut sections = Vec::with_capacity(footer.entries.len() + 1);
+    let mut section_batch_rows = Vec::with_capacity(footer.entries.len() + 1);
     let mut run_infos = Vec::new();
     let mut metadata = Pod5Metadata {
         file_identifier: footer.file_identifier.clone(),
@@ -1147,16 +1306,22 @@ fn inspect_pod5<R: Read + Seek>(
             }
         }
 
-        let mut arrow_reader = FileReader::try_new(
-            SectionReader {
-                reader: shared.clone(),
-                offset,
-                length,
-                position: 0,
-            },
-            None,
-        )
-        .map_err(arrow_error)?;
+        // arrow-ipc trusts the block table and panics or aborts on bad values,
+        // so check it before FileReader reads dictionary blocks.
+        let batch_rows = validate_arrow_section(shared.clone(), offset, length)?;
+        // validate_arrow_section checked that this sum fits.
+        let row_count = batch_rows.iter().sum();
+        let mut arrow_reader = arrow_call(|| {
+            FileReader::try_new(
+                SectionReader {
+                    reader: shared.clone(),
+                    offset,
+                    length,
+                    position: 0,
+                },
+                None,
+            )
+        })?;
         update_metadata(arrow_reader.custom_metadata(), &mut metadata)?;
         let schema = arrow_reader.schema();
         let kind = infer_section_kind(&schema);
@@ -1166,11 +1331,10 @@ fn inspect_pod5<R: Read + Seek>(
                 "POD5 footer content type does not match Arrow schema",
             ));
         }
-        let row_count = arrow_section_row_count(shared.clone(), offset, length)?;
 
         if kind == Pod5SectionKind::RunInfo {
-            for batch in &mut arrow_reader {
-                run_infos.extend(parse_run_info_batch(&batch.map_err(arrow_error)?)?);
+            while let Some(batch) = arrow_call(|| arrow_reader.next().transpose())? {
+                run_infos.extend(parse_run_info_batch(&batch)?);
             }
         }
 
@@ -1181,6 +1345,7 @@ fn inspect_pod5<R: Read + Seek>(
             padded_length,
             row_count,
         });
+        section_batch_rows.push(batch_rows);
     }
 
     sections.push(Pod5Section {
@@ -1190,6 +1355,7 @@ fn inspect_pod5<R: Read + Seek>(
         padded_length: final_marker_offset - footer_magic_start,
         row_count: 0,
     });
+    section_batch_rows.push(Vec::new());
 
     if sections
         .iter()
@@ -1219,7 +1385,7 @@ fn inspect_pod5<R: Read + Seek>(
         pod5_version: metadata.pod5_version,
     };
 
-    Ok((header, run_infos))
+    Ok((header, run_infos, section_batch_rows))
 }
 
 #[derive(Debug)]
@@ -1264,41 +1430,357 @@ fn section_kind_from_footer_content_type(content_type: i16) -> Pod5SectionKind {
     }
 }
 
-fn arrow_section_row_count<R: Read + Seek>(
+/// Checks an embedded Arrow file's footer blocks and the batch messages they
+/// point to, then returns each record batch's row count in footer order, the
+/// order arrow-ipc's `FileReader` reads them. Their sum fits in `usize`.
+///
+/// Every block must lie inside the section before the Arrow footer, every
+/// buffer inside its block's body, and node and row counts must be
+/// non-negative, with a record batch's first column as long as the batch.
+/// Buffers must be long enough for their columns' lengths (see
+/// [`ArrowBatchLayout`]), which bounds row counts by the bytes present; for
+/// that, the first column must have a layout whose buffers grow with its
+/// length (see [`column_bounds_its_length`]), and bodies must not be
+/// compressed.
+fn validate_arrow_section<R: Read + Seek>(
     shared: SharedReader<R>,
     offset: u64,
     length: u64,
-) -> io::Result<usize> {
+) -> io::Result<Vec<usize>> {
     let footer = read_arrow_footer(shared.clone(), offset, length)?;
+    // `read_arrow_footer` checked that the footer and its 10-byte trailer fit.
+    let data_end = length - 10 - footer.len() as u64;
     let footer = root_as_footer(&footer)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    let Some(blocks) = footer.recordBatches() else {
-        return Ok(0);
-    };
+    let schema_fields = footer
+        .schema()
+        .and_then(|schema| schema.fields())
+        .ok_or_else(|| invalid_data("Arrow footer is missing its schema"))?;
+    let dictionaries = footer.dictionaries().into_iter().flatten();
+    let record_batches = footer.recordBatches().into_iter().flatten();
 
     let mut total = 0usize;
-    for block in blocks {
-        let metadata_len = usize::try_from(block.metaDataLength())
-            .map_err(|_| invalid_data("Arrow block metadata length is negative"))?;
+    let mut batch_rows = Vec::new();
+    for (block, is_record_batch) in dictionaries
+        .map(|block| (block, false))
+        .chain(record_batches.map(|block| (block, true)))
+    {
         let block_offset = u64::try_from(block.offset())
             .map_err(|_| invalid_data("Arrow block offset is negative"))?;
-        let metadata = read_exact_at(shared.clone(), offset + block_offset, metadata_len)?;
-        let message = parse_arrow_message(&metadata)?;
-        if message.header_type() != MessageHeader::RecordBatch {
-            continue;
+        let metadata_len = u64::try_from(block.metaDataLength())
+            .map_err(|_| invalid_data("Arrow block metadata length is negative"))?;
+        let body_len = u64::try_from(block.bodyLength())
+            .map_err(|_| invalid_data("Arrow block body length is negative"))?;
+        let block_end = block_offset
+            .checked_add(metadata_len)
+            .and_then(|end| end.checked_add(body_len))
+            .ok_or_else(|| invalid_data("Arrow block length overflow"))?;
+        if block_end > data_end {
+            return Err(invalid_data("Arrow block extends past its section"));
         }
-        let header = message
-            .header()
-            .ok_or_else(|| invalid_data("Arrow record batch message is missing header"))?;
-        let batch = unsafe { arrow_ipc::RecordBatch::init_from_table(header) };
+
+        let metadata = read_exact_at(shared.clone(), offset + block_offset, metadata_len as usize)?;
+        let message = parse_arrow_message(&metadata)?;
+        let (batch, dictionary_field) = match message.header_type() {
+            MessageHeader::RecordBatch if is_record_batch => {
+                (message.header_as_record_batch(), None)
+            }
+            MessageHeader::DictionaryBatch if !is_record_batch => {
+                let dictionary = message
+                    .header_as_dictionary_batch()
+                    .ok_or_else(|| invalid_data("Arrow batch message is missing its header"))?;
+                let field = find_dictionary_field(schema_fields.iter(), dictionary.id())
+                    .ok_or_else(|| invalid_data("Arrow dictionary batch has no schema field"))?;
+                (dictionary.data(), Some(field))
+            }
+            _ => return Err(invalid_data("Arrow block holds an unexpected message")),
+        };
+        let batch =
+            batch.ok_or_else(|| invalid_data("Arrow batch message is missing its header"))?;
+
+        for buffer in batch.buffers().into_iter().flatten() {
+            let buffer_offset = u64::try_from(buffer.offset())
+                .map_err(|_| invalid_data("Arrow buffer offset is negative"))?;
+            let buffer_len = u64::try_from(buffer.length())
+                .map_err(|_| invalid_data("Arrow buffer length is negative"))?;
+            if buffer_offset
+                .checked_add(buffer_len)
+                .is_none_or(|end| end > body_len)
+            {
+                return Err(invalid_data("Arrow buffer extends past its block body"));
+            }
+        }
         let rows = usize::try_from(batch.length())
             .map_err(|_| invalid_data("Arrow record batch length is negative"))?;
-        total = total
-            .checked_add(rows)
-            .ok_or_else(|| invalid_data("Arrow record batch row count overflow"))?;
+        let nodes = batch.nodes().into_iter().flatten().collect::<Vec<_>>();
+        if nodes.iter().any(|node| {
+            node.length() < 0 || node.null_count() < 0 || node.null_count() > node.length()
+        }) {
+            return Err(invalid_data("Arrow field node counts are malformed"));
+        }
+        if nodes
+            .first()
+            .is_some_and(|node| node.length() != batch.length())
+        {
+            return Err(invalid_data(
+                "Arrow record batch length disagrees with its columns",
+            ));
+        }
+        // POD5 writers don't compress Arrow bodies, brust's arrow-ipc build can't
+        // decode them, and compressed buffer lengths can't bound row counts.
+        if batch.compression().is_some() {
+            return Err(invalid_data(
+                "compressed Arrow bodies are not supported in POD5",
+            ));
+        }
+        let mut layout = ArrowBatchLayout {
+            nodes: &nodes,
+            buffers: batch.buffers().into_iter().flatten().collect(),
+            next_node: 0,
+            next_buffer: 0,
+        };
+        match dictionary_field {
+            Some(field) => {
+                layout.check_field(field, true)?;
+            }
+            None => {
+                // The first column's length is the batch's row count, so its
+                // buffers must bound that length by the bytes present; later
+                // columns of types the checks don't model are left to arrow-ipc.
+                let mut fields = schema_fields.iter();
+                let Some(first) = fields.next() else {
+                    return Err(invalid_data("Arrow section has no columns"));
+                };
+                if !column_bounds_its_length(&first)? || !layout.check_field(first, false)? {
+                    return Err(invalid_data(
+                        "first Arrow column cannot bound the batch's row count",
+                    ));
+                }
+                for field in fields {
+                    if !layout.check_field(field, false)? {
+                        break;
+                    }
+                }
+            }
+        }
+        if is_record_batch {
+            total = total
+                .checked_add(rows)
+                .ok_or_else(|| invalid_data("Arrow record batch row count overflow"))?;
+            batch_rows.push(rows);
+        }
     }
 
-    Ok(total)
+    Ok(batch_rows)
+}
+
+fn find_dictionary_field<'a>(
+    fields: impl Iterator<Item = arrow_ipc::Field<'a>>,
+    id: i64,
+) -> Option<arrow_ipc::Field<'a>> {
+    for field in fields {
+        if field
+            .dictionary()
+            .is_some_and(|encoding| encoding.id() == id)
+        {
+            return Some(field);
+        }
+        if let Some(found) = field
+            .children()
+            .and_then(|children| find_dictionary_field(children.iter(), id))
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Walks an Arrow batch's field nodes and buffers in the order arrow-ipc
+/// consumes them, checking each buffer is long enough for its node's length.
+///
+/// arrow-ipc builds arrays from these buffers before validating them and
+/// panics when one is too short, so they are checked first. The checks also
+/// bound every row count by the bytes actually present.
+struct ArrowBatchLayout<'a> {
+    nodes: &'a [&'a arrow_ipc::FieldNode],
+    buffers: Vec<&'a arrow_ipc::Buffer>,
+    next_node: usize,
+    next_buffer: usize,
+}
+
+/// How a field's buffers are laid out, as far as these checks need.
+#[derive(Clone, Copy)]
+enum ArrowFieldLayout {
+    /// Validity bitmap, then values of this many bits each.
+    Fixed(u64),
+    /// Validity bitmap, offsets of this many bytes each, then values.
+    Variable(u64),
+    /// Validity bitmap and offsets of this many bytes each, then one child.
+    List(u64),
+    /// Validity bitmap, then children.
+    Nested,
+    /// No buffers.
+    Null,
+}
+
+impl ArrowBatchLayout<'_> {
+    /// Checks `field` and its children against the next nodes and buffers.
+    ///
+    /// Returns `false`, checking nothing further, when the field uses a type
+    /// these checks don't model, since later fields can't be located after it.
+    fn check_field(
+        &mut self,
+        field: arrow_ipc::Field<'_>,
+        dictionary_values: bool,
+    ) -> io::Result<bool> {
+        let Some(layout) = arrow_field_layout(&field, dictionary_values)? else {
+            return Ok(false);
+        };
+
+        let (length, null_count) = self.next_node()?;
+        if let ArrowFieldLayout::Null = layout {
+            return Ok(true);
+        }
+        let validity = self.next_buffer()?;
+        if null_count > 0 && validity < length.div_ceil(8) {
+            return Err(invalid_data("Arrow validity buffer is too short"));
+        }
+        let too_short = || invalid_data("Arrow buffer is too short for its column length");
+        match layout {
+            ArrowFieldLayout::Fixed(bits) => {
+                let needed = length.checked_mul(bits).ok_or_else(too_short)?.div_ceil(8);
+                if self.next_buffer()? < needed {
+                    return Err(too_short());
+                }
+            }
+            ArrowFieldLayout::Variable(width) | ArrowFieldLayout::List(width) => {
+                let offsets = self.next_buffer()?;
+                let needed = length
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(width))
+                    .ok_or_else(too_short)?;
+                if length > 0 && offsets < needed {
+                    return Err(too_short());
+                }
+                if let ArrowFieldLayout::Variable(_) = layout {
+                    self.next_buffer()?;
+                }
+            }
+            ArrowFieldLayout::Nested | ArrowFieldLayout::Null => {}
+        }
+        if let ArrowFieldLayout::List(_) | ArrowFieldLayout::Nested = layout {
+            for child in field.children().into_iter().flatten() {
+                if !self.check_field(child, false)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn next_node(&mut self) -> io::Result<(u64, u64)> {
+        let node = self
+            .nodes
+            .get(self.next_node)
+            .ok_or_else(|| invalid_data("Arrow batch has fewer field nodes than its schema"))?;
+        self.next_node += 1;
+        // Both counts were checked to be non-negative before the walk.
+        Ok((node.length() as u64, node.null_count() as u64))
+    }
+
+    /// Returns the next buffer's length; its extent was checked against the body.
+    fn next_buffer(&mut self) -> io::Result<u64> {
+        let buffer = self
+            .buffers
+            .get(self.next_buffer)
+            .ok_or_else(|| invalid_data("Arrow batch has fewer buffers than its schema"))?;
+        self.next_buffer += 1;
+        Ok(buffer.length() as u64)
+    }
+}
+
+/// Whether checking `field` bounds its length by the bytes present: its
+/// layout has a values or offsets buffer that grows with the length.
+fn column_bounds_its_length(field: &arrow_ipc::Field<'_>) -> io::Result<bool> {
+    Ok(matches!(
+        arrow_field_layout(field, false)?,
+        Some(
+            ArrowFieldLayout::Fixed(1..)
+                | ArrowFieldLayout::Variable(_)
+                | ArrowFieldLayout::List(_)
+        )
+    ))
+}
+
+/// Returns `field`'s buffer layout, or `None` for a type the checks don't model.
+///
+/// A dictionary-encoded field is laid out as its index type in record batches
+/// and as its value type in its own dictionary batches.
+fn arrow_field_layout(
+    field: &arrow_ipc::Field<'_>,
+    dictionary_values: bool,
+) -> io::Result<Option<ArrowFieldLayout>> {
+    use arrow_ipc::{DateUnit, IntervalUnit, Precision, Type};
+
+    let bits =
+        |width: i32| u64::try_from(width).map_err(|_| invalid_data("Arrow type width is negative"));
+    if !dictionary_values && let Some(encoding) = field.dictionary() {
+        let index_bits = encoding.indexType().map_or(32, |index| index.bitWidth());
+        return Ok(Some(ArrowFieldLayout::Fixed(bits(index_bits)?)));
+    }
+    let layout = match field.type_type() {
+        Type::Null => ArrowFieldLayout::Null,
+        Type::Bool => ArrowFieldLayout::Fixed(1),
+        Type::Int => {
+            ArrowFieldLayout::Fixed(bits(field.type_as_int().map_or(0, |int| int.bitWidth()))?)
+        }
+        Type::FloatingPoint => ArrowFieldLayout::Fixed(
+            match field
+                .type_as_floating_point()
+                .map(|float| float.precision())
+            {
+                Some(Precision::HALF) => 16,
+                Some(Precision::SINGLE) => 32,
+                _ => 64,
+            },
+        ),
+        Type::Decimal => ArrowFieldLayout::Fixed(bits(
+            field
+                .type_as_decimal()
+                .map_or(128, |decimal| decimal.bitWidth()),
+        )?),
+        Type::Date => ArrowFieldLayout::Fixed(match field.type_as_date().map(|date| date.unit()) {
+            Some(DateUnit::DAY) => 32,
+            _ => 64,
+        }),
+        Type::Time => ArrowFieldLayout::Fixed(bits(
+            field.type_as_time().map_or(32, |time| time.bitWidth()),
+        )?),
+        Type::Timestamp | Type::Duration => ArrowFieldLayout::Fixed(64),
+        Type::Interval => ArrowFieldLayout::Fixed(
+            match field.type_as_interval().map(|interval| interval.unit()) {
+                Some(IntervalUnit::YEAR_MONTH) => 32,
+                Some(IntervalUnit::DAY_TIME) => 64,
+                _ => 128,
+            },
+        ),
+        Type::FixedSizeBinary => ArrowFieldLayout::Fixed(
+            bits(
+                field
+                    .type_as_fixed_size_binary()
+                    .map_or(0, |binary| binary.byteWidth()),
+            )?
+            .checked_mul(8)
+            .ok_or_else(|| invalid_data("Arrow type width overflow"))?,
+        ),
+        Type::Utf8 | Type::Binary => ArrowFieldLayout::Variable(4),
+        Type::LargeUtf8 | Type::LargeBinary => ArrowFieldLayout::Variable(8),
+        Type::List | Type::Map => ArrowFieldLayout::List(4),
+        Type::LargeList => ArrowFieldLayout::List(8),
+        Type::FixedSizeList | Type::Struct_ => ArrowFieldLayout::Nested,
+        _ => return Ok(None),
+    };
+    Ok(Some(layout))
 }
 
 fn read_arrow_footer<R: Read + Seek>(
@@ -1384,10 +1866,13 @@ fn fb_table_vector_field(data: &[u8], table: usize, slot: u16) -> io::Result<Vec
     };
     let vector = fb_uoffset_target(data, field)?;
     let len = fb_u32_at(data, vector)? as usize;
-    let mut tables = Vec::with_capacity(len);
     let elements = vector
         .checked_add(4)
         .ok_or_else(|| invalid_data("FlatBuffer vector offset overflow"))?;
+    if len > data.len().saturating_sub(elements) / 4 {
+        return Err(invalid_data("FlatBuffer vector is longer than its data"));
+    }
+    let mut tables = Vec::with_capacity(len);
 
     for index in 0..len {
         let element = elements
@@ -1508,82 +1993,184 @@ fn fb_i32_at(data: &[u8], position: usize) -> io::Result<i32> {
     )))
 }
 
-fn encode_pod5(pod5: &Pod5) -> io::Result<Vec<u8>> {
+/// Signal table rows per Arrow record batch, as official POD5 writers use.
+///
+/// Official readers find a row's batch by dividing its number by the first
+/// batch's row count, so every batch but the last has this many rows.
+const SIGNAL_BATCH_ROWS: usize = 100;
+
+/// A payload that passed every check on its contents, with its Run Info and
+/// Reads tables encoded. Writing it still compresses uncompressed signal rows
+/// and encodes the Signal table, a batch at a time.
+struct PreparedPod5<'a> {
+    signals: &'a [Pod5Signal],
+    metadata: Pod5WriterMetadata,
+    marker: [u8; 16],
+    run_info: Vec<u8>,
+    reads: Vec<u8>,
+}
+
+fn prepare_pod5(pod5: &Pod5) -> io::Result<PreparedPod5<'_>> {
     validate_pod5_for_writing(pod5)?;
 
     let metadata = pod5_writer_metadata(pod5);
-    let signal = write_arrow_section(build_signal_batch(&pod5.signals, &metadata)?, &metadata)?;
     let run_info =
         write_arrow_section(build_run_info_batch(&pod5.run_infos, &metadata)?, &metadata)?;
     let reads = write_arrow_section(build_reads_batch(&pod5.records, &metadata)?, &metadata)?;
-    let sections = [
-        (Pod5SectionKind::Signal, signal),
-        (Pod5SectionKind::RunInfo, run_info),
-        (Pod5SectionKind::Reads, reads),
-    ];
-
     let marker = pod5_section_marker(pod5, &metadata)?;
-    let mut output = Vec::new();
-    let mut footer_entries = Vec::with_capacity(sections.len());
 
-    output.extend_from_slice(POD5_MAGIC);
-    output.extend_from_slice(&marker);
+    Ok(PreparedPod5 {
+        signals: &pod5.signals,
+        metadata,
+        marker,
+        run_info,
+        reads,
+    })
+}
 
-    for (kind, section) in sections {
-        let offset = output.len() as i64;
-        let length = section.len() as i64;
-        output.extend_from_slice(&section);
-        pad_to_8(&mut output);
-        output.extend_from_slice(&marker);
-        footer_entries.push(Pod5FooterEntry {
-            offset,
-            length,
-            content_type: match kind {
-                Pod5SectionKind::Reads => 0,
-                Pod5SectionKind::Signal => 1,
-                Pod5SectionKind::RunInfo => 4,
-                Pod5SectionKind::Unknown | Pod5SectionKind::Footer => {
-                    return Err(invalid_data("POD5 writer cannot encode this section kind"));
+impl PreparedPod5<'_> {
+    /// Writes the POD5 file, the Signal table a batch at a time.
+    fn write_to<W: Write>(&self, writer: W) -> io::Result<()> {
+        let mut output = CountingWriter {
+            inner: BufWriter::new(writer),
+            written: 0,
+        };
+        let mut footer_entries = Vec::with_capacity(3);
+
+        output.write_all(POD5_MAGIC)?;
+        output.write_all(&self.marker)?;
+
+        for (kind, content_type) in [
+            (Pod5SectionKind::Signal, 1),
+            (Pod5SectionKind::RunInfo, 4),
+            (Pod5SectionKind::Reads, 0),
+        ] {
+            let offset = output.written;
+            match kind {
+                Pod5SectionKind::Signal => {
+                    write_signal_section(self.signals, &self.metadata, &mut output)?;
                 }
-            },
-        });
+                Pod5SectionKind::RunInfo => output.write_all(&self.run_info)?,
+                _ => output.write_all(&self.reads)?,
+            }
+            let length = output.written - offset;
+            output.pad_to_8()?;
+            output.write_all(&self.marker)?;
+            footer_entries.push(Pod5FooterEntry {
+                offset: file_offset(offset)?,
+                length: file_offset(length)?,
+                content_type,
+            });
+        }
+
+        let footer = build_pod5_footer(&self.metadata, &footer_entries);
+        output.write_all(POD5_FOOTER_MAGIC)?;
+        let footer_payload_start = output.written;
+        output.write_all(&footer)?;
+        output.pad_to_8()?;
+        let footer_len = output.written - footer_payload_start;
+        output.write_all(&footer_len.to_le_bytes())?;
+        output.write_all(&self.marker)?;
+        output.write_all(POD5_MAGIC)?;
+
+        output
+            .inner
+            .into_inner()
+            .map(drop)
+            .map_err(io::IntoInnerError::into_error)
+    }
+}
+
+fn file_offset(value: u64) -> io::Result<i64> {
+    i64::try_from(value).map_err(|_| invalid_data("POD5 output exceeds the footer's offset range"))
+}
+
+/// Counts the bytes written through it, for the POD5 footer's offsets.
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: Write> CountingWriter<W> {
+    fn pad_to_8(&mut self) -> io::Result<()> {
+        let padding = (8 - self.written % 8) % 8;
+        self.write_all(&[0; 8][..padding as usize])
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.written += written as u64;
+        Ok(written)
     }
 
-    let footer = build_pod5_footer(&metadata, &footer_entries);
-    output.extend_from_slice(POD5_FOOTER_MAGIC);
-    let footer_payload_start = output.len();
-    output.extend_from_slice(&footer);
-    pad_to_8(&mut output);
-    let footer_len = (output.len() - footer_payload_start) as u64;
-    output.extend_from_slice(&footer_len.to_le_bytes());
-    output.extend_from_slice(&marker);
-    output.extend_from_slice(POD5_MAGIC);
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
 
-    Ok(output)
+/// Writes the Signal table as an Arrow file of [`SIGNAL_BATCH_ROWS`]-row
+/// batches, building one batch at a time.
+fn write_signal_section<W: Write>(
+    signals: &[Pod5Signal],
+    metadata: &Pod5WriterMetadata,
+    output: W,
+) -> io::Result<()> {
+    let schema = Arc::new(signal_schema(metadata));
+    let mut writer = FileWriter::try_new(output, schema.as_ref()).map_err(arrow_write_error)?;
+    for (key, value) in arrow_metadata(metadata) {
+        writer.write_metadata(key, value);
+    }
+    // An empty table is still written as one empty batch.
+    for rows in signals
+        .chunks(SIGNAL_BATCH_ROWS)
+        .chain(signals.is_empty().then_some(signals))
+    {
+        writer
+            .write(&build_signal_batch(rows, &schema)?)
+            .map_err(arrow_write_error)?;
+    }
+    writer.finish().map_err(arrow_write_error)
 }
 
 fn validate_pod5_for_writing(pod5: &Pod5) -> io::Result<()> {
-    if pod5.signals.is_empty() {
-        return Err(invalid_data("POD5 writer requires at least one signal row"));
+    // Empty tables are valid: official pod5 writes files with no reads, and
+    // reads with no samples have no signal rows.
+    if let Some(version) = &pod5.header.pod5_version {
+        validate_pod5_version(version)?;
     }
-    if pod5.run_infos.is_empty() {
-        return Err(invalid_data(
-            "POD5 writer requires at least one run info row",
-        ));
+    if let Some(identifier) = &pod5.header.file_identifier
+        && !is_canonical_uuid(identifier)
+    {
+        return Err(invalid_data(format!(
+            "MINKNOW:file_identifier must be a UUID, got {identifier}"
+        )));
     }
 
+    let mut signal_read_ids = Vec::with_capacity(pod5.signals.len());
     for signal in &pod5.signals {
-        uuid_string_to_bytes(&signal.read_id)?;
+        signal_read_ids.push(uuid_string_to_bytes(&signal.read_id)?);
+        validate_signal_payload(signal)?;
     }
 
     for record in &pod5.records {
-        uuid_string_to_bytes(&record.read_id)?;
+        let read_id = uuid_string_to_bytes(&record.read_id)?;
+        if !POD5_END_REASONS.contains(&record.end_reason.as_str()) {
+            return Err(invalid_data(format!(
+                "POD5 end_reason {:?} is not a known end reason",
+                record.end_reason
+            )));
+        }
         let mut total = 0u64;
         for &index in &record.signal_rows {
             let signal = pod5
                 .signals
                 .get(index as usize)
                 .ok_or_else(|| invalid_data("POD5 signal row index is out of bounds"))?;
+            if signal_read_ids[index as usize] != read_id {
+                return Err(invalid_data("POD5 signal row read_id does not match read"));
+            }
             total = total
                 .checked_add(u64::from(signal.samples))
                 .ok_or_else(|| invalid_data("POD5 signal sample count overflow"))?;
@@ -1603,6 +2190,44 @@ fn validate_pod5_for_writing(pod5: &Pod5) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// End reasons official POD5 readers accept in the Reads `end_reason` column.
+const POD5_END_REASONS: &[&str] = &[
+    "unknown",
+    "mux_change",
+    "unblock_mux_change",
+    "data_service_unblock_mux_change",
+    "signal_positive",
+    "signal_negative",
+    "api_request",
+    "device_data_error",
+    "analysis_config_change",
+    "paused",
+];
+
+/// Checks that a signal row's payload decodes to exactly its declared samples.
+fn validate_signal_payload(signal: &Pod5Signal) -> io::Result<()> {
+    match &signal.payload {
+        Pod5SignalPayload::Uncompressed(samples) if samples.len() != signal.samples as usize => {
+            Err(invalid_data(
+                "POD5 signal row samples does not match its payload length",
+            ))
+        }
+        Pod5SignalPayload::Uncompressed(_) => Ok(()),
+        Pod5SignalPayload::Vbz(data) => {
+            decompress_vbz_signal(data, signal.samples as usize).map(drop)
+        }
+    }
+}
+
+/// Whether `value` is a hyphenated `8-4-4-4-12` hex UUID.
+fn is_canonical_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
 fn pod5_writer_metadata(pod5: &Pod5) -> Pod5WriterMetadata {
@@ -1665,10 +2290,18 @@ fn write_arrow_section(batch: RecordBatch, metadata: &Pod5WriterMetadata) -> io:
     Ok(data)
 }
 
-fn build_signal_batch(
-    signals: &[Pod5Signal],
-    metadata: &Pod5WriterMetadata,
-) -> io::Result<RecordBatch> {
+fn signal_schema(metadata: &Pod5WriterMetadata) -> Schema {
+    Schema::new_with_metadata(
+        vec![
+            uuid_field("read_id"),
+            vbz_field("signal"),
+            Field::new("samples", DataType::UInt32, false),
+        ],
+        arrow_metadata(metadata),
+    )
+}
+
+fn build_signal_batch(signals: &[Pod5Signal], schema: &SchemaRef) -> io::Result<RecordBatch> {
     let mut read_id = FixedSizeBinaryBuilder::with_capacity(signals.len(), 16);
     let total_signal_bytes = signals
         .iter()
@@ -1693,84 +2326,57 @@ fn build_signal_batch(
     let read_id = Arc::new(read_id.finish()) as ArrayRef;
     let signal = Arc::new(signal.finish()) as ArrayRef;
     let samples = Arc::new(UInt32Array::from(samples)) as ArrayRef;
-    let schema = Schema::new_with_metadata(
-        vec![
-            uuid_field("read_id"),
-            vbz_field("signal"),
-            Field::new("samples", DataType::UInt32, false),
-        ],
-        arrow_metadata(metadata),
-    );
 
-    RecordBatch::try_new(Arc::new(schema), vec![read_id, signal, samples]).map_err(arrow_error)
+    RecordBatch::try_new(schema.clone(), vec![read_id, signal, samples]).map_err(arrow_error)
 }
 
 fn build_run_info_batch(
     run_infos: &[Pod5RunInfo],
     metadata: &Pod5WriterMetadata,
 ) -> io::Result<RecordBatch> {
-    let rows = run_infos.len();
-    let context_tags = Arc::new(empty_string_map_array(rows)?) as ArrayRef;
-    let tracking_id = Arc::new(empty_string_map_array(rows)?) as ArrayRef;
-    let acquisition_start_time = Arc::new(timestamp_utc_zeros(rows)) as ArrayRef;
-    let protocol_start_time = Arc::new(timestamp_utc_zeros(rows)) as ArrayRef;
+    let strings = |field: fn(&Pod5RunInfo) -> &str| -> ArrayRef {
+        Arc::new(StringArray::from(
+            run_infos.iter().map(field).collect::<Vec<_>>(),
+        ))
+    };
+    let timestamps = |field: fn(&Pod5RunInfo) -> i64| -> ArrayRef {
+        Arc::new(
+            TimestampMillisecondArray::from(run_infos.iter().map(field).collect::<Vec<_>>())
+                .with_timezone("UTC"),
+        )
+    };
+    let int16s = |field: fn(&Pod5RunInfo) -> i16| -> ArrayRef {
+        Arc::new(Int16Array::from(
+            run_infos.iter().map(field).collect::<Vec<_>>(),
+        ))
+    };
 
     let arrays: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from(
-            run_infos
-                .iter()
-                .map(|run_info| run_info.acquisition_id.clone())
-                .collect::<Vec<_>>(),
-        )),
-        acquisition_start_time.clone(),
-        Arc::new(Int16Array::from(vec![0i16; rows])),
-        Arc::new(Int16Array::from(vec![0i16; rows])),
-        context_tags.clone(),
-        Arc::new(StringArray::from(
-            run_infos
-                .iter()
-                .map(|run_info| run_info.experiment_name.clone())
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            run_infos
-                .iter()
-                .map(|run_info| run_info.flow_cell_id.clone())
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(vec![String::new(); rows])),
-        Arc::new(StringArray::from(vec![String::new(); rows])),
-        Arc::new(StringArray::from(vec![String::new(); rows])),
-        protocol_start_time.clone(),
-        Arc::new(StringArray::from(
-            run_infos
-                .iter()
-                .map(|run_info| run_info.sample_id.clone())
-                .collect::<Vec<_>>(),
-        )),
+        strings(|run_info| &run_info.acquisition_id),
+        timestamps(|run_info| run_info.acquisition_start_time),
+        int16s(|run_info| run_info.adc_max),
+        int16s(|run_info| run_info.adc_min),
+        string_map_array(run_infos.iter().map(|run_info| &run_info.context_tags))?,
+        strings(|run_info| &run_info.experiment_name),
+        strings(|run_info| &run_info.flow_cell_id),
+        strings(|run_info| &run_info.flow_cell_product_code),
+        strings(|run_info| &run_info.protocol_name),
+        strings(|run_info| &run_info.protocol_run_id),
+        timestamps(|run_info| run_info.protocol_start_time),
+        strings(|run_info| &run_info.sample_id),
         Arc::new(UInt16Array::from(
             run_infos
                 .iter()
                 .map(|run_info| run_info.sample_rate)
                 .collect::<Vec<_>>(),
         )),
-        Arc::new(StringArray::from(
-            run_infos
-                .iter()
-                .map(|run_info| run_info.sequencing_kit.clone())
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(vec![String::new(); rows])),
-        Arc::new(StringArray::from(vec![String::new(); rows])),
-        Arc::new(StringArray::from(
-            run_infos
-                .iter()
-                .map(|run_info| run_info.software.clone())
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(vec![String::new(); rows])),
-        Arc::new(StringArray::from(vec![String::new(); rows])),
-        tracking_id.clone(),
+        strings(|run_info| &run_info.sequencing_kit),
+        strings(|run_info| &run_info.sequencer_position),
+        strings(|run_info| &run_info.sequencer_position_type),
+        strings(|run_info| &run_info.software),
+        strings(|run_info| &run_info.system_name),
+        strings(|run_info| &run_info.system_type),
+        string_map_array(run_infos.iter().map(|run_info| &run_info.tracking_id))?,
     ];
 
     let fields = RUN_INFO_TABLE_FIELDS
@@ -1801,12 +2407,17 @@ fn build_reads_batch(
             signal.values().append_value(row);
         }
         signal.append(true);
-        pore_type.append_value(&record.pore_type);
-        end_reason.append_value(&record.end_reason);
-        run_info.append_value(&record.run_info);
+        // Dictionary keys are 16-bit, as in official POD5 files.
+        let key_overflow =
+            |_| invalid_data("POD5 column has more distinct values than 16-bit keys can index");
+        pore_type.append(&record.pore_type).map_err(key_overflow)?;
+        end_reason
+            .append(&record.end_reason)
+            .map_err(key_overflow)?;
+        run_info.append(&record.run_info).map_err(key_overflow)?;
     }
 
-    let arrays: Vec<ArrayRef> = vec![
+    let mut arrays: Vec<ArrayRef> = vec![
         Arc::new(read_id.finish()),
         Arc::new(signal.finish()),
         Arc::new(UInt32Array::from(
@@ -1906,8 +2517,26 @@ fn build_reads_batch(
         )),
         Arc::new(run_info.finish()),
     ];
+    let mut names = READS_TABLE_FIELDS.to_vec();
+    if writes_open_pore_level(&metadata.pod5_version) {
+        arrays.push(Arc::new(Float32Array::from(
+            records
+                .iter()
+                .map(|record| record.open_pore_level.unwrap_or(f32::NAN))
+                .collect::<Vec<_>>(),
+        )));
+        names.push(OPEN_PORE_LEVEL_FIELD);
+    } else if records
+        .iter()
+        .any(|record| record.open_pore_level.is_some())
+    {
+        return Err(invalid_data(format!(
+            "POD5 open_pore_level needs MINKNOW:pod5_version {OPEN_PORE_LEVEL_MIN_VERSION} or later, got {}",
+            metadata.pod5_version
+        )));
+    }
 
-    let fields = READS_TABLE_FIELDS
+    let fields = names
         .iter()
         .zip(arrays.iter())
         .map(|(name, array)| {
@@ -1923,20 +2552,48 @@ fn build_reads_batch(
     RecordBatch::try_new(Arc::new(schema), arrays).map_err(arrow_error)
 }
 
-fn empty_string_map_array(rows: usize) -> io::Result<arrow_array::MapArray> {
-    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-    for _ in 0..rows {
-        builder.append(true).map_err(arrow_error)?;
+/// Reads column added in POD5 0.3.30; official readers require it from then on.
+const OPEN_PORE_LEVEL_FIELD: &str = "open_pore_level";
+/// First POD5 version whose Reads table has [`OPEN_PORE_LEVEL_FIELD`].
+const OPEN_PORE_LEVEL_MIN_VERSION: &str = "0.3.30";
+
+/// Whether a Reads table stamped with `version` must carry `open_pore_level`.
+///
+/// A version that doesn't parse as `major.minor.patch` gets the newest schema.
+fn writes_open_pore_level(version: &str) -> bool {
+    match (
+        pod5_version_number(version),
+        pod5_version_number(OPEN_PORE_LEVEL_MIN_VERSION),
+    ) {
+        (Some(version), Some(minimum)) => version >= minimum,
+        _ => true,
     }
-    Ok(builder.finish())
 }
 
-fn timestamp_utc_zeros(rows: usize) -> TimestampMillisecondArray {
-    let mut builder = TimestampMillisecondBuilder::new().with_timezone("UTC");
-    for _ in 0..rows {
-        builder.append_value(0);
+fn pod5_version_number(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.').map(|part| {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            None
+        } else {
+            part.parse::<u64>().ok()
+        }
+    });
+    let number = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(number)
+}
+
+fn string_map_array<'a>(
+    rows: impl Iterator<Item = &'a Vec<(String, String)>>,
+) -> io::Result<ArrayRef> {
+    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    for entries in rows {
+        for (key, value) in entries {
+            builder.keys().append_value(key);
+            builder.values().append_value(value);
+        }
+        builder.append(true).map_err(arrow_error)?;
     }
-    builder.finish()
+    Ok(Arc::new(builder.finish()))
 }
 
 fn uuid_field(name: &str) -> Field {
@@ -1994,208 +2651,6 @@ fn build_pod5_footer(metadata: &Pod5WriterMetadata, entries: &[Pod5FooterEntry])
     let footer = builder.end_table(start);
     builder.finish(footer, None);
     builder.finished_data().to_vec()
-}
-
-fn pad_to_8(data: &mut Vec<u8>) {
-    let padding = (8 - data.len() % 8) % 8;
-    data.extend(std::iter::repeat_n(0, padding));
-}
-
-fn parse_pod5(data: &[u8]) -> io::Result<ParsedPod5> {
-    if data.len() < 8 + 16 + 16 + 8 {
-        return Err(invalid_data("POD5 file is too short"));
-    }
-
-    let magic = slice_to_array::<8>(
-        data.get(..8)
-            .ok_or_else(|| invalid_data("POD5 magic is missing"))?,
-    );
-
-    if &magic != POD5_MAGIC {
-        return Err(invalid_data("invalid POD5 leading magic"));
-    }
-
-    if data.get(data.len() - 8..).unwrap() != POD5_MAGIC {
-        return Err(invalid_data("invalid POD5 trailing magic"));
-    }
-
-    let section_marker = slice_to_array::<16>(
-        data.get(8..24)
-            .ok_or_else(|| invalid_data("POD5 section marker is missing"))?,
-    );
-    let final_marker_offset = data.len() - 8 - 16;
-    if data.get(final_marker_offset..final_marker_offset + 16) != Some(&section_marker) {
-        return Err(invalid_data("POD5 final section marker is missing"));
-    }
-
-    let marker_positions = find_section_markers(data, &section_marker);
-    if marker_positions.len() < 3 {
-        return Err(invalid_data("POD5 file has too few section markers"));
-    }
-
-    if marker_positions[0] != 8 || *marker_positions.last().unwrap() != final_marker_offset {
-        return Err(invalid_data("POD5 section markers are malformed"));
-    }
-
-    let mut sections = Vec::new();
-    let mut run_infos = Vec::new();
-    let mut signals = Vec::new();
-    let mut records = Vec::new();
-    let mut metadata = Pod5Metadata::default();
-    let mut seen_footer = false;
-
-    for window in marker_positions.windows(2) {
-        let section_start = window[0] + 16;
-        let section_end = window[1];
-
-        if section_start > section_end {
-            return Err(invalid_data("POD5 section offsets are malformed"));
-        }
-
-        let section = &data[section_start..section_end];
-        if section.starts_with(POD5_FOOTER_MAGIC) {
-            let footer_len = parse_footer_section(section)?;
-            sections.push(Pod5Section {
-                kind: Pod5SectionKind::Footer,
-                offset: section_start as u64,
-                length: footer_len as u64,
-                padded_length: section.len() as u64,
-                row_count: 0,
-            });
-            seen_footer = true;
-            continue;
-        }
-
-        let arrow_len = arrow_payload_len(section)?;
-        let payload = &section[..arrow_len];
-        let mut reader = FileReader::try_new(Cursor::new(payload), None).map_err(arrow_error)?;
-        update_metadata(reader.custom_metadata(), &mut metadata)?;
-        let schema = reader.schema();
-        let kind = infer_section_kind(&schema);
-        let mut row_count = 0usize;
-
-        for batch in &mut reader {
-            let batch = batch.map_err(arrow_error)?;
-            row_count += batch.num_rows();
-
-            match kind {
-                Pod5SectionKind::Reads => records.extend(parse_reads_batch(&batch)?),
-                Pod5SectionKind::Signal => signals.extend(parse_signal_batch(&batch)?),
-                Pod5SectionKind::RunInfo => run_infos.extend(parse_run_info_batch(&batch)?),
-                Pod5SectionKind::Unknown | Pod5SectionKind::Footer => {}
-            }
-        }
-
-        sections.push(Pod5Section {
-            kind,
-            offset: section_start as u64,
-            length: arrow_len as u64,
-            padded_length: section.len() as u64,
-            row_count,
-        });
-    }
-
-    if !seen_footer {
-        return Err(invalid_data("POD5 footer section is missing"));
-    }
-
-    if sections
-        .iter()
-        .all(|section| section.kind != Pod5SectionKind::Reads)
-    {
-        return Err(invalid_data("POD5 Reads table is missing"));
-    }
-    if sections
-        .iter()
-        .all(|section| section.kind != Pod5SectionKind::Signal)
-    {
-        return Err(invalid_data("POD5 Signal table is missing"));
-    }
-    if sections
-        .iter()
-        .all(|section| section.kind != Pod5SectionKind::RunInfo)
-    {
-        return Err(invalid_data("POD5 Run Info table is missing"));
-    }
-
-    let header = Pod5Header {
-        magic,
-        section_marker,
-        sections,
-        file_identifier: metadata.file_identifier,
-        software: metadata.software,
-        pod5_version: metadata.pod5_version,
-    };
-
-    Ok((header, run_infos, signals, records))
-}
-
-fn find_section_markers(data: &[u8], section_marker: &[u8; 16]) -> Vec<usize> {
-    let mut positions = Vec::new();
-    let mut offset = 0usize;
-
-    while let Some(position) = data[offset..]
-        .windows(section_marker.len())
-        .position(|window| window == section_marker)
-    {
-        let absolute = offset + position;
-        positions.push(absolute);
-        offset = absolute + section_marker.len();
-    }
-
-    positions
-}
-
-fn parse_footer_section(section: &[u8]) -> io::Result<usize> {
-    if section.len() < POD5_FOOTER_MAGIC.len() + 8 {
-        return Err(invalid_data("POD5 footer section is too short"));
-    }
-
-    let footer_len_offset = section.len() - 8;
-    let footer_len = u64::from_le_bytes(
-        section[footer_len_offset..]
-            .try_into()
-            .map_err(|_| invalid_data("POD5 footer length is malformed"))?,
-    ) as usize;
-    let footer_start = POD5_FOOTER_MAGIC.len();
-    let footer_end = footer_start
-        .checked_add(footer_len)
-        .ok_or_else(|| invalid_data("POD5 footer length overflow"))?;
-
-    if footer_end > footer_len_offset {
-        return Err(invalid_data("POD5 footer length exceeds section"));
-    }
-
-    if !section[footer_end..footer_len_offset]
-        .iter()
-        .all(|byte| *byte == 0)
-    {
-        return Err(invalid_data("POD5 footer padding is not zeroed"));
-    }
-
-    Ok(footer_len)
-}
-
-fn arrow_payload_len(section: &[u8]) -> io::Result<usize> {
-    if !section.starts_with(ARROW_MAGIC) {
-        return Err(invalid_data("POD5 section is neither Arrow nor footer"));
-    }
-
-    let end_magic_offset = section
-        .windows(ARROW_MAGIC.len())
-        .rposition(|window| window == ARROW_MAGIC)
-        .ok_or_else(|| invalid_data("embedded Arrow file is missing trailing magic"))?;
-    let arrow_len = end_magic_offset + ARROW_MAGIC.len();
-
-    if arrow_len == ARROW_MAGIC.len() {
-        return Err(invalid_data("embedded Arrow file has no payload"));
-    }
-
-    if !section[arrow_len..].iter().all(|byte| *byte == 0) {
-        return Err(invalid_data("POD5 Arrow section padding is not zeroed"));
-    }
-
-    Ok(arrow_len)
 }
 
 fn infer_section_kind(schema: &SchemaRef) -> Pod5SectionKind {
@@ -2291,6 +2746,15 @@ fn parse_reads_batch(batch: &RecordBatch) -> io::Result<Vec<Pod5Record>> {
     let end_reason = dict_string_column(batch, "end_reason")?;
     let end_reason_forced = bool_column(batch, "end_reason_forced")?;
     let run_info = dict_string_column(batch, "run_info")?;
+    let open_pore_level = match batch.column_by_name(OPEN_PORE_LEVEL_FIELD) {
+        Some(column) => Some(
+            column
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| invalid_data("POD5 column has unexpected type"))?,
+        ),
+        None => None,
+    };
 
     let mut records = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
@@ -2319,6 +2783,10 @@ fn parse_reads_batch(batch: &RecordBatch) -> io::Result<Vec<Pod5Record>> {
             end_reason: dictionary_string_value(end_reason, row)?,
             end_reason_forced: end_reason_forced.value(row),
             run_info: dictionary_string_value(run_info, row)?,
+            open_pore_level: open_pore_level
+                .filter(|column| column.is_valid(row))
+                .map(|column| column.value(row))
+                .filter(|level| !level.is_nan()),
         });
     }
 
@@ -2333,6 +2801,19 @@ fn parse_run_info_batch(batch: &RecordBatch) -> io::Result<Vec<Pod5RunInfo>> {
     let sequencing_kit = string_column(batch, "sequencing_kit")?;
     let sample_rate = uint16_column(batch, "sample_rate")?;
     let software = string_column(batch, "software")?;
+    let acquisition_start_time = timestamp_ms_column(batch, "acquisition_start_time")?;
+    let adc_max = int16_column(batch, "adc_max")?;
+    let adc_min = int16_column(batch, "adc_min")?;
+    let context_tags = map_column(batch, "context_tags")?;
+    let flow_cell_product_code = string_column(batch, "flow_cell_product_code")?;
+    let protocol_name = string_column(batch, "protocol_name")?;
+    let protocol_run_id = string_column(batch, "protocol_run_id")?;
+    let protocol_start_time = timestamp_ms_column(batch, "protocol_start_time")?;
+    let sequencer_position = string_column(batch, "sequencer_position")?;
+    let sequencer_position_type = string_column(batch, "sequencer_position_type")?;
+    let system_name = string_column(batch, "system_name")?;
+    let system_type = string_column(batch, "system_type")?;
+    let tracking_id = map_column(batch, "tracking_id")?;
 
     let mut run_infos = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
@@ -2344,6 +2825,19 @@ fn parse_run_info_batch(batch: &RecordBatch) -> io::Result<Vec<Pod5RunInfo>> {
             sequencing_kit: sequencing_kit.value(row).to_string(),
             sample_rate: sample_rate.value(row),
             software: software.value(row).to_string(),
+            acquisition_start_time: acquisition_start_time.value(row),
+            adc_max: adc_max.value(row),
+            adc_min: adc_min.value(row),
+            context_tags: string_map_value(context_tags, row)?,
+            flow_cell_product_code: flow_cell_product_code.value(row).to_string(),
+            protocol_name: protocol_name.value(row).to_string(),
+            protocol_run_id: protocol_run_id.value(row).to_string(),
+            protocol_start_time: protocol_start_time.value(row),
+            sequencer_position: sequencer_position.value(row).to_string(),
+            sequencer_position_type: sequencer_position_type.value(row).to_string(),
+            system_name: system_name.value(row).to_string(),
+            system_type: system_type.value(row).to_string(),
+            tracking_id: string_map_value(tracking_id, row)?,
         });
     }
 
@@ -2443,6 +2937,57 @@ fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> io::Result<&'a Strin
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| invalid_data("POD5 column has unexpected type"))
+}
+
+fn int16_column<'a>(batch: &'a RecordBatch, name: &str) -> io::Result<&'a Int16Array> {
+    column(batch, name)?
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .ok_or_else(|| invalid_data("POD5 column has unexpected type"))
+}
+
+fn timestamp_ms_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> io::Result<&'a TimestampMillisecondArray> {
+    column(batch, name)?
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .ok_or_else(|| invalid_data("POD5 column has unexpected type"))
+}
+
+fn map_column<'a>(batch: &'a RecordBatch, name: &str) -> io::Result<&'a MapArray> {
+    column(batch, name)?
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| invalid_data("POD5 column has unexpected type"))
+}
+
+/// Returns one row of a `map<string, string>` column as key/value pairs.
+fn string_map_value(map: &MapArray, row: usize) -> io::Result<Vec<(String, String)>> {
+    if map.is_null(row) {
+        return Ok(Vec::new());
+    }
+    let keys = map
+        .keys()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| invalid_data("POD5 map keys have unexpected type"))?;
+    let values = map
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| invalid_data("POD5 map values have unexpected type"))?;
+    let offsets = map.value_offsets();
+    let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+    Ok((start..end)
+        .map(|entry| {
+            (
+                keys.value(entry).to_string(),
+                values.value(entry).to_string(),
+            )
+        })
+        .collect())
 }
 
 fn uint8_column<'a>(batch: &'a RecordBatch, name: &str) -> io::Result<&'a UInt8Array> {
@@ -2626,10 +3171,42 @@ pub fn decompress_vbz_signal(data: &[u8], num_samples: usize) -> io::Result<Vec<
                 .ok_or_else(|| invalid_data("VBZ decompressed length overflow"))?,
         )
         .ok_or_else(|| invalid_data("VBZ decompressed length overflow"))?;
-    let inner = zstd::bulk::decompress(data, max_inner_len)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let inner = decompress_vbz_frame(data, max_inner_len)?;
 
     decode_vbz_inner(&inner, num_samples)
+}
+
+/// Highest compression ratio for which a frame's declared size is used to
+/// size the output up front; above it the output grows as data decodes.
+const VBZ_TRUSTED_RATIO: u64 = 64;
+
+/// Decompresses a VBZ zstd frame that may hold at most `max_len` bytes.
+///
+/// `max_len` and the frame header come from the file, so neither is trusted to
+/// size a large allocation before any data has decoded.
+fn decompress_vbz_frame(data: &[u8], max_len: usize) -> io::Result<Vec<u8>> {
+    let zstd_error =
+        |error: io::Error| io::Error::new(io::ErrorKind::InvalidData, error.to_string());
+    let declared = zstd::zstd_safe::get_frame_content_size(data).ok().flatten();
+    if let Some(size) = declared
+        && size <= max_len as u64
+        && size <= (data.len() as u64).saturating_mul(VBZ_TRUSTED_RATIO)
+    {
+        return zstd::bulk::decompress(data, size as usize).map_err(zstd_error);
+    }
+
+    let mut inner = Vec::new();
+    zstd::stream::read::Decoder::with_buffer(data)
+        .map_err(zstd_error)?
+        .take((max_len as u64).saturating_add(1))
+        .read_to_end(&mut inner)
+        .map_err(zstd_error)?;
+    if inner.len() > max_len {
+        return Err(invalid_data(
+            "VBZ data decompresses past its declared samples",
+        ));
+    }
+    Ok(inner)
 }
 
 fn encode_vbz_inner(samples: &[i16]) -> Vec<u8> {
@@ -2661,6 +3238,10 @@ fn decode_vbz_inner(data: &[u8], num_samples: usize) -> io::Result<Vec<i16>> {
 
     let control = &data[..control_len];
     let values = &data[control_len..];
+    // Every sample takes at least one value byte, so this bounds the output.
+    if values.len() < num_samples {
+        return Err(invalid_data("VBZ data stream is truncated"));
+    }
     let mut value_offset = 0usize;
     let mut previous = 0i16;
     let mut output = Vec::with_capacity(num_samples);
@@ -2709,6 +3290,15 @@ fn slice_to_array<const N: usize>(slice: &[u8]) -> [u8; N] {
 
 fn arrow_error(error: ArrowError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+/// Like [`arrow_error`], but a failure of the output stream is returned as
+/// it is, so callers can tell a full disk or a closed pipe from bad data.
+fn arrow_write_error(error: ArrowError) -> io::Error {
+    match error {
+        ArrowError::IoError(_, error) => error,
+        error => arrow_error(error),
+    }
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -2798,6 +3388,10 @@ mod pod5_tests {
             assert_eq!(actual.channel, expected.channel);
             assert_eq!(actual.well, expected.well);
             assert_eq!(actual.pore_type, expected.pore_type);
+            assert_eq!(
+                actual.open_pore_level.map(f32::to_bits),
+                expected.open_pore_level.map(f32::to_bits)
+            );
             assert_eq!(
                 actual.calibration_offset.to_bits(),
                 expected.calibration_offset.to_bits()
@@ -2989,6 +3583,77 @@ mod pod5_tests {
     }
 
     #[test]
+    fn sample_summaries_saturate_instead_of_overflowing() {
+        // num_samples comes from the file; summing crafted values must not panic.
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        for record in &mut pod5.records {
+            record.num_samples = u64::MAX / 2 + 1;
+        }
+
+        assert_eq!(pod5.total_samples(), u64::MAX);
+        assert!(
+            pod5.channel_summaries()
+                .iter()
+                .all(|summary| summary.sample_count >= u64::MAX / 2)
+        );
+        assert_eq!(pod5.run_info_summaries()[0].sample_count, u64::MAX);
+    }
+
+    #[test]
+    fn writer_round_trips_an_empty_payload() {
+        // Official pod5 writes files with no reads; brust reads them.
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        pod5.records.clear();
+        pod5.signals.clear();
+        pod5.run_infos.clear();
+        let mut output = Vec::new();
+        pod5.to_writer(&mut output).unwrap();
+
+        let round_tripped = Pod5::from_reader(&output[..]).unwrap();
+        assert!(round_tripped.records.is_empty());
+        assert!(round_tripped.signals.is_empty());
+        assert!(round_tripped.run_infos.is_empty());
+    }
+
+    #[test]
+    fn writer_round_trips_a_zero_sample_read() {
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        pod5.records.truncate(1);
+        pod5.records[0].signal_rows.clear();
+        pod5.records[0].num_samples = 0;
+        pod5.signals.clear();
+        let mut output = Vec::new();
+        pod5.to_writer(&mut output).unwrap();
+
+        let round_tripped = Pod5::from_reader(&output[..]).unwrap();
+        assert_eq!(round_tripped.records[0].num_samples, 0);
+        assert_eq!(
+            round_tripped
+                .signal_for_record(&round_tripped.records[0])
+                .unwrap(),
+            Vec::<i16>::new()
+        );
+    }
+
+    #[test]
+    fn too_many_distinct_dictionary_values_are_an_error_not_a_panic() {
+        // Dictionary keys are 16-bit, as in official POD5 files.
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        let template = pod5.records[0].clone();
+        pod5.records = (0..32_769)
+            .map(|index| Pod5Record {
+                pore_type: format!("pore-{index}"),
+                ..template.clone()
+            })
+            .collect();
+        let mut output = Vec::new();
+
+        let error = pod5.to_writer(&mut output).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn writer_round_trips_materialized_pod5() {
         let pod5 = Pod5::from_path(A_100_POD5).unwrap();
         let mut output = Vec::new();
@@ -3007,6 +3672,153 @@ mod pod5_tests {
         assert_eq!(round_tripped.header.read_count(), RECORD_COUNT);
         assert_eq!(round_tripped.header.signal_count(), RECORD_COUNT);
         assert_eq!(round_tripped.header.run_info_count(), 1);
+    }
+
+    fn written_reads_field_names(pod5: &Pod5) -> Vec<String> {
+        let mut output = Vec::new();
+        pod5.to_writer(&mut output).unwrap();
+        let reader = Pod5Reader::from_reader(Cursor::new(output.clone())).unwrap();
+        let section = reader
+            .header
+            .sections
+            .iter()
+            .find(|section| section.kind == Pod5SectionKind::Reads)
+            .unwrap();
+        let start = section.offset as usize;
+        let arrow = output[start..start + section.length as usize].to_vec();
+        let arrow_reader = FileReader::try_new(Cursor::new(arrow), None).unwrap();
+        arrow_reader
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    }
+
+    #[test]
+    fn writer_emits_open_pore_level_for_versions_that_require_it() {
+        // Official pod5 >= 0.3.30 refuses Reads tables without this column.
+        for version in [None, Some("0.3.30"), Some("0.3.34"), Some("0.3.39")] {
+            let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+            pod5.header.pod5_version = version.map(str::to_string);
+            let fields = written_reads_field_names(&pod5);
+            assert!(
+                fields.iter().any(|name| name == "open_pore_level"),
+                "version {version:?} wrote {fields:?}"
+            );
+        }
+    }
+
+    fn assert_fixture_run_info_columns(run_info: &Pod5RunInfo) {
+        let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
+        assert_eq!(run_info.acquisition_start_time, 1_688_015_479_792);
+        assert_eq!(run_info.adc_max, 4095);
+        assert_eq!(run_info.adc_min, -4096);
+        assert_eq!(run_info.context_tags.len(), 8);
+        assert_eq!(run_info.context_tags[0], pair("barcoding_enabled", "0"));
+        assert_eq!(
+            run_info.context_tags[7],
+            pair("sequencing_kit", "sqk-nbd114-24")
+        );
+        assert_eq!(run_info.flow_cell_product_code, "FLO-MIN114");
+        assert_eq!(
+            run_info.protocol_name,
+            "sequencing/sequencing_MIN114_DNA_e8_2_400K:FLO-MIN114:SQK-NBD114-24:400"
+        );
+        assert_eq!(
+            run_info.protocol_run_id,
+            "f51f2183-4844-4a44-9be9-d7455407b836"
+        );
+        assert_eq!(run_info.protocol_start_time, 1_688_015_166_811);
+        assert_eq!(run_info.sequencer_position, "MN40918");
+        assert_eq!(run_info.sequencer_position_type, "MinION Mk1B");
+        assert_eq!(run_info.system_name, "grhl-c214-07");
+        assert_eq!(run_info.system_type, "Darwin 21.6.0");
+        assert_eq!(run_info.tracking_id.len(), 29);
+        assert_eq!(run_info.tracking_id[0], pair("asic_id", "616835618"));
+        assert_eq!(run_info.tracking_id[28], pair("version", "5.5.3"));
+    }
+
+    #[test]
+    fn fixture_run_info_reads_every_column() {
+        let pod5 = Pod5::from_path(A_100_POD5).unwrap();
+
+        assert_fixture_run_info_columns(&pod5.run_infos[0]);
+    }
+
+    #[test]
+    fn writer_preserves_every_run_info_column() {
+        let pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        let mut output = Vec::new();
+        pod5.to_writer(&mut output).unwrap();
+        let round_tripped = Pod5::from_reader(&output[..]).unwrap();
+
+        assert_fixture_run_info_columns(&round_tripped.run_infos[0]);
+    }
+
+    #[test]
+    fn open_pore_level_version_threshold_is_numeric() {
+        for (version, expected) in [
+            ("0.3.29", false),
+            ("0.2.99", false),
+            ("0.3.30", true),
+            ("0.3.100", true),
+            ("0.10.0", true),
+            ("1.0.0", true),
+            // Unparseable versions get the newest schema.
+            ("0.3", true),
+            ("0.3.29.1", true),
+            ("+0.3.29", true),
+            ("", true),
+        ] {
+            assert_eq!(writes_open_pore_level(version), expected, "{version}");
+        }
+    }
+
+    #[test]
+    fn writer_omits_open_pore_level_for_older_versions() {
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        pod5.header.pod5_version = Some("0.3.29".to_string());
+        let fields = written_reads_field_names(&pod5);
+
+        assert!(!fields.iter().any(|name| name == "open_pore_level"));
+        assert_eq!(fields.len(), READS_TABLE_FIELDS.len());
+    }
+
+    #[test]
+    fn fixture_without_open_pore_level_reads_as_none() {
+        let pod5 = Pod5::from_path(A_100_POD5).unwrap();
+
+        assert!(
+            pod5.records
+                .iter()
+                .all(|record| record.open_pore_level.is_none())
+        );
+    }
+
+    #[test]
+    fn open_pore_level_round_trips() {
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        pod5.header.pod5_version = Some("0.3.39".to_string());
+        pod5.records[0].open_pore_level = Some(222.5);
+        let mut output = Vec::new();
+        pod5.to_writer(&mut output).unwrap();
+        let round_tripped = Pod5::from_reader(&output[..]).unwrap();
+
+        assert_eq!(round_tripped.records[0].open_pore_level, Some(222.5));
+        assert_eq!(round_tripped.records[1].open_pore_level, None);
+    }
+
+    #[test]
+    fn writer_rejects_open_pore_level_for_versions_without_the_column() {
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        pod5.header.pod5_version = Some("0.3.28".to_string());
+        pod5.records[0].open_pore_level = Some(222.5);
+        let mut output = Vec::new();
+
+        let error = pod5.to_writer(&mut output).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -3031,6 +3843,22 @@ mod pod5_tests {
                 sequencing_kit: "kit".to_string(),
                 sample_rate: 5000,
                 software: "software".to_string(),
+                acquisition_start_time: 1_700_000_000_123,
+                adc_max: 2047,
+                adc_min: -2048,
+                context_tags: vec![("experiment_type".to_string(), "rna".to_string())],
+                flow_cell_product_code: "FLO-PRO114M".to_string(),
+                protocol_name: "protocol".to_string(),
+                protocol_run_id: "protocol-run".to_string(),
+                protocol_start_time: 1_699_999_999_000,
+                sequencer_position: "1A".to_string(),
+                sequencer_position_type: "PromethION".to_string(),
+                system_name: "host".to_string(),
+                system_type: "Linux".to_string(),
+                tracking_id: vec![
+                    ("asic_id".to_string(), "1".to_string()),
+                    ("device_id".to_string(), "PC24B".to_string()),
+                ],
             }],
             signals: vec![Pod5Signal {
                 read_id: read_id.clone(),
@@ -3059,6 +3887,7 @@ mod pod5_tests {
                 end_reason: "signal_positive".to_string(),
                 end_reason_forced: false,
                 run_info: run_id,
+                open_pore_level: None,
             }],
         };
 
@@ -3075,6 +3904,593 @@ mod pod5_tests {
         assert_eq!(round_tripped.run_infos, pod5.run_infos);
     }
 
+    /// Where an Arrow footer `Block` of the first `kind` section sits in `data`.
+    fn arrow_block_position(
+        data: &[u8],
+        kind: Pod5SectionKind,
+        dictionary: bool,
+        index: usize,
+    ) -> usize {
+        let reader = Pod5Reader::from_reader(Cursor::new(data.to_vec())).unwrap();
+        let section = reader
+            .header
+            .sections
+            .iter()
+            .find(|section| section.kind == kind)
+            .unwrap();
+        let (start, end) = (
+            section.offset as usize,
+            (section.offset + section.length) as usize,
+        );
+        let footer_len = i32::from_le_bytes(data[end - 10..end - 6].try_into().unwrap()) as usize;
+        let footer_start = end - 10 - footer_len;
+        let footer = &data[footer_start..end - 10];
+        let parsed = root_as_footer(footer).unwrap();
+        let blocks = if dictionary {
+            parsed.dictionaries().unwrap()
+        } else {
+            parsed.recordBatches().unwrap()
+        };
+        let block: &arrow_ipc::Block = blocks.get(index);
+        assert!(start < footer_start);
+        footer_start + (block as *const arrow_ipc::Block as usize - footer.as_ptr() as usize)
+    }
+
+    /// The fixture with one Arrow footer block's `bodyLength` replaced.
+    fn fixture_with_block_body_length(
+        kind: Pod5SectionKind,
+        dictionary: bool,
+        body: i64,
+    ) -> Vec<u8> {
+        let mut data = std::fs::read(A_100_POD5).unwrap();
+        // Block layout: offset i64, metaDataLength i32, padding, bodyLength i64.
+        let position = arrow_block_position(&data, kind, dictionary, 0) + 16;
+        data[position..position + 8].copy_from_slice(&body.to_le_bytes());
+        data
+    }
+
+    fn assert_invalid_pod5(data: Vec<u8>) {
+        let error = Pod5Reader::from_reader(Cursor::new(data.clone()))
+            .and_then(Pod5Reader::read_all)
+            .expect_err("malformed POD5 should be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(Pod5::from_reader(&data[..]).is_err());
+    }
+
+    #[test]
+    fn negative_dictionary_body_length_is_rejected() {
+        assert_invalid_pod5(fixture_with_block_body_length(
+            Pod5SectionKind::Reads,
+            true,
+            -1,
+        ));
+    }
+
+    #[test]
+    fn negative_record_batch_body_length_is_rejected() {
+        assert_invalid_pod5(fixture_with_block_body_length(
+            Pod5SectionKind::Reads,
+            false,
+            -8,
+        ));
+    }
+
+    #[test]
+    fn record_batch_body_past_its_section_is_rejected() {
+        assert_invalid_pod5(fixture_with_block_body_length(
+            Pod5SectionKind::Signal,
+            false,
+            1 << 44,
+        ));
+    }
+
+    #[test]
+    fn record_batch_length_that_disagrees_with_its_columns_is_rejected() {
+        let mut data = std::fs::read(A_100_POD5).unwrap();
+        let position = arrow_batch_length_position(&data, Pod5SectionKind::Signal);
+        data[position..position + 8].copy_from_slice(&(1i64 << 40).to_le_bytes());
+
+        assert_invalid_pod5(data);
+    }
+
+    /// Where the Message of an Arrow footer block starts in `data`.
+    fn arrow_message_start(data: &[u8], kind: Pod5SectionKind, dictionary: bool) -> usize {
+        let block = arrow_block_position(data, kind, dictionary, 0);
+        let section = Pod5Reader::from_reader(Cursor::new(data.to_vec()))
+            .unwrap()
+            .header
+            .sections
+            .into_iter()
+            .find(|section| section.kind == kind)
+            .unwrap();
+        let block_offset = i64::from_le_bytes(data[block..block + 8].try_into().unwrap());
+        // Block metadata is a 0xFFFFFFFF continuation, a length, then the Message.
+        section.offset as usize + block_offset as usize + 8
+    }
+
+    /// Where a batch's first field node (length i64, then null_count i64) sits.
+    fn arrow_first_node_position(data: &[u8], kind: Pod5SectionKind, dictionary: bool) -> usize {
+        let start = arrow_message_start(data, kind, dictionary);
+        let message = root_as_message(&data[start..]).unwrap();
+        let batch = if dictionary {
+            message
+                .header_as_dictionary_batch()
+                .unwrap()
+                .data()
+                .unwrap()
+        } else {
+            message.header_as_record_batch().unwrap()
+        };
+        let node: &arrow_ipc::FieldNode = batch.nodes().unwrap().get(0);
+        start + (node as *const arrow_ipc::FieldNode as usize - data[start..].as_ptr() as usize)
+    }
+
+    /// Where the first record batch's `length` field sits in `data`.
+    fn arrow_batch_length_position(data: &[u8], kind: Pod5SectionKind) -> usize {
+        let start = arrow_message_start(data, kind, false);
+        let message = &data[start..];
+        let table = fb_root_table(message).unwrap();
+        let header_field = fb_field_position(message, table, 8).unwrap().unwrap();
+        let header = fb_uoffset_target(message, header_field).unwrap();
+        start + fb_field_position(message, header, 4).unwrap().unwrap()
+    }
+
+    #[test]
+    fn unknown_arrow_column_type_is_rejected() {
+        // arrow-ipc panics ("Type NONE not supported") converting this schema.
+        let mut data = std::fs::read(A_100_POD5).unwrap();
+        let section = Pod5Reader::from_reader(Cursor::new(data.clone()))
+            .unwrap()
+            .header
+            .sections
+            .into_iter()
+            .find(|section| section.kind == Pod5SectionKind::Reads)
+            .unwrap();
+        let end = (section.offset + section.length) as usize;
+        let footer_len = i32::from_le_bytes(data[end - 10..end - 6].try_into().unwrap()) as usize;
+        let footer_start = end - 10 - footer_len;
+        let footer = &data[footer_start..end - 10];
+        let footer_table = fb_root_table(footer).unwrap();
+        let schema_field = fb_field_position(footer, footer_table, 6).unwrap().unwrap();
+        let schema = fb_uoffset_target(footer, schema_field).unwrap();
+        let signal_field = fb_table_vector_field(footer, schema, 6).unwrap()[1];
+        let type_type = fb_field_position(footer, signal_field, 8).unwrap().unwrap();
+        data[footer_start + type_type] = 0;
+
+        assert_invalid_pod5(data);
+    }
+
+    #[test]
+    fn signal_rows_with_an_unchecked_first_column_are_rejected() {
+        // A first column of a type the layout checks don't model leaves the
+        // row count unbounded, so the section is rejected when opened.
+        let mut data = std::fs::read(A_100_POD5).unwrap();
+        let batch_length = arrow_batch_length_position(&data, Pod5SectionKind::Signal);
+        let node_length = arrow_first_node_position(&data, Pod5SectionKind::Signal, false);
+        let section = Pod5Reader::from_reader(Cursor::new(data.clone()))
+            .unwrap()
+            .header
+            .sections
+            .into_iter()
+            .find(|section| section.kind == Pod5SectionKind::Signal)
+            .unwrap();
+        let end = (section.offset + section.length) as usize;
+        let footer_len = i32::from_le_bytes(data[end - 10..end - 6].try_into().unwrap()) as usize;
+        let footer_start = end - 10 - footer_len;
+        let footer = &data[footer_start..end - 10];
+        let footer_table = fb_root_table(footer).unwrap();
+        let schema_field = fb_field_position(footer, footer_table, 6).unwrap().unwrap();
+        let schema = fb_uoffset_target(footer, schema_field).unwrap();
+        let read_id_field = fb_table_vector_field(footer, schema, 6).unwrap()[0];
+        let type_type = footer_start
+            + fb_field_position(footer, read_id_field, 8)
+                .unwrap()
+                .unwrap();
+        data[type_type] = arrow_ipc::Type::BinaryView.0;
+        data[batch_length..batch_length + 8].copy_from_slice(&i64::MAX.to_le_bytes());
+        data[node_length..node_length + 8].copy_from_slice(&i64::MAX.to_le_bytes());
+
+        let error = Pod5Reader::from_reader(Cursor::new(data))
+            .map(|reader| reader.header.signal_count())
+            .expect_err("unbounded Signal row count should be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn zero_width_first_column_cannot_vouch_for_a_row_count() {
+        // FixedSizeBinary(0) needs no bytes however many rows it claims.
+        let mut data = std::fs::read(A_100_POD5).unwrap();
+        let batch_length = arrow_batch_length_position(&data, Pod5SectionKind::Signal);
+        let node_length = arrow_first_node_position(&data, Pod5SectionKind::Signal, false);
+        let section = Pod5Reader::from_reader(Cursor::new(data.clone()))
+            .unwrap()
+            .header
+            .sections
+            .into_iter()
+            .find(|section| section.kind == Pod5SectionKind::Signal)
+            .unwrap();
+        let end = (section.offset + section.length) as usize;
+        let footer_len = i32::from_le_bytes(data[end - 10..end - 6].try_into().unwrap()) as usize;
+        let footer_start = end - 10 - footer_len;
+        let footer = &data[footer_start..end - 10];
+        let footer_table = fb_root_table(footer).unwrap();
+        let schema_field = fb_field_position(footer, footer_table, 6).unwrap().unwrap();
+        let schema = fb_uoffset_target(footer, schema_field).unwrap();
+        let read_id_field = fb_table_vector_field(footer, schema, 6).unwrap()[0];
+        let type_field = fb_field_position(footer, read_id_field, 10)
+            .unwrap()
+            .unwrap();
+        let binary_type = fb_uoffset_target(footer, type_field).unwrap();
+        let byte_width = footer_start + fb_field_position(footer, binary_type, 4).unwrap().unwrap();
+        assert_eq!(data[byte_width..byte_width + 4], 16i32.to_le_bytes());
+        data[byte_width..byte_width + 4].copy_from_slice(&0i32.to_le_bytes());
+        data[batch_length..batch_length + 8].copy_from_slice(&i64::MAX.to_le_bytes());
+        data[node_length..node_length + 8].copy_from_slice(&i64::MAX.to_le_bytes());
+
+        let error = Pod5Reader::from_reader(Cursor::new(data))
+            .map(|reader| reader.header.signal_count())
+            .expect_err("unbounded Signal row count should be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn compressed_arrow_bodies_are_rejected() {
+        use arrow_ipc::CompressionType;
+        use arrow_ipc::writer::IpcWriteOptions;
+
+        let pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        let metadata = pod5_writer_metadata(&pod5);
+        let schema = Arc::new(signal_schema(&metadata));
+        let batch = build_signal_batch(&pod5.signals, &schema).unwrap();
+        let options = IpcWriteOptions::default()
+            .try_with_compression(Some(CompressionType::ZSTD))
+            .unwrap();
+        let mut data = Vec::new();
+        let mut writer =
+            FileWriter::try_new_with_options(&mut data, batch.schema().as_ref(), options).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+
+        let length = data.len() as u64;
+        let shared = Rc::new(RefCell::new(Cursor::new(data)));
+        let error = validate_arrow_section(shared, 0, length).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn null_count_without_a_validity_buffer_is_rejected() {
+        for (kind, dictionary) in [
+            (Pod5SectionKind::Reads, false),
+            (Pod5SectionKind::Signal, false),
+            (Pod5SectionKind::Reads, true),
+        ] {
+            let mut data = std::fs::read(A_100_POD5).unwrap();
+            let null_count = arrow_first_node_position(&data, kind, dictionary) + 8;
+            data[null_count..null_count + 8].copy_from_slice(&1i64.to_le_bytes());
+
+            assert_invalid_pod5(data);
+        }
+    }
+
+    #[test]
+    fn batch_and_column_lengths_beyond_their_buffers_are_rejected() {
+        let mut data = std::fs::read(A_100_POD5).unwrap();
+        let batch_length = arrow_batch_length_position(&data, Pod5SectionKind::Signal);
+        let node_length = arrow_first_node_position(&data, Pod5SectionKind::Signal, false);
+        data[batch_length..batch_length + 8].copy_from_slice(&i64::MAX.to_le_bytes());
+        data[node_length..node_length + 8].copy_from_slice(&i64::MAX.to_le_bytes());
+
+        // Opening must fail: header counts are reported from the open alone.
+        let error = Pod5Reader::from_reader(Cursor::new(data.clone()))
+            .map(|reader| reader.header.signal_count())
+            .expect_err("bogus Signal row count should be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_invalid_pod5(data);
+    }
+
+    #[test]
+    fn largest_representable_vbz_limit_does_not_overflow() {
+        // div_ceil(n, 8) + 2n == usize::MAX exactly for this n on 64-bit.
+        assert!(decompress_vbz_signal(&[], usize::MAX / 17 * 8).is_err());
+    }
+
+    #[test]
+    fn huge_footer_vector_length_is_rejected_without_allocating_it() {
+        let metadata = Pod5WriterMetadata {
+            file_identifier: "00000000-0000-0000-0000-000000000002".to_string(),
+            software: "test".to_string(),
+            pod5_version: "0.3.34".to_string(),
+        };
+        let entry = Pod5FooterEntry {
+            offset: 24,
+            length: 8,
+            content_type: 0,
+        };
+        let mut footer = build_pod5_footer(&metadata, &[entry]);
+        let table = fb_root_table(&footer).unwrap();
+        let field = fb_field_position(&footer, table, 10).unwrap().unwrap();
+        let vector = fb_uoffset_target(&footer, field).unwrap();
+        footer[vector..vector + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        assert!(parse_pod5_footer(&footer).is_err());
+    }
+
+    #[test]
+    fn huge_declared_sample_counts_are_errors_not_allocations() {
+        let samples = [1i16, 2, 3];
+        let compressed = compress_vbz_signal(&samples).unwrap();
+        assert!(decompress_vbz_signal(&compressed, 1 << 40).is_err());
+
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        pod5.records[0].num_samples = 1 << 62;
+        assert!(pod5.signal_for_record(&pod5.records[0]).is_err());
+        let mut reader = Pod5Reader::from_path(A_100_POD5).unwrap();
+        let mut record = reader.read_record().unwrap().unwrap();
+        record.num_samples = 1 << 62;
+        assert!(reader.signal_for_record(&record).is_err());
+    }
+
+    /// An Arrow Signal table with one record batch per entry of `batches`,
+    /// and each batch's row count. Rows are `(last read ID byte, samples,
+    /// declared sample count)`.
+    #[allow(clippy::type_complexity)]
+    fn signal_table(batches: &[&[(u8, &[i16], u32)]]) -> (Vec<u8>, Vec<usize>) {
+        use arrow_array::builder::{Int16Builder, LargeListBuilder};
+
+        let schema = Arc::new(Schema::new(vec![
+            uuid_field("read_id"),
+            Field::new(
+                "signal",
+                DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int16, true))),
+                false,
+            ),
+            Field::new("samples", DataType::UInt32, false),
+        ]));
+        let batch = |rows: &[(u8, &[i16], u32)]| {
+            let mut read_id = FixedSizeBinaryBuilder::new(16);
+            let mut signal = LargeListBuilder::new(Int16Builder::new());
+            for (id, values, _) in rows {
+                let mut bytes = [0u8; 16];
+                bytes[15] = *id;
+                read_id.append_value(bytes).unwrap();
+                signal.values().append_slice(values);
+                signal.append(true);
+            }
+            let samples = UInt32Array::from(rows.iter().map(|row| row.2).collect::<Vec<_>>());
+            let signal = signal
+                .finish()
+                .into_data()
+                .into_builder()
+                .data_type(schema.field(1).data_type().clone())
+                .build()
+                .unwrap();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(read_id.finish()),
+                    Arc::new(arrow_array::LargeListArray::from(signal)),
+                    Arc::new(samples),
+                ],
+            )
+            .unwrap()
+        };
+
+        let mut data = Vec::new();
+        let mut writer = FileWriter::try_new(&mut data, &schema).unwrap();
+        for rows in batches {
+            writer.write(&batch(rows)).unwrap();
+        }
+        writer.finish().unwrap();
+        drop(writer);
+        (data, batches.iter().map(|rows| rows.len()).collect())
+    }
+
+    fn signal_cursor_over<R: Read + Seek>(
+        reader: R,
+        length: u64,
+        batch_rows: Vec<usize>,
+    ) -> Pod5SignalCursor<R> {
+        let section = Pod5Section {
+            kind: Pod5SectionKind::Signal,
+            offset: 0,
+            length,
+            padded_length: length,
+            row_count: batch_rows.iter().sum(),
+        };
+        Pod5SignalCursor::new(Rc::new(RefCell::new(reader)), vec![(section, batch_rows)])
+    }
+
+    /// A Signal table of three batches: `[row 0]`, `[row 1]`, `[rows 2, 3]`.
+    /// Row 1 declares three samples but stores two, so its batch fails to parse.
+    fn signal_cursor_with_bad_middle_batch() -> Pod5SignalCursor<Cursor<Vec<u8>>> {
+        let (data, batch_rows) = signal_table(&[
+            &[(1, &[10, 11], 2)],
+            &[(2, &[20, 21], 3)],
+            &[(3, &[30, 31], 2), (4, &[40, 41], 2)],
+        ]);
+        let length = data.len() as u64;
+        signal_cursor_over(Cursor::new(data), length, batch_rows)
+    }
+
+    #[test]
+    fn signal_rows_are_read_from_their_own_batch() {
+        // Out-of-order access used to restart at row 0 and read every batch
+        // before the one wanted, which is quadratic over a whole file.
+        let samples: Vec<i16> = (0..2_000).collect();
+        let rows: Vec<(u8, &[i16], u32)> = (0..50).map(|id| (id, &samples[..], 2_000)).collect();
+        let batches: Vec<&[(u8, &[i16], u32)]> = rows.chunks(1).collect();
+        let (data, batch_rows) = signal_table(&batches);
+        let length = data.len() as u64;
+        let batch_bytes = length / 50;
+        let (reader, bytes_read) = CountingReadSeek::new(Cursor::new(data));
+        let mut cursor = signal_cursor_over(reader, length, batch_rows);
+
+        for row in [49, 0, 25, 24, 48] {
+            let before = bytes_read.get();
+            let signal = cursor.signal_row_at(row).unwrap();
+            assert_eq!(signal.read_id[34..], format!("{row:02x}"));
+            assert!(bytes_read.get() - before < 3 * batch_bytes, "row {row}");
+        }
+    }
+
+    #[test]
+    fn rows_of_the_batch_just_read_are_served_without_reading_again() {
+        let samples = [1i16, 2, 3];
+        let rows: Vec<(u8, &[i16], u32)> = (0..10).map(|id| (id, &samples[..], 3)).collect();
+        let (data, batch_rows) = signal_table(&[&rows]);
+        let length = data.len() as u64;
+        let (reader, bytes_read) = CountingReadSeek::new(Cursor::new(data));
+        let mut cursor = signal_cursor_over(reader, length, batch_rows);
+
+        cursor.signal_row_at(9).unwrap();
+        let before = bytes_read.get();
+        for row in [0, 5, 3] {
+            let signal = cursor.signal_row_at(row).unwrap();
+            assert_eq!(signal.read_id[34..], format!("{row:02x}"));
+        }
+        assert_eq!(bytes_read.get(), before);
+
+        // A row already handed out is read again with its batch.
+        assert_eq!(cursor.signal_row_at(9).unwrap().read_id[34..], *"09");
+        assert!(bytes_read.get() > before);
+        assert_eq!(cursor.signal_row_at(8).unwrap().read_id[34..], *"08");
+    }
+
+    fn row_read_id(cursor: &mut Pod5SignalCursor<Cursor<Vec<u8>>>, row: u64) -> io::Result<String> {
+        cursor.signal_row_at(row).map(|signal| signal.read_id)
+    }
+
+    #[test]
+    fn signal_rows_after_a_bad_batch_keep_their_numbers() {
+        let mut cursor = signal_cursor_with_bad_middle_batch();
+
+        assert_eq!(
+            row_read_id(&mut cursor, 0).unwrap(),
+            "00000000-0000-0000-0000-000000000001"
+        );
+        assert!(row_read_id(&mut cursor, 1).is_err());
+        assert_eq!(
+            row_read_id(&mut cursor, 2).unwrap(),
+            "00000000-0000-0000-0000-000000000003"
+        );
+        assert!(row_read_id(&mut cursor, 1).is_err());
+        assert_eq!(
+            row_read_id(&mut cursor, 3).unwrap(),
+            "00000000-0000-0000-0000-000000000004"
+        );
+    }
+
+    #[test]
+    fn signal_rows_past_a_bad_batch_are_reachable_on_a_fresh_cursor() {
+        let mut cursor = signal_cursor_with_bad_middle_batch();
+        assert_eq!(
+            row_read_id(&mut cursor, 3).unwrap(),
+            "00000000-0000-0000-0000-000000000004"
+        );
+
+        let mut cursor = signal_cursor_with_bad_middle_batch();
+        assert_eq!(
+            row_read_id(&mut cursor, 2).unwrap(),
+            "00000000-0000-0000-0000-000000000003"
+        );
+        assert!(row_read_id(&mut cursor, 4).is_err());
+    }
+
+    fn assert_writer_rejects(pod5: &Pod5) {
+        let mut output = Vec::new();
+        let error = pod5.to_writer(&mut output).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn writer_rejects_uncompressed_payload_shorter_than_declared_samples() {
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        let mut samples = pod5.signals[0].decompress().unwrap();
+        samples.pop();
+        pod5.signals[0].payload = Pod5SignalPayload::Uncompressed(samples);
+
+        assert_writer_rejects(&pod5);
+    }
+
+    #[test]
+    fn writer_rejects_vbz_payload_that_disagrees_with_declared_samples() {
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        pod5.signals[0].samples += 1;
+        let record = pod5
+            .records
+            .iter_mut()
+            .find(|record| record.signal_rows == [0])
+            .unwrap();
+        record.num_samples += 1;
+
+        assert_writer_rejects(&pod5);
+    }
+
+    #[test]
+    fn writer_rejects_reads_that_reference_another_reads_signal() {
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        let other_row = pod5
+            .records
+            .iter()
+            .find(|record| record.read_id != pod5.records[0].read_id)
+            .unwrap()
+            .signal_rows[0];
+        pod5.records[0].signal_rows = vec![other_row];
+        pod5.records[0].num_samples = u64::from(pod5.signals[other_row as usize].samples);
+
+        assert_writer_rejects(&pod5);
+    }
+
+    #[test]
+    fn writer_rejects_malformed_header_metadata() {
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        pod5.header.pod5_version = Some("0.3".to_string());
+        assert_writer_rejects(&pod5);
+
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        pod5.header.file_identifier = Some("garbage".to_string());
+        assert_writer_rejects(&pod5);
+
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        pod5.header.file_identifier = Some("1cadb1e9592f4e2292854626f2b7da9f".to_string());
+        assert_writer_rejects(&pod5);
+    }
+
+    #[test]
+    fn writer_rejects_unknown_end_reason() {
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        pod5.records[0].end_reason = "garbage".to_string();
+
+        assert_writer_rejects(&pod5);
+    }
+
+    #[test]
+    fn writer_accepts_every_official_end_reason() {
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        let reasons = [
+            "unknown",
+            "mux_change",
+            "unblock_mux_change",
+            "data_service_unblock_mux_change",
+            "signal_positive",
+            "signal_negative",
+            "api_request",
+            "device_data_error",
+            "analysis_config_change",
+            "paused",
+        ];
+        for (record, reason) in pod5.records.iter_mut().zip(reasons.iter().cycle()) {
+            record.end_reason = reason.to_string();
+        }
+        let mut output = Vec::new();
+        pod5.to_writer(&mut output).unwrap();
+        let round_tripped = Pod5::from_reader(&output[..]).unwrap();
+
+        assert_eq!(round_tripped.records[9].end_reason, "paused");
+    }
+
     #[test]
     fn writer_rejects_invalid_signal_row_references() {
         let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
@@ -3082,6 +4498,43 @@ mod pod5_tests {
         let mut output = Vec::new();
 
         assert!(pod5.to_writer(&mut output).is_err());
+    }
+
+    #[test]
+    fn from_reader_accepts_section_marker_bytes_inside_data() {
+        // Payloads without a marker get brust's fixed one; data that happens
+        // to contain it must not split a section.
+        let mut pod5 = Pod5::from_path(A_100_POD5).unwrap();
+        pod5.header.section_marker = [0; 16];
+        pod5.run_infos[0].experiment_name = "BRUSTPOD5WRITER!".to_string();
+        let mut output = Vec::new();
+        pod5.to_writer(&mut output).unwrap();
+
+        let buffered = Pod5::from_reader(&output[..]).unwrap();
+
+        assert_eq!(buffered.records.len(), RECORD_COUNT);
+        assert_eq!(buffered.run_infos[0].experiment_name, "BRUSTPOD5WRITER!");
+    }
+
+    #[test]
+    fn from_reader_rejects_a_zeroed_footer() {
+        let mut data = std::fs::read(A_100_POD5).unwrap();
+        let footer = Pod5::from_path(A_100_POD5)
+            .unwrap()
+            .header
+            .sections
+            .into_iter()
+            .find(|section| section.kind == Pod5SectionKind::Footer)
+            .unwrap();
+        let payload = footer.offset as usize + POD5_FOOTER_MAGIC.len();
+        data[payload..payload + footer.length as usize].fill(0);
+
+        assert!(
+            Pod5Reader::from_reader(Cursor::new(data.clone()))
+                .and_then(Pod5Reader::read_all)
+                .is_err()
+        );
+        assert!(Pod5::from_reader(&data[..]).is_err());
     }
 
     #[test]

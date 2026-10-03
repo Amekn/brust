@@ -5,10 +5,11 @@
 //! format validation; stats collection avoids repeating expensive validation
 //! work that the readers already perform.
 
-use crate::{Format, Result};
+use crate::{Error, Format, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
+use std::hash::{BuildHasher, RandomState};
 use std::path::Path;
 
 /// Statistics for any supported Brust format.
@@ -156,9 +157,12 @@ impl BaseComposition {
         self.g + self.c
     }
 
-    /// Returns the GC fraction, or `None` when no bases were observed.
+    /// Returns `G` plus `C` as a fraction of the unambiguous bases (`A`, `C`,
+    /// `G`, `T` and `U`), or `None` when there are none. `N`, other IUPAC codes,
+    /// gaps and other symbols are left out of the denominator.
     pub fn gc_fraction(&self) -> Option<f64> {
-        (self.total > 0).then(|| self.gc_count() as f64 / self.total as f64)
+        let unambiguous = self.a + self.c + self.g + self.t + self.u;
+        (unambiguous > 0).then(|| self.gc_count() as f64 / unambiguous as f64)
     }
 
     fn add_sequence(&mut self, sequence: &str) {
@@ -229,6 +233,10 @@ pub struct FastaStats {
     /// Number of records whose sequence is empty.
     pub empty_records: u64,
     /// Number of distinct record IDs.
+    ///
+    /// IDs are compared by 128-bit fingerprint rather than kept in memory;
+    /// two different IDs share one with probability under 10⁻²⁰ for a billion
+    /// IDs, which would count one as a repeat.
     pub unique_ids: u64,
     /// Number of records whose ID was seen previously.
     pub duplicate_id_records: u64,
@@ -252,6 +260,10 @@ pub struct FastqStats {
     /// Number of reads containing at least one `N` base.
     pub reads_with_n: u64,
     /// Number of distinct read IDs.
+    ///
+    /// IDs are compared by 128-bit fingerprint rather than kept in memory;
+    /// two different IDs share one with probability under 10⁻²⁰ for a billion
+    /// IDs, which would count one as a repeat.
     pub unique_ids: u64,
     /// Number of reads whose ID was seen previously.
     pub duplicate_id_records: u64,
@@ -347,7 +359,8 @@ pub struct AlignmentStats {
     pub mapq_zero: u64,
     /// Number of records with mapping quality `255`.
     pub mapq_unavailable: u64,
-    /// Mapping quality summary.
+    /// Mapping quality summary of mapped records whose MAPQ is available (not
+    /// 255).
     pub mapq: NumberStats,
     /// Template length (`TLEN`) summary.
     pub template_length: NumberStats,
@@ -493,7 +506,7 @@ pub fn fasta_stats<P: AsRef<Path>>(input: P) -> Result<FastaStats> {
     let mut reader = fasta::FastaReader::from_path(path)?;
     let mut sequence_lengths = LengthAccumulator::default();
     let mut bases = BaseComposition::default();
-    let mut ids = HashSet::new();
+    let mut ids = IdSet::default();
     let mut records = 0;
     let mut records_with_description = 0;
     let mut empty_records = 0;
@@ -515,7 +528,7 @@ pub fn fasta_stats<P: AsRef<Path>>(input: P) -> Result<FastaStats> {
         if record.sequence.is_empty() {
             empty_records += 1;
         }
-        if !ids.insert(record.id) {
+        if !ids.insert(&record.id) {
             duplicate_id_records += 1;
         }
     }
@@ -527,7 +540,7 @@ pub fn fasta_stats<P: AsRef<Path>>(input: P) -> Result<FastaStats> {
         bases,
         records_with_description,
         empty_records,
-        unique_ids: ids.len() as u64,
+        unique_ids: ids.len(),
         duplicate_id_records,
     })
 }
@@ -540,7 +553,7 @@ pub fn fastq_stats<P: AsRef<Path>>(input: P) -> Result<FastqStats> {
     let mut read_lengths = LengthAccumulator::default();
     let mut bases = BaseComposition::default();
     let mut qualities = QualityAccumulator::default();
-    let mut ids = HashSet::new();
+    let mut ids = IdSet::default();
     let mut reads = 0;
     let mut reads_with_description = 0;
     let mut reads_with_n = 0;
@@ -566,7 +579,7 @@ pub fn fastq_stats<P: AsRef<Path>>(input: P) -> Result<FastqStats> {
         {
             reads_with_n += 1;
         }
-        if !ids.insert(record.id) {
+        if !ids.insert(&record.id) {
             duplicate_id_records += 1;
         }
     }
@@ -579,7 +592,7 @@ pub fn fastq_stats<P: AsRef<Path>>(input: P) -> Result<FastqStats> {
         qualities: qualities.finish(),
         reads_with_description,
         reads_with_n,
-        unique_ids: ids.len() as u64,
+        unique_ids: ids.len(),
         duplicate_id_records,
     })
 }
@@ -673,9 +686,21 @@ pub fn pod5_stats<P: AsRef<Path>>(input: P) -> Result<Pod5Stats> {
     let mut forced_end_reason_reads = 0;
     let mut reads_with_missing_run_info = 0;
 
+    let overflow = || {
+        Error::invalid(
+            Format::Pod5,
+            "POD5 read sample or event counts overflow u64",
+        )
+    };
+    let mut total_minknow_events = 0u64;
     while let Some(record) = reader.read_record()? {
         read_count += 1;
-        total_samples += record.num_samples;
+        // The counts come from the file, so their sums are checked; per-run
+        // and per-channel sums are bounded by these totals.
+        total_samples = u64::checked_add(total_samples, record.num_samples).ok_or_else(overflow)?;
+        total_minknow_events = total_minknow_events
+            .checked_add(record.num_minknow_events)
+            .ok_or_else(overflow)?;
         read_sample_lengths.push(record.num_samples);
         signal_rows_per_read.push(record.signal_rows.len() as u64);
         minknow_events.push(record.num_minknow_events);
@@ -788,26 +813,32 @@ pub fn pod5_stats<P: AsRef<Path>>(input: P) -> Result<Pod5Stats> {
     })
 }
 
+/// Summarises lengths from a histogram, so memory grows with the number of
+/// distinct lengths rather than the number of records.
 #[derive(Default)]
 struct LengthAccumulator {
-    lengths: Vec<u64>,
+    /// How many times each length was seen.
+    counts: BTreeMap<u64, u64>,
+    count: u64,
     total: u64,
 }
 
 impl LengthAccumulator {
     fn push(&mut self, length: u64) {
-        self.total += length;
-        self.lengths.push(length);
+        // Callers whose lengths come straight from a file check their sums;
+        // saturating keeps this from ever panicking.
+        self.total = self.total.saturating_add(length);
+        self.count += 1;
+        *self.counts.entry(length).or_default() += 1;
     }
 
-    fn finish(mut self) -> LengthStats {
-        self.lengths.sort_unstable_by(|left, right| right.cmp(left));
-        let count = self.lengths.len() as u64;
-        let min = self.lengths.last().copied();
-        let max = self.lengths.first().copied();
+    fn finish(self) -> LengthStats {
+        let count = self.count;
+        let min = self.counts.keys().next().copied();
+        let max = self.counts.keys().next_back().copied();
         let mean = (count > 0).then(|| self.total as f64 / count as f64);
-        let n50 = nx(&self.lengths, self.total, 50, 100);
-        let n90 = nx(&self.lengths, self.total, 90, 100);
+        let n50 = nx(&self.counts, self.total, 50, 100);
+        let n90 = nx(&self.counts, self.total, 90, 100);
 
         LengthStats {
             count,
@@ -818,6 +849,31 @@ impl LengthAccumulator {
             n50,
             n90,
         }
+    }
+}
+
+/// IDs seen so far, kept as 128-bit fingerprints rather than strings.
+///
+/// A fingerprint is two keyed SipHash values, so two different IDs share one
+/// with probability about n²/2¹²⁹ for n IDs (under 10⁻²⁰ for a billion). A
+/// clash would count one ID as a repeat.
+#[derive(Default)]
+struct IdSet {
+    hasher: RandomState,
+    fingerprints: HashSet<u128>,
+}
+
+impl IdSet {
+    /// Adds `id`, returning whether it had not been seen before.
+    fn insert(&mut self, id: &str) -> bool {
+        let high = self.hasher.hash_one((0u8, id));
+        let low = self.hasher.hash_one((1u8, id));
+        self.fingerprints
+            .insert((u128::from(high) << 64) | u128::from(low))
+    }
+
+    fn len(&self) -> u64 {
+        self.fingerprints.len() as u64
     }
 }
 
@@ -1023,26 +1079,44 @@ impl AlignmentAccumulator {
             record.fixed.mapq,
             i64::from(record.fixed.tlen),
         );
-        self.query_lengths.push(u64::from(record.fixed.l_seq));
+        // As for SAM: the stored sequence's length, else the CIGAR's query
+        // length when SEQ is absent (l_seq 0), else nothing.
+        if record.fixed.l_seq > 0 {
+            self.query_lengths.push(u64::from(record.fixed.l_seq));
+        }
 
+        // A record with more than 65,535 CIGAR operations keeps its real
+        // CIGAR in a CG tag, which is not one of its SAM tags.
+        let cg_cigar = record.stores_cigar_in_cg_tag();
         for field in &record.auxiliary {
+            if cg_cigar && field.tag == "CG" {
+                continue;
+            }
             *self
                 .optional_tag_counts
                 .entry(field.tag.clone())
                 .or_default() += 1;
         }
 
-        if !record.variable.cigar.is_empty() {
+        let cigar = record.cigar_ops();
+        if !cigar.is_empty() {
+            let mut query_len = 0u64;
             let mut reference_len = 0u64;
-            for packed in &record.variable.cigar {
+            for packed in cigar.iter() {
                 let len = u64::from(packed >> 4);
                 let Some(op) = bam_cigar_op(*packed) else {
                     continue;
                 };
                 *self.cigar_ops.entry(op).or_default() += len;
+                if matches!(op, 'M' | 'I' | 'S' | '=' | 'X') {
+                    query_len += len;
+                }
                 if matches!(op, 'M' | 'D' | 'N' | '=' | 'X') {
                     reference_len += len;
                 }
+            }
+            if record.fixed.l_seq == 0 {
+                self.query_lengths.push(query_len);
             }
             self.reference_lengths.push(reference_len);
         }
@@ -1050,7 +1124,11 @@ impl AlignmentAccumulator {
 
     fn push_flags(&mut self, flag: u16, reference_name: &str, mapq: u8, template_length: i64) {
         self.records += 1;
-        self.mapq.push(i64::from(mapq));
+        // MAPQ 255 means "unavailable", and an unmapped record's MAPQ has no
+        // meaning, so neither enters the summary.
+        if flag & sam::flags::UNMAPPED == 0 && mapq != 255 {
+            self.mapq.push(i64::from(mapq));
+        }
         self.template_length.push(template_length);
         *self
             .records_by_reference
@@ -1196,11 +1274,17 @@ fn summarize_bam_header(header: &bam::BamHeader, refs: &[bam::BamRef]) -> BamHea
     BamHeaderStats {
         header_text_bytes: header.text.len() as u64,
         binary_header_text_bytes: u64::from(header.l_text),
-        header_lines: header.text.lines().count() as u64,
+        header_lines: line_count(&header.text),
         reference_count: refs.len() as u64,
         references,
         declared_reference_bases,
     }
+}
+
+/// Counts lines as `str::lines` would, on bytes that need not be UTF-8.
+fn line_count(text: &[u8]) -> u64 {
+    let pieces = text.split(|&byte| byte == b'\n').count();
+    (pieces - usize::from(text.is_empty() || text.ends_with(b"\n"))) as u64
 }
 
 fn bam_reference_name(record: &bam::BamRecord, refs: &[bam::BamRef]) -> String {
@@ -1216,21 +1300,23 @@ fn bam_cigar_op(packed: u32) -> Option<char> {
     OPS.get((packed & 0x0f) as usize).copied().map(char::from)
 }
 
-fn nx(lengths_descending: &[u64], total: u64, numerator: u128, denominator: u128) -> Option<u64> {
-    if lengths_descending.is_empty() {
-        return None;
-    }
+/// The N-x of a length histogram: walking lengths from longest to shortest,
+/// the length at which the running sum first reaches
+/// `numerator / denominator` of `total`.
+fn nx(counts: &BTreeMap<u64, u64>, total: u64, numerator: u128, denominator: u128) -> Option<u64> {
     let threshold = (u128::from(total) * numerator).div_ceil(denominator);
     let mut cumulative = 0u128;
 
-    for length in lengths_descending {
-        cumulative += u128::from(*length);
+    // Each product is below 2^128 and the counts sum to at most u64::MAX, so
+    // the running sum cannot overflow.
+    for (&length, &count) in counts.iter().rev() {
+        cumulative += u128::from(length) * u128::from(count);
         if cumulative >= threshold {
-            return Some(*length);
+            return Some(length);
         }
     }
 
-    lengths_descending.last().copied()
+    counts.keys().next().copied()
 }
 
 impl fmt::Display for FastaStats {
@@ -1711,6 +1797,133 @@ mod tests {
     const BAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bam/aligned.bam");
     const POD5: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../pod5/A_100.pod5");
 
+    /// A per-test scratch folder, removed on drop.
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("brust-stats-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn file(&self, name: &str, contents: &[u8]) -> std::path::PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, contents).unwrap();
+            path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const ALIGNMENTS: &str = "@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\n\
+        noseq\t0\tref\t1\t60\t10M\t*\t0\t0\t*\t*\n\
+        withseq\t0\tref\t1\t255\t4M\t*\t0\t0\tACGT\tIIII\n\
+        unmapped\t4\t*\t0\t200\t*\t*\t0\t0\t*\t*\n";
+
+    #[test]
+    fn sam_and_bam_query_lengths_agree_when_seq_is_absent() {
+        // Without SEQ the CIGAR gives the query length; with neither, none.
+        let dir = TestDir::new("query-lengths");
+        let sam = dir.file("in.sam", ALIGNMENTS.as_bytes());
+        let bam = dir.0.join("in.bam");
+        crate::convert::convert(crate::convert::Conversion::SamToBam, &sam, &bam).unwrap();
+
+        let sam_stats = sam_stats(&sam).unwrap().alignments.query_lengths;
+        let bam_stats = bam_stats(&bam).unwrap().alignments.query_lengths;
+
+        assert_eq!((sam_stats.count, sam_stats.total), (2, 14));
+        assert_eq!((bam_stats.count, bam_stats.total), (2, 14));
+    }
+
+    #[test]
+    fn long_cigar_bam_stats_match_the_sam_they_came_from() {
+        // More than 65,535 operations: BAM stores a placeholder and a CG tag.
+        let dir = TestDir::new("long-cigar");
+        let bases = 35_000;
+        let text = format!(
+            "@HD\tVN:1.6\n@SQ\tSN:ref\tLN:1000000\nr1\t0\tref\t1\t60\t{}\t*\t0\t0\t{}\t{}\tNM:i:1\n",
+            "1M1D".repeat(bases),
+            "A".repeat(bases),
+            "I".repeat(bases)
+        );
+        let sam = dir.file("in.sam", text.as_bytes());
+        let bam = dir.0.join("in.bam");
+        crate::convert::convert(crate::convert::Conversion::SamToBam, &sam, &bam).unwrap();
+
+        let sam_stats = sam_stats(&sam).unwrap().alignments;
+        let bam_stats = bam_stats(&bam).unwrap().alignments;
+
+        assert_eq!(bam_stats.cigar_ops, sam_stats.cigar_ops);
+        assert_eq!(bam_stats.reference_lengths, sam_stats.reference_lengths);
+        assert_eq!(bam_stats.optional_tag_counts, sam_stats.optional_tag_counts);
+    }
+
+    #[test]
+    fn mapq_summary_leaves_out_unavailable_and_unmapped_records() {
+        let dir = TestDir::new("mapq");
+        let stats = sam_stats(dir.file("in.sam", ALIGNMENTS.as_bytes()))
+            .unwrap()
+            .alignments;
+
+        assert_eq!(stats.mapq.count, 1);
+        assert_eq!(stats.mapq.max, Some(60));
+        assert_eq!(stats.mapq.mean, Some(60.0));
+        assert_eq!(stats.mapq_unavailable, 1);
+    }
+
+    #[test]
+    fn header_line_count_matches_str_lines() {
+        for text in ["", "a", "a\n", "a\nb", "a\n\nb\n", "\n", "a\r\nb\r\n"] {
+            assert_eq!(
+                line_count(text.as_bytes()),
+                text.lines().count() as u64,
+                "{text:?}"
+            );
+        }
+        assert_eq!(line_count(b"@CO\tcaf\xe9\n@CO\tx\n"), 2);
+    }
+
+    #[test]
+    fn gc_fraction_counts_only_unambiguous_bases() {
+        let composition = |sequence: &str| {
+            let mut bases = BaseComposition::default();
+            bases.add_sequence(sequence);
+            bases.gc_fraction()
+        };
+
+        assert_eq!(composition("GCNN--AT"), Some(0.5));
+        assert_eq!(composition("GCAU"), Some(0.5));
+        assert_eq!(composition("NNN-"), None);
+        assert_eq!(composition(""), None);
+    }
+
+    #[test]
+    fn pod5_sample_totals_that_overflow_are_errors() {
+        let mut data = std::fs::read(POD5).unwrap();
+        let pod5 = pod5::Pod5::from_path(POD5).unwrap();
+        // The Reads table stores num_samples as consecutive u64 values.
+        let mut pattern = pod5.records[0].num_samples.to_le_bytes().to_vec();
+        pattern.extend_from_slice(&pod5.records[1].num_samples.to_le_bytes());
+        let position = data
+            .windows(pattern.len())
+            .position(|window| window == pattern)
+            .unwrap();
+        let huge = (u64::MAX / 2 + 1).to_le_bytes();
+        data[position..position + 8].copy_from_slice(&huge);
+        data[position + 8..position + 16].copy_from_slice(&huge);
+        let dir = TestDir::new("pod5-overflow");
+
+        let error = pod5_stats(dir.file("in.pod5", &data)).unwrap_err();
+
+        assert!(matches!(error, crate::Error::InvalidPod5(_)), "{error:?}");
+    }
+
     #[test]
     fn fasta_fixture_stats_capture_sequence_rollups() {
         // FASTA stats should count records, lengths, descriptions, and bases.
@@ -1799,5 +2012,109 @@ mod tests {
         assert!((qscore.mean.unwrap() - 40.0).abs() < 1e-9);
         assert!(!qscore.min.unwrap().is_nan());
         assert!(!qscore.max.unwrap().is_nan());
+    }
+
+    /// Summarises lengths the way stats did before the histogram: keep every
+    /// value, sort descending, and walk to each N-x.
+    fn sorted_length_stats(lengths: &[u64]) -> LengthStats {
+        let mut sorted = lengths.to_vec();
+        sorted.sort_unstable_by(|left, right| right.cmp(left));
+        let total = sorted
+            .iter()
+            .fold(0u64, |sum, &length| sum.saturating_add(length));
+        let nx = |numerator: u128| {
+            let threshold = (u128::from(total) * numerator).div_ceil(100);
+            let mut cumulative = 0u128;
+            sorted
+                .iter()
+                .find(|&&length| {
+                    cumulative += u128::from(length);
+                    cumulative >= threshold
+                })
+                .or(sorted.last())
+                .copied()
+        };
+        let count = sorted.len() as u64;
+        LengthStats {
+            count,
+            total,
+            min: sorted.last().copied(),
+            max: sorted.first().copied(),
+            mean: (count > 0).then(|| total as f64 / count as f64),
+            n50: nx(50),
+            n90: nx(90),
+        }
+    }
+
+    #[test]
+    fn length_histogram_matches_sorting_every_length() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut cases = vec![
+            vec![],
+            vec![0],
+            vec![0, 0, 0],
+            vec![u64::MAX, u64::MAX, 1],
+            vec![5, 5, 5, 1, 1, 9],
+        ];
+        for case in 0..300 {
+            let range = [1, 3, 10, 1_000, u64::MAX / 1_024][case % 5];
+            cases.push((0..case % 60).map(|_| random() % range).collect());
+        }
+
+        for lengths in cases {
+            let mut accumulator = LengthAccumulator::default();
+            for &length in &lengths {
+                accumulator.push(length);
+            }
+            assert_eq!(
+                accumulator.finish(),
+                sorted_length_stats(&lengths),
+                "{lengths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_lengths_share_one_histogram_entry() {
+        // A billion 150 bp reads must not need a billion stored lengths.
+        let mut accumulator = LengthAccumulator::default();
+        for _ in 0..100_000 {
+            accumulator.push(150);
+        }
+        accumulator.push(151);
+
+        assert_eq!(accumulator.counts.len(), 2);
+        let stats = accumulator.finish();
+        assert_eq!(stats.count, 100_001);
+        assert_eq!(stats.total, 15_000_151);
+        assert_eq!((stats.min, stats.max), (Some(150), Some(151)));
+    }
+
+    #[test]
+    fn id_set_reports_each_repeated_id() {
+        let mut ids = IdSet::default();
+
+        assert!(ids.insert("r1"));
+        assert!(ids.insert("r2"));
+        assert!(!ids.insert("r1"));
+        assert!(ids.insert("r10"));
+        assert!(!ids.insert("r2"));
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn id_set_keeps_a_fixed_size_fingerprint_per_id() {
+        // Storing the IDs themselves cost about 120 bytes per read.
+        let mut ids = IdSet::default();
+        ids.insert(&"x".repeat(10_000));
+
+        let fingerprints: &HashSet<u128> = &ids.fingerprints;
+        assert_eq!(fingerprints.len(), 1);
     }
 }

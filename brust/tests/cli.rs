@@ -331,3 +331,28 @@ fn cli_convert_accepts_bare_relative_output() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(names(&temp.join(".")), ["out.fasta"]);
 }
+
+#[cfg(unix)]
+#[test]
+fn closed_stdout_is_not_a_crash() {
+    // `brust stats ... | head -1`: the reader exits first, so writes fail with
+    // a broken pipe. That must not panic.
+    let mut child = brust()
+        .args([
+            "stats",
+            "fastq",
+            common::fixture("fastq/UDP0057_sub100.fastq")
+                .to_str()
+                .unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(output.status.success(), "{:?}: {stderr}", output.status);
+}

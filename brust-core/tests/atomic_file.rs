@@ -140,9 +140,10 @@ fn missing_parent_folder_is_not_found() {
 #[test]
 fn failed_rename_removes_temp_and_keeps_target_folder() {
     let dir = TempDir::new("failed-rename");
+    let mut file = AtomicFile::create(dir.join("out")).unwrap();
+    // A folder appearing at the target after `create` makes the rename fail.
     fs::create_dir(dir.join("out")).unwrap();
     fs::write(dir.join("out/keep.txt"), b"keep").unwrap();
-    let mut file = AtomicFile::create(dir.join("out")).unwrap();
     file.write_all(b"new").unwrap();
     assert!(file.commit().is_err());
     assert_eq!(names(dir.path()), ["out"]);
@@ -206,4 +207,46 @@ fn folder_sync_failure_reports_published_file() {
 fn atomic_file_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<AtomicFile>();
+}
+
+#[test]
+fn longest_legal_file_name_can_be_written() {
+    // The temporary name used to prefix the whole target name, so a legal
+    // 255-byte name failed with "File name too long".
+    let dir = TempDir::new("long-name");
+    for name in [format!("{}.fastq.gz", "a".repeat(246)), "é".repeat(127)] {
+        assert!(name.len() <= 255);
+        let mut file = AtomicFile::create(dir.join(&name)).unwrap();
+        file.write_all(b"data").unwrap();
+        file.commit().unwrap();
+        assert_eq!(fs::read(dir.join(&name)).unwrap(), b"data");
+    }
+}
+
+#[test]
+fn existing_directory_target_is_refused_up_front() {
+    let dir = TempDir::new("directory-target");
+    fs::create_dir(dir.join("out")).unwrap();
+
+    let error = AtomicFile::create(dir.join("out")).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(names(dir.path()), ["out"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn special_file_target_is_refused_instead_of_replaced() {
+    // Renaming over a FIFO, socket or device would silently replace it with a
+    // regular file.
+    let dir = TempDir::new("special-target");
+    let socket = dir.join("out.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+    let error = AtomicFile::create(&socket).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    use std::os::unix::fs::FileTypeExt;
+    assert!(fs::metadata(&socket).unwrap().file_type().is_socket());
+    assert_eq!(names(dir.path()), ["out.sock"]);
 }

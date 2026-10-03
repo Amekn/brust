@@ -28,6 +28,9 @@ use std::thread::{self, JoinHandle};
 /// compress.
 pub const MAX_BLOCK_DATA: usize = 64 * 1024 - 256;
 
+/// Largest uncompressed size a BGZF block may hold (the SAM spec's 64 KiB).
+const MAX_BLOCK_UNCOMPRESSED: usize = 64 * 1024;
+
 /// The standard 28-byte BGZF EOF marker: an empty BGZF block that ends a stream.
 pub const EOF_BLOCK: [u8; 28] = *b"\x1f\x8b\x08\x04\x00\x00\x00\x00\x00\xff\x06\x00BC\x02\x00\x1b\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 
@@ -143,7 +146,17 @@ impl<R: Read> BgzfReader<R> {
             let block = match read_bgzf_block(&mut self.inner, self.next_block_start) {
                 Ok(block) => block,
                 Err(error) => {
-                    self.last_read_failed = true;
+                    // A failed block is reported once, by its own error. A
+                    // transient error is not a failed block: a retry that then
+                    // reaches the end must still check for the EOF block.
+                    if !matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::Interrupted
+                            | io::ErrorKind::TimedOut
+                    ) {
+                        self.last_read_failed = true;
+                    }
                     return Err(error);
                 }
             };
@@ -208,7 +221,7 @@ fn read_bgzf_block<R: Read>(
     compressed_offset: u64,
 ) -> io::Result<Option<BgzfBlock>> {
     let mut prefix = [0u8; 12];
-    if !read_exact_or_eof(reader, &mut prefix)? {
+    if !read_exact_or_eof(reader, &mut prefix, "BGZF block header")? {
         return Ok(None);
     }
 
@@ -247,12 +260,25 @@ fn read_bgzf_block<R: Read>(
     let expected_crc = u32::from_le_bytes(footer[..4].try_into().unwrap());
     let expected_isize = u32::from_le_bytes(footer[4..8].try_into().unwrap());
 
+    // A BGZF block holds at most 64 KiB, which virtual offsets rely on, so a
+    // larger ISIZE is invalid and decompression stops just past the limit.
+    if expected_isize as usize > MAX_BLOCK_UNCOMPRESSED {
+        return Err(invalid_data("BGZF ISIZE exceeds the 64 KiB block limit"));
+    }
     let mut decoder = DeflateDecoder::new(deflate);
     let mut uncompressed = Vec::with_capacity(expected_isize as usize);
-    decoder.read_to_end(&mut uncompressed)?;
+    (&mut decoder)
+        .take(MAX_BLOCK_UNCOMPRESSED as u64 + 1)
+        .read_to_end(&mut uncompressed)
+        .map_err(|error| invalid_data(format!("BGZF block has corrupt deflate data: {error}")))?;
     if uncompressed.len() != expected_isize as usize {
         return Err(invalid_data(
             "BGZF ISIZE does not match decompressed length",
+        ));
+    }
+    if decoder.total_in() != deflate.len() as u64 {
+        return Err(invalid_data(
+            "BGZF block has bytes after its deflate stream",
         ));
     }
 

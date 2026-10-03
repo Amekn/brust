@@ -23,7 +23,9 @@ use brust_fastq::FastqReader;
 - `FastqReader`: streaming parser over plain or gzip files and arbitrary
   readers; gzip streams are recognized by their magic bytes.
 - `FastqWriter`: streaming plain/gzip writer; path APIs select gzip for `.gz`
-  and arbitrary writers can use an explicit `Compression` value.
+  and arbitrary writers can use an explicit `Compression` value. Path APIs
+  buffer their output; call `finish` to write the rest, including the gzip
+  trailer, and see any error.
 - `Fastq`: materialized FASTQ collection with `from_path`, `to_path`, and
   `to_fasta`.
 - `FastqRecord`: owned read record with `id`, optional `description`,

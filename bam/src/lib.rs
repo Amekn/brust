@@ -21,6 +21,7 @@
 //! with the same output bytes for any thread count.
 
 use brust_core::{AtomicFile, Error, Format};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -74,7 +75,8 @@ pub struct BamReader<R: Read = File> {
 /// returns an error.
 pub struct BamWriter<W: Write = File> {
     writer: BgzfWriter<W>,
-    header_written: bool,
+    // Names and lengths of the references written in the header, once it is.
+    references: Option<Vec<(String, u32)>>,
 }
 
 /// Converts SAM alignment records to BAM records using one SAM header.
@@ -103,17 +105,19 @@ pub struct PositionedBamRecord {
 
 /// BAM header information from the binary file header.
 ///
-/// The parsed `text` field is the SAM header text with trailing NUL padding
-/// removed. The original `l_text` value is preserved and is used by the writer
-/// when it is non-zero.
+/// The `text` field holds the SAM header text bytes exactly as stored, with
+/// trailing NUL padding removed; [`BamHeader::text_str`] reads it as UTF-8.
+/// The original `l_text` value is preserved and is used by the writer when it
+/// is non-zero.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BamHeader {
     /// BAM magic bytes, always `[0x42, 0x41, 0x4D, 0x01]`.
     pub magic: [u8; 4],
     /// Length of the SAM header text in bytes, including any NUL padding.
     pub l_text: u32,
-    /// SAM header text with trailing NUL padding removed.
-    pub text: String,
+    /// SAM header text bytes with trailing NUL padding removed. They are kept
+    /// as stored, so text that is not UTF-8 still round-trips unchanged.
+    pub text: Vec<u8>,
     /// Number of reference sequences in the BAM reference dictionary.
     pub n_ref: u32,
 }
@@ -179,46 +183,46 @@ impl BamRecordFixed {
     /// contain at least the fixed core bytes.
     pub fn new(block_size: u32, data: &[u8]) -> io::Result<Self> {
         if data.len() < 32 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "data too short"));
+            return Err(invalid_data("data too short"));
         }
 
         let ref_id = match data.get(0..4) {
             Some(d) => i32::from_le_bytes(d.try_into().unwrap()),
-            None => return Err(io::Error::new(io::ErrorKind::InvalidData, "data too short")),
+            None => return Err(invalid_data("data too short")),
         };
         let pos = match data.get(4..8) {
             Some(d) => i32::from_le_bytes(d.try_into().unwrap()),
-            None => return Err(io::Error::new(io::ErrorKind::InvalidData, "data too short")),
+            None => return Err(invalid_data("data too short")),
         };
         let l_read_name = data[8];
         let mapq = data[9];
         let bin = match data.get(10..12) {
             Some(d) => u16::from_le_bytes(d.try_into().unwrap()),
-            None => return Err(io::Error::new(io::ErrorKind::InvalidData, "data too short")),
+            None => return Err(invalid_data("data too short")),
         };
         let n_cigar_op = match data.get(12..14) {
             Some(d) => u16::from_le_bytes(d.try_into().unwrap()),
-            None => return Err(io::Error::new(io::ErrorKind::InvalidData, "data too short")),
+            None => return Err(invalid_data("data too short")),
         };
         let flag = match data.get(14..16) {
             Some(d) => u16::from_le_bytes(d.try_into().unwrap()),
-            None => return Err(io::Error::new(io::ErrorKind::InvalidData, "data too short")),
+            None => return Err(invalid_data("data too short")),
         };
         let l_seq = match data.get(16..20) {
             Some(d) => u32::from_le_bytes(d.try_into().unwrap()),
-            None => return Err(io::Error::new(io::ErrorKind::InvalidData, "data too short")),
+            None => return Err(invalid_data("data too short")),
         };
         let next_ref_id = match data.get(20..24) {
             Some(d) => i32::from_le_bytes(d.try_into().unwrap()),
-            None => return Err(io::Error::new(io::ErrorKind::InvalidData, "data too short")),
+            None => return Err(invalid_data("data too short")),
         };
         let next_pos = match data.get(24..28) {
             Some(d) => i32::from_le_bytes(d.try_into().unwrap()),
-            None => return Err(io::Error::new(io::ErrorKind::InvalidData, "data too short")),
+            None => return Err(invalid_data("data too short")),
         };
         let tlen = match data.get(28..32) {
             Some(d) => i32::from_le_bytes(d.try_into().unwrap()),
-            None => return Err(io::Error::new(io::ErrorKind::InvalidData, "data too short")),
+            None => return Err(invalid_data("data too short")),
         };
         Ok(Self {
             block_size,
@@ -264,25 +268,19 @@ impl BamRecordVariable {
                 .trim_end_matches('\0')
                 .to_string(),
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "read_name cannot be extracted",
-                ));
+                return Err(invalid_data("read_name cannot be extracted"));
             }
         };
         offset += fixed.l_read_name as usize;
 
-        let cigar_len_bytes = (fixed.n_cigar_op as usize).checked_mul(4).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "CIGAR byte length overflow")
-        })?;
+        let cigar_len_bytes = (fixed.n_cigar_op as usize)
+            .checked_mul(4)
+            .ok_or_else(|| invalid_data("CIGAR byte length overflow"))?;
 
         let cigar_bytes = match data.get(offset..offset + cigar_len_bytes) {
             Some(slice) => slice,
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "CIGAR data out of bounds",
-                ));
+                return Err(invalid_data("CIGAR data out of bounds"));
             }
         };
 
@@ -292,10 +290,7 @@ impl BamRecordVariable {
             bytes.copy_from_slice(chunk);
             let packed = u32::from_le_bytes(bytes);
             if packed & 0x0f > 8 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "CIGAR operation code out of bounds",
-                ));
+                return Err(invalid_data("CIGAR operation code out of bounds"));
             }
             cigar.push(packed);
         }
@@ -305,10 +300,7 @@ impl BamRecordVariable {
         let seq = match data.get(offset..offset + seq_byte_length) {
             Some(slice) => slice.to_vec(),
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Sequence data out of bounds",
-                ));
+                return Err(invalid_data("Sequence data out of bounds"));
             }
         };
         offset += seq_byte_length;
@@ -316,10 +308,7 @@ impl BamRecordVariable {
         let qual = match data.get(offset..offset + fixed.l_seq as usize) {
             Some(slice) => slice.to_vec(),
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Quality data out of bounds",
-                ));
+                return Err(invalid_data("Quality data out of bounds"));
             }
         };
 
@@ -354,10 +343,7 @@ impl BamRecordAuxiliary {
         let tag = match data.get(*offset..*offset + 2) {
             Some(tag) => String::from_utf8_lossy(tag).to_string(),
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "auxiliary tag is incomplete",
-                ));
+                return Err(invalid_data("auxiliary tag is incomplete"));
             }
         };
         *offset += 2;
@@ -365,10 +351,7 @@ impl BamRecordAuxiliary {
         let val_type = match data.get(*offset) {
             Some(val_type) => *val_type,
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "auxiliary value type is missing",
-                ));
+                return Err(invalid_data("auxiliary value type is missing"));
             }
         };
         *offset += 1;
@@ -378,10 +361,7 @@ impl BamRecordAuxiliary {
                 let v = match data.get(*offset) {
                     Some(v) => *v,
                     None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "auxiliary A value is missing",
-                        ));
+                        return Err(invalid_data("auxiliary A value is missing"));
                     }
                 };
                 *offset += 1;
@@ -392,10 +372,7 @@ impl BamRecordAuxiliary {
                 let v = match data.get(*offset) {
                     Some(v) => *v as i8,
                     None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "auxiliary c value is missing",
-                        ));
+                        return Err(invalid_data("auxiliary c value is missing"));
                     }
                 };
                 *offset += 1;
@@ -406,10 +383,7 @@ impl BamRecordAuxiliary {
                 let v = match data.get(*offset) {
                     Some(v) => *v,
                     None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "auxiliary C value is missing",
-                        ));
+                        return Err(invalid_data("auxiliary C value is missing"));
                     }
                 };
                 *offset += 1;
@@ -420,10 +394,7 @@ impl BamRecordAuxiliary {
                 let v = match data.get(*offset..*offset + 2) {
                     Some(v) => i16::from_le_bytes(v.try_into().unwrap()),
                     None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "auxiliary s value is incomplete",
-                        ));
+                        return Err(invalid_data("auxiliary s value is incomplete"));
                     }
                 };
                 *offset += 2;
@@ -434,10 +405,7 @@ impl BamRecordAuxiliary {
                 let v = match data.get(*offset..*offset + 2) {
                     Some(v) => u16::from_le_bytes(v.try_into().unwrap()),
                     None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "auxiliary S value is incomplete",
-                        ));
+                        return Err(invalid_data("auxiliary S value is incomplete"));
                     }
                 };
                 *offset += 2;
@@ -448,10 +416,7 @@ impl BamRecordAuxiliary {
                 let v = match data.get(*offset..*offset + 4) {
                     Some(v) => i32::from_le_bytes(v.try_into().unwrap()),
                     None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "auxiliary i value is incomplete",
-                        ));
+                        return Err(invalid_data("auxiliary i value is incomplete"));
                     }
                 };
                 *offset += 4;
@@ -462,10 +427,7 @@ impl BamRecordAuxiliary {
                 let v = match data.get(*offset..*offset + 4) {
                     Some(v) => u32::from_le_bytes(v.try_into().unwrap()),
                     None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "auxiliary I value is incomplete",
-                        ));
+                        return Err(invalid_data("auxiliary I value is incomplete"));
                     }
                 };
                 *offset += 4;
@@ -476,10 +438,7 @@ impl BamRecordAuxiliary {
                 let v = match data.get(*offset..*offset + 4) {
                     Some(v) => f32::from_le_bytes(v.try_into().unwrap()),
                     None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "auxiliary f value is incomplete",
-                        ));
+                        return Err(invalid_data("auxiliary f value is incomplete"));
                     }
                 };
                 *offset += 4;
@@ -494,10 +453,7 @@ impl BamRecordAuxiliary {
                 }
 
                 if *offset >= data.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "auxiliary Z string is missing NUL terminator",
-                    ));
+                    return Err(invalid_data("auxiliary Z string is missing NUL terminator"));
                 }
 
                 let s = String::from_utf8_lossy(&data[start..*offset]).to_string();
@@ -515,10 +471,7 @@ impl BamRecordAuxiliary {
                 }
 
                 if *offset >= data.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "auxiliary H string is missing NUL terminator",
-                    ));
+                    return Err(invalid_data("auxiliary H string is missing NUL terminator"));
                 }
 
                 let s = String::from_utf8_lossy(&data[start..*offset]).to_string();
@@ -532,10 +485,7 @@ impl BamRecordAuxiliary {
                 let subtype = match data.get(*offset) {
                     Some(subtype) => *subtype,
                     None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "auxiliary B subtype is missing",
-                        ));
+                        return Err(invalid_data("auxiliary B subtype is missing"));
                     }
                 };
                 *offset += 1;
@@ -543,13 +493,23 @@ impl BamRecordAuxiliary {
                 let count = match data.get(*offset..*offset + 4) {
                     Some(v) => u32::from_le_bytes(v.try_into().unwrap()) as usize,
                     None => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "auxiliary B count is incomplete",
-                        ));
+                        return Err(invalid_data("auxiliary B count is incomplete"));
                     }
                 };
                 *offset += 4;
+                // The count comes from the file: check the values are present
+                // before reserving room for them.
+                let value_size = match subtype {
+                    b'c' | b'C' => 1,
+                    b's' | b'S' => 2,
+                    _ => 4,
+                };
+                if count
+                    .checked_mul(value_size)
+                    .is_none_or(|bytes| bytes > data.len().saturating_sub(*offset))
+                {
+                    return Err(invalid_data("auxiliary B array is longer than its record"));
+                }
 
                 match subtype {
                     b'c' => {
@@ -559,8 +519,7 @@ impl BamRecordAuxiliary {
                             let v = match data.get(*offset) {
                                 Some(v) => *v as i8,
                                 None => {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
+                                    return Err(invalid_data(
                                         "auxiliary B,c array value is missing",
                                     ));
                                 }
@@ -579,8 +538,7 @@ impl BamRecordAuxiliary {
                             let v = match data.get(*offset) {
                                 Some(v) => *v,
                                 None => {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
+                                    return Err(invalid_data(
                                         "auxiliary B,C array value is missing",
                                     ));
                                 }
@@ -599,8 +557,7 @@ impl BamRecordAuxiliary {
                             let v = match data.get(*offset..*offset + 2) {
                                 Some(v) => i16::from_le_bytes(v.try_into().unwrap()),
                                 None => {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
+                                    return Err(invalid_data(
                                         "auxiliary B,s array value is incomplete",
                                     ));
                                 }
@@ -619,8 +576,7 @@ impl BamRecordAuxiliary {
                             let v = match data.get(*offset..*offset + 2) {
                                 Some(v) => u16::from_le_bytes(v.try_into().unwrap()),
                                 None => {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
+                                    return Err(invalid_data(
                                         "auxiliary B,S array value is incomplete",
                                     ));
                                 }
@@ -639,8 +595,7 @@ impl BamRecordAuxiliary {
                             let v = match data.get(*offset..*offset + 4) {
                                 Some(v) => i32::from_le_bytes(v.try_into().unwrap()),
                                 None => {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
+                                    return Err(invalid_data(
                                         "auxiliary B,i array value is incomplete",
                                     ));
                                 }
@@ -659,8 +614,7 @@ impl BamRecordAuxiliary {
                             let v = match data.get(*offset..*offset + 4) {
                                 Some(v) => u32::from_le_bytes(v.try_into().unwrap()),
                                 None => {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
+                                    return Err(invalid_data(
                                         "auxiliary B,I array value is incomplete",
                                     ));
                                 }
@@ -679,8 +633,7 @@ impl BamRecordAuxiliary {
                             let v = match data.get(*offset..*offset + 4) {
                                 Some(v) => f32::from_le_bytes(v.try_into().unwrap()),
                                 None => {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
+                                    return Err(invalid_data(
                                         "auxiliary B,f array value is incomplete",
                                     ));
                                 }
@@ -693,19 +646,19 @@ impl BamRecordAuxiliary {
                     }
 
                     _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("unknown auxiliary B array subtype: {}", subtype as char),
-                        ));
+                        return Err(invalid_data(format!(
+                            "unknown auxiliary B array subtype: {}",
+                            subtype as char
+                        )));
                     }
                 }
             }
 
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown auxiliary value type: {}", val_type as char),
-                ));
+                return Err(invalid_data(format!(
+                    "unknown auxiliary value type: {}",
+                    val_type as char
+                )));
             }
         };
 
@@ -776,40 +729,38 @@ impl BamRecord {
     /// of the payload.
     pub fn new(block_size: u32, data: Vec<u8>) -> io::Result<Self> {
         if block_size as usize != data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "block_size does not match record data length",
-            ));
+            return Err(invalid_data("block_size does not match record data length"));
         }
 
         if data.len() < 32 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(invalid_data(
                 "BAM record is smaller than the 32-byte fixed core (exclude block_size)",
             ));
         }
 
         let fixed = BamRecordFixed::new(block_size, &data)?;
         let (variable, mut var_offset) = BamRecordVariable::new(&fixed, &data)?;
-
         let mut auxiliary = Vec::new();
         while var_offset < data.len() {
             let aux = BamRecordAuxiliary::new(&mut var_offset, &data)?;
             auxiliary.push(aux);
         }
 
-        Ok(Self {
+        let record = Self {
             fixed,
             variable,
             auxiliary,
-        })
+        };
+        record.check_query_length()?;
+        Ok(record)
     }
 
     /// Appends this record in BAM binary form to `out`.
     ///
     /// The output is the `block_size` field (`u32`, little-endian) followed by
     /// the record payload, which is what [`BamWriter::write_record`] feeds into
-    /// the BGZF stream. The record is validated the same way, and `out` is left
+    /// the BGZF stream, with the same record-layout checks; only the writer can
+    /// also check reference IDs against its dictionary. `out` is left
     /// unchanged when it returns an error. A non-zero `fixed.block_size` must
     /// equal the encoded payload length.
     pub fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
@@ -829,20 +780,90 @@ impl BamRecord {
         Ok(())
     }
 
+    /// As htslib does: a mapped record with SEQ and a CIGAR must have them
+    /// agree, using the real CIGAR (see [`BamRecord::cigar_ops`]).
+    fn check_query_length(&self) -> io::Result<()> {
+        if self.fixed.l_seq == 0 || self.fixed.flag & 0x4 != 0 {
+            return Ok(());
+        }
+        let cigar = self.cigar_ops();
+        if cigar.is_empty() {
+            return Ok(());
+        }
+        let query_len = cigar
+            .iter()
+            .filter(|&&op| matches!(op & 0x0f, 0 | 1 | 4 | 7 | 8))
+            .map(|&op| u64::from(op >> 4))
+            .sum::<u64>();
+        if query_len != u64::from(self.fixed.l_seq) {
+            return Err(invalid_data("BAM CIGAR and query sequence lengths differ"));
+        }
+        Ok(())
+    }
+
     /// Returns this record's read name.
     pub fn read_name(&self) -> &str {
         &self.variable.read_name
     }
 
-    /// Returns the record's CIGAR as a SAM-style string.
+    /// Returns the record's real CIGAR as packed BAM operations.
+    ///
+    /// An alignment with more than 65,535 operations is stored as a `kSmN`
+    /// placeholder (`k` = `l_seq`) with the real CIGAR in a `CG:B:I` tag (SAM
+    /// spec 4.2.2). For such a record this returns the tag's operations, using
+    /// htslib's test: the record is placed, its first operation soft-clips the
+    /// whole read, and `CG` is a `B,I` or `B,i` array at least as long as the
+    /// stored CIGAR. Otherwise it returns `variable.cigar`.
+    pub fn cigar_ops(&self) -> Cow<'_, [u32]> {
+        match self.long_cigar_tag() {
+            Some(index) => match &self.auxiliary[index].value {
+                BamAuxValue::B(BamAuxArray::I(ops)) => Cow::Borrowed(ops),
+                BamAuxValue::B(BamAuxArray::i(ops)) => {
+                    Cow::Owned(ops.iter().map(|&op| op as u32).collect())
+                }
+                _ => unreachable!("long_cigar_tag checks the array type"),
+            },
+            None => Cow::Borrowed(&self.variable.cigar),
+        }
+    }
+
+    /// Whether this record's real CIGAR is the one in its `CG` tag (see
+    /// [`BamRecord::cigar_ops`]); that tag is then not part of the record's
+    /// SAM form.
+    pub fn stores_cigar_in_cg_tag(&self) -> bool {
+        self.long_cigar_tag().is_some()
+    }
+
+    /// Index of the `CG` tag holding the real CIGAR, if any.
+    fn long_cigar_tag(&self) -> Option<usize> {
+        let first = *self.variable.cigar.first()?;
+        if self.fixed.ref_id < 0
+            || self.fixed.pos < 0
+            || first & 0x0f != 4
+            || first >> 4 != self.fixed.l_seq
+        {
+            return None;
+        }
+        let index = self.auxiliary.iter().position(|aux| aux.tag == "CG")?;
+        let ops = match &self.auxiliary[index].value {
+            BamAuxValue::B(BamAuxArray::I(ops)) => ops.len(),
+            BamAuxValue::B(BamAuxArray::i(ops)) => ops.len(),
+            _ => return None,
+        };
+        (ops >= self.variable.cigar.len()).then_some(index)
+    }
+
+    /// Returns the record's real CIGAR (see [`BamRecord::cigar_ops`]) as a
+    /// SAM-style string.
     pub fn cigar_string(&self) -> String {
         const CIGAR_OPS: &[u8; 9] = b"MIDNSHP=X";
-        if self.variable.cigar.is_empty() {
+        let cigar = self.cigar_ops();
+        if cigar.is_empty() {
             return "*".to_string();
         }
 
         let mut decoded = String::new();
-        for op in &self.variable.cigar {
+        for op in cigar.iter() {
             let op_code = (op & 0x0f) as usize;
             let op_char = CIGAR_OPS.get(op_code).copied().unwrap_or(b'?') as char;
             decoded.push_str(&(op >> 4).to_string());
@@ -854,7 +875,8 @@ impl BamRecord {
     /// Decodes the packed BAM sequence bytes into a base string.
     pub fn sequence_string(&self) -> String {
         const BASES: &[u8; 16] = b"=ACMGRSVTWYHKDBN";
-        let l_seq = self.fixed.l_seq as usize;
+        // l_seq and seq are public fields; never index past the packed data.
+        let l_seq = (self.fixed.l_seq as usize).min(self.variable.seq.len() * 2);
         let mut decoded = String::with_capacity(l_seq);
         for i in 0..l_seq {
             let byte = self.variable.seq[i / 2];
@@ -1008,7 +1030,7 @@ impl SamToBamConverter {
 
         let refs = bam_refs_from_sam_header(header)?;
         let reference_ids = reference_ids_from_refs(&refs);
-        let text = sam_header_text(header)?;
+        let text = sam_header_text(header)?.into_bytes();
         let header = BamHeader {
             magic: [0x42, 0x41, 0x4D, 0x01],
             l_text: text.len() as u32,
@@ -1133,7 +1155,8 @@ impl<R: Read> BamReader<R> {
     pub fn from_reader(reader: R) -> io::Result<Self> {
         let mut reader = BgzfReader::new(reader);
         let header = BamHeader::read_from(&mut reader)?;
-        let mut refs = Vec::with_capacity(header.n_ref as usize);
+        // n_ref comes from the file, so the list grows as entries are read.
+        let mut refs = Vec::new();
 
         for _ in 0..header.n_ref {
             refs.push(BamRef::read_from(&mut reader)?);
@@ -1189,15 +1212,22 @@ impl<R: Read> BamReader<R> {
     pub fn read_record_with_virtual_offset(&mut self) -> io::Result<Option<PositionedBamRecord>> {
         let virtual_offset = self.virtual_offset();
         let mut block_size = [0u8; 4];
-        if !read_exact_or_eof(&mut self.reader, &mut block_size)? {
+        if !read_exact_or_eof(&mut self.reader, &mut block_size, "BAM record block_size")? {
             return Ok(None);
         }
 
         let block_size = u32::from_le_bytes(block_size);
 
-        let mut record_data = vec![0u8; block_size as usize];
-        self.reader.read_exact(&mut record_data)?;
+        let record_data = read_exact_vec(&mut self.reader, block_size, "BAM record")?;
         let record = BamRecord::new(block_size, record_data)?;
+        // As htslib does: reference IDs must be -1 or index the dictionary.
+        let references = self.refs.len();
+        let in_range = |id: i32| id == -1 || usize::try_from(id).is_ok_and(|id| id < references);
+        if !in_range(record.fixed.ref_id) || !in_range(record.fixed.next_ref_id) {
+            return Err(invalid_data(
+                "BAM record reference ID is outside the reference dictionary",
+            ));
+        }
         Ok(Some(PositionedBamRecord {
             virtual_offset,
             record,
@@ -1292,7 +1322,16 @@ impl BamWriter<AtomicFile> {
     ///
     /// This writes the last block and the BGZF EOF block, and joins any worker
     /// threads. See [`AtomicFile::commit`] for the exact steps and errors.
+    ///
+    /// Returns an [`io::ErrorKind::InvalidInput`] error and publishes nothing
+    /// if no header was written, since an EOF block alone is not a BAM.
     pub fn commit(self) -> io::Result<()> {
+        if self.references.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BAM writer has no header to commit",
+            ));
+        }
         self.finish()?.commit()
     }
 }
@@ -1302,7 +1341,7 @@ impl<W: Write> BamWriter<W> {
     pub fn from_writer(writer: W) -> Self {
         Self {
             writer: BgzfWriter::new(writer),
-            header_written: false,
+            references: None,
         }
     }
 
@@ -1318,7 +1357,7 @@ impl<W: Write> BamWriter<W> {
     pub fn from_writer_with_threads(writer: W, threads: usize) -> Self {
         Self {
             writer: BgzfWriter::with_threads(writer, threads),
-            header_written: false,
+            references: None,
         }
     }
 
@@ -1327,7 +1366,7 @@ impl<W: Write> BamWriter<W> {
     /// The header can be written only once. The stored reference count must
     /// match the supplied reference slice.
     pub fn write_header(&mut self, header: &BamHeader, refs: &[BamRef]) -> io::Result<()> {
-        if self.header_written {
+        if self.references.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "BAM header has already been written",
@@ -1336,19 +1375,33 @@ impl<W: Write> BamWriter<W> {
         let mut data = Vec::new();
         write_bam_header(&mut data, header, refs)?;
         self.writer.write_all(&data)?;
-        self.header_written = true;
+        self.references = Some(
+            refs.iter()
+                .map(|reference| (reference.name.clone(), reference.l_seq))
+                .collect(),
+        );
         Ok(())
     }
 
     /// Writes one BAM alignment record.
     ///
-    /// A header must have already been written. Packed CIGAR, sequence, quality,
-    /// and auxiliary fields are serialized from the record as stored.
+    /// A header must have already been written, and the record's reference IDs
+    /// must be -1 or index its reference dictionary, as readers require. Packed
+    /// CIGAR, sequence, quality, and auxiliary fields are serialized from the
+    /// record as stored.
     pub fn write_record(&mut self, record: &BamRecord) -> io::Result<()> {
-        if !self.header_written {
+        let Some(references) = &self.references else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "BAM header must be written before records",
+            ));
+        };
+        let in_range =
+            |id: i32| id == -1 || usize::try_from(id).is_ok_and(|id| id < references.len());
+        if !in_range(record.fixed.ref_id) || !in_range(record.fixed.next_ref_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BAM record reference ID is outside the written reference dictionary",
             ));
         }
         let mut data = Vec::new();
@@ -1364,9 +1417,30 @@ impl<W: Write> BamWriter<W> {
     }
 
     /// Writes a materialized BAM payload.
+    ///
+    /// The first call writes the payload's header. A later call appends the
+    /// payload's records only if its reference dictionary (names and lengths)
+    /// is the one already written, since record reference IDs index it;
+    /// otherwise it returns an [`io::ErrorKind::InvalidInput`] error without
+    /// writing anything.
     pub fn write_all(&mut self, bam: &Bam) -> io::Result<()> {
-        if !self.header_written {
-            self.write_header(&bam.header, &bam.refs)?;
+        match &self.references {
+            None => self.write_header(&bam.header, &bam.refs)?,
+            Some(references) => {
+                let same = references.len() == bam.refs.len()
+                    && references
+                        .iter()
+                        .zip(&bam.refs)
+                        .all(|((name, length), reference)| {
+                            *name == reference.name && *length == reference.l_seq
+                        });
+                if !same {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "BAM payload's reference dictionary differs from the one already written",
+                    ));
+                }
+            }
         }
         for record in &bam.records {
             self.write_record(record)?;
@@ -1408,18 +1482,16 @@ impl BamHeader {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
         if magic != [0x42, 0x41, 0x4D, 0x01] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid BAM magic bytes",
-            ));
+            return Err(invalid_data("invalid BAM magic bytes"));
         }
 
         let l_text = read_u32_le(reader, "BAM header text length")?;
-        let mut text = vec![0u8; l_text as usize];
-        reader.read_exact(&mut text)?;
-        let text = String::from_utf8_lossy(&text)
-            .trim_end_matches('\0')
-            .to_string();
+        let mut text = read_exact_vec(reader, l_text, "BAM header text")?;
+        let end = text
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .map_or(0, |index| index + 1);
+        text.truncate(end);
 
         let n_ref = read_u32_le(reader, "BAM reference count")?;
 
@@ -1432,15 +1504,32 @@ impl BamHeader {
     }
 }
 
+impl BamHeader {
+    /// Returns the header text as UTF-8.
+    ///
+    /// Returns an `InvalidData` error when the stored text is not UTF-8, which
+    /// SAM header text must be.
+    pub fn text_str(&self) -> io::Result<&str> {
+        std::str::from_utf8(&self.text)
+            .map_err(|error| invalid_data(format!("BAM header text is not UTF-8: {error}")))
+    }
+}
+
 impl BamRef {
     /// Reads one reference dictionary entry from a decompressed BAM stream.
+    ///
+    /// The name must be UTF-8: it is a SAM reference name, and replacing bytes
+    /// would silently rename the reference.
     pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
         let l_name = read_u32_le(reader, "reference name length")?;
-        let mut name = vec![0u8; l_name as usize];
-        reader.read_exact(&mut name)?;
-        let name = String::from_utf8_lossy(&name)
-            .trim_end_matches('\0')
-            .to_string();
+        let mut name = read_exact_vec(reader, l_name, "BAM reference name")?;
+        let end = name
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .map_or(0, |index| index + 1);
+        name.truncate(end);
+        let name =
+            String::from_utf8(name).map_err(|_| invalid_data("BAM reference name is not UTF-8"))?;
 
         let l_seq = read_u32_le(reader, "reference sequence length")?;
 
@@ -1462,10 +1551,16 @@ fn bam_record_to_sam_record(record: &BamRecord, refs: &[BamRef]) -> io::Result<s
     } else {
         record.sequence_string()
     };
+    let long_cigar_tag = record.long_cigar_tag();
+    if long_cigar_tag.is_some() && record.cigar_ops().iter().any(|op| op & 0x0f > 8) {
+        return Err(invalid_data("BAM CG tag holds an invalid CIGAR operation"));
+    }
     let optional = record
         .auxiliary
         .iter()
-        .map(bam_aux_to_sam_optional)
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != long_cigar_tag)
+        .map(|(_, auxiliary)| bam_aux_to_sam_optional(auxiliary))
         .collect::<io::Result<Vec<_>>>()?;
 
     Ok(sam::SamRecord::new(
@@ -1615,7 +1710,7 @@ fn bam_record_from_sam_record(
     record: &sam::SamRecord,
     reference_ids: &HashMap<String, i32>,
 ) -> io::Result<BamRecord> {
-    record.to_sam_line()?;
+    record.validate()?;
 
     let ref_id = sam_reference_id(&record.rname, reference_ids)?;
     let next_ref_id = if record.rnext == "=" {
@@ -1625,7 +1720,7 @@ fn bam_record_from_sam_record(
     };
     let pos = bam_position(record.pos)?;
     let next_pos = bam_position(record.pnext)?;
-    let cigar = pack_cigar(&record.cigar)?;
+    let mut cigar = pack_cigar(&record.cigar)?;
     let seq = pack_sequence(&record.seq)?;
     let l_seq = if record.seq == "*" {
         0
@@ -1640,14 +1735,37 @@ fn bam_record_from_sam_record(
         .ok_or_else(|| invalid_data("SAM QNAME length overflow"))?;
     let l_read_name =
         u8::try_from(read_name_len).map_err(|_| invalid_data("SAM QNAME is too long for BAM"))?;
-    let n_cigar_op = u16::try_from(cigar.len())
-        .map_err(|_| invalid_data("SAM CIGAR has too many operations for BAM"))?;
     let bin = bam_bin(record, pos)?;
-    let auxiliary = record
+    let mut auxiliary = record
         .optional
         .iter()
         .map(sam_optional_to_bam_aux)
         .collect::<io::Result<Vec<_>>>()?;
+    if cigar.len() > usize::from(u16::MAX) {
+        // SAM spec 4.2.2: store a `kSmN` placeholder and the real CIGAR in CG.
+        if auxiliary.iter().any(|aux| aux.tag == "CG") {
+            return Err(invalid_data(
+                "SAM record has more than 65535 CIGAR operations and its own CG tag",
+            ));
+        }
+        let reference_len = cigar
+            .iter()
+            .filter(|&&op| matches!(op & 0x0f, 0 | 2 | 3 | 7 | 8))
+            .try_fold(0u32, |total, op| total.checked_add(op >> 4))
+            .filter(|&total| total <= MAX_CIGAR_OP_LEN)
+            .ok_or_else(|| invalid_data("SAM CIGAR reference length exceeds BAM's limit"))?;
+        if l_seq > MAX_CIGAR_OP_LEN {
+            return Err(invalid_data(
+                "SAM SEQ is too long for a BAM long-CIGAR record",
+            ));
+        }
+        let real = std::mem::replace(&mut cigar, vec![l_seq << 4 | 4, reference_len << 4 | 3]);
+        auxiliary.push(BamRecordAuxiliary {
+            tag: "CG".to_string(),
+            value: BamAuxValue::B(BamAuxArray::I(real)),
+        });
+    }
+    let n_cigar_op = u16::try_from(cigar.len()).expect("long CIGARs use a 2-operation placeholder");
 
     let mut bam_record = BamRecord {
         fixed: BamRecordFixed {
@@ -1688,7 +1806,14 @@ fn sam_reference_id(value: &str, reference_ids: &HashMap<String, i32>) -> io::Re
     reference_ids
         .get(value)
         .copied()
-        .ok_or_else(|| invalid_data(format!("SAM reference {value} is missing from @SQ header")))
+        // The SAM input is at fault here, not a BAM.
+        .ok_or_else(|| {
+            Error::invalid(
+                Format::Sam,
+                format!("SAM reference {value} is missing from @SQ header"),
+            )
+            .into()
+        })
 }
 
 fn bam_position(position: u32) -> io::Result<i32> {
@@ -1716,8 +1841,14 @@ fn pack_cigar(cigar: &str) -> io::Result<Vec<u32>> {
                     .ok_or_else(|| invalid_data("SAM CIGAR operation length overflow"))?;
             }
             b'M' | b'I' | b'D' | b'N' | b'S' | b'H' | b'P' | b'=' | b'X' => {
-                if !saw_digit || len == 0 {
+                // Zero-length operations are allowed, as in SAMv1 and htslib.
+                if !saw_digit {
                     return Err(invalid_data("invalid SAM CIGAR operation length"));
+                }
+                if len > MAX_CIGAR_OP_LEN {
+                    return Err(invalid_data(
+                        "SAM CIGAR operation length exceeds BAM's 28-bit limit",
+                    ));
                 }
                 packed.push((len << 4) | cigar_op_code(byte));
                 len = 0;
@@ -1732,6 +1863,9 @@ fn pack_cigar(cigar: &str) -> io::Result<Vec<u32>> {
     }
     Ok(packed)
 }
+
+/// Largest CIGAR operation length a BAM record can store (28 bits).
+const MAX_CIGAR_OP_LEN: u32 = (1 << 28) - 1;
 
 fn cigar_op_code(op: u8) -> u32 {
     match op {
@@ -1755,37 +1889,35 @@ fn pack_sequence(seq: &str) -> io::Result<Vec<u8>> {
 
     let mut packed = Vec::with_capacity(seq.len().div_ceil(2));
     for chunk in seq.as_bytes().chunks(2) {
-        let high = base_code(chunk[0])?;
-        let low = chunk
-            .get(1)
-            .copied()
-            .map(base_code)
-            .transpose()?
-            .unwrap_or(0);
+        let high = base_code(chunk[0]);
+        let low = chunk.get(1).copied().map_or(0, base_code);
         packed.push((high << 4) | low);
     }
     Ok(packed)
 }
 
-fn base_code(base: u8) -> io::Result<u8> {
+/// Returns a base's 4-bit BAM code.
+///
+/// As SAM spec 4.2.3 says, characters without a code are stored as `N`;
+/// like htslib, `U` is stored as `T`.
+fn base_code(base: u8) -> u8 {
     match base.to_ascii_uppercase() {
-        b'=' => Ok(0),
-        b'A' => Ok(1),
-        b'C' => Ok(2),
-        b'M' => Ok(3),
-        b'G' => Ok(4),
-        b'R' => Ok(5),
-        b'S' => Ok(6),
-        b'V' => Ok(7),
-        b'T' => Ok(8),
-        b'W' => Ok(9),
-        b'Y' => Ok(10),
-        b'H' => Ok(11),
-        b'K' => Ok(12),
-        b'D' => Ok(13),
-        b'B' => Ok(14),
-        b'N' => Ok(15),
-        _ => Err(invalid_data("SAM SEQ contains a base BAM cannot encode")),
+        b'=' => 0,
+        b'A' => 1,
+        b'C' => 2,
+        b'M' => 3,
+        b'G' => 4,
+        b'R' => 5,
+        b'S' => 6,
+        b'V' => 7,
+        b'T' | b'U' => 8,
+        b'W' => 9,
+        b'Y' => 10,
+        b'H' => 11,
+        b'K' => 12,
+        b'D' => 13,
+        b'B' => 14,
+        _ => 15,
     }
 }
 
@@ -1807,43 +1939,43 @@ fn pack_quality(qual: &str, len: usize) -> io::Result<Vec<u8>> {
         .collect()
 }
 
+/// Computes the BAM `bin` field as htslib does.
+///
+/// SAM spec 4.2.1 treats an unmapped record, or an alignment that consumes no
+/// reference bases, as length one, so an unplaced read (`pos` -1) gets
+/// `reg2bin(-1, 0)` = 4680.
 fn bam_bin(record: &sam::SamRecord, pos: i32) -> io::Result<u16> {
-    if pos < 0 || record.cigar == "*" {
-        return Ok(0);
-    }
-
-    let reference_len = record.reference_len_from_cigar()?;
-    if reference_len == 0 {
-        return Ok(0);
-    }
-    let beg = u32::try_from(pos).map_err(|_| invalid_data("BAM position is negative"))?;
-    let end = beg
-        .checked_add(
-            u32::try_from(reference_len)
-                .map_err(|_| invalid_data("SAM CIGAR reference length exceeds u32"))?,
-        )
-        .ok_or_else(|| invalid_data("SAM alignment end overflows u32"))?;
+    let reference_len = if record.is_unmapped() || record.cigar == "*" {
+        0
+    } else {
+        record.reference_len_from_cigar()?
+    };
+    let beg = i64::from(pos);
+    let end = i64::try_from(reference_len.max(1))
+        .ok()
+        .and_then(|len| beg.checked_add(len))
+        .ok_or_else(|| invalid_data("SAM alignment end overflows"))?;
     Ok(reg2bin(beg, end))
 }
 
-fn reg2bin(beg: u32, end: u32) -> u16 {
-    let end = end.saturating_sub(1);
-    if beg >> 14 == end >> 14 {
-        return 4681 + (beg >> 14) as u16;
-    }
-    if beg >> 17 == end >> 17 {
-        return 585 + (beg >> 17) as u16;
-    }
-    if beg >> 20 == end >> 20 {
-        return 73 + (beg >> 20) as u16;
-    }
-    if beg >> 23 == end >> 23 {
-        return 9 + (beg >> 23) as u16;
-    }
-    if beg >> 26 == end >> 26 {
-        return 1 + (beg >> 26) as u16;
-    }
-    0
+/// htslib's `hts_reg2bin(beg, end, 14, 5)`, cut to BAM's 16-bit field as
+/// htslib does: bins for positions past 2^29 don't fit the BAI scheme.
+fn reg2bin(beg: i64, end: i64) -> u16 {
+    let end = end - 1;
+    let bin = if beg >> 14 == end >> 14 {
+        4681 + (beg >> 14)
+    } else if beg >> 17 == end >> 17 {
+        585 + (beg >> 17)
+    } else if beg >> 20 == end >> 20 {
+        73 + (beg >> 20)
+    } else if beg >> 23 == end >> 23 {
+        9 + (beg >> 23)
+    } else if beg >> 26 == end >> 26 {
+        1 + (beg >> 26)
+    } else {
+        0
+    };
+    bin as u16
 }
 
 fn sam_optional_to_bam_aux(field: &sam::SamOptionalField) -> io::Result<BamRecordAuxiliary> {
@@ -1906,25 +2038,54 @@ fn hex_string_to_bytes(value: &str) -> io::Result<Vec<u8>> {
         return Err(invalid_data("BAM H auxiliary value has odd length"));
     }
 
-    let mut bytes = Vec::with_capacity(value.len() / 2);
-    for index in (0..value.len()).step_by(2) {
-        bytes.push(
-            u8::from_str_radix(&value[index..index + 2], 16)
-                .map_err(|_| invalid_data("BAM H auxiliary value is not hex"))?,
-        );
+    // Decode byte pairs: slicing the string could split a character, and
+    // u8::from_str_radix would accept a '+' sign.
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Some(hex_digit(pair[0])? << 4 | hex_digit(pair[1])?))
+        .collect::<Option<Vec<u8>>>()
+        .ok_or_else(|| invalid_data("BAM H auxiliary value is not hex"))
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    char::from(byte).to_digit(16).map(|digit| digit as u8)
+}
+
+/// Reads exactly `len` bytes, where `len` comes from the file.
+///
+/// The buffer grows as data arrives instead of being sized from `len` up
+/// front, so a bogus length can't force a huge allocation.
+fn read_exact_vec<R: Read>(reader: &mut R, len: u32, what: &str) -> io::Result<Vec<u8>> {
+    const INITIAL_CAPACITY: usize = 64 * 1024;
+    let mut data = Vec::with_capacity((len as usize).min(INITIAL_CAPACITY));
+    reader.take(u64::from(len)).read_to_end(&mut data)?;
+    if data.len() != len as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("{what} is truncated"),
+        ));
     }
-    Ok(bytes)
+    Ok(data)
 }
 
 fn read_u32_le<R: Read>(reader: &mut R, field: &str) -> io::Result<u32> {
     let mut bytes = [0u8; 4];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|err| io::Error::new(err.kind(), format!("failed to read {field}: {err}")))?;
+    reader.read_exact(&mut bytes).map_err(|err| {
+        // An error that already carries a Brust diagnostic (from BGZF, say)
+        // is passed on as it is; only plain I/O errors get the field name.
+        if err.get_ref().is_some_and(|inner| inner.is::<Error>()) {
+            err
+        } else {
+            io::Error::new(err.kind(), format!("failed to read {field}: {err}"))
+        }
+    })?;
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool> {
+/// Fills `buf`, returning `false` at a clean EOF before the first byte; `what`
+/// names the field for a truncation error.
+fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8], what: &str) -> io::Result<bool> {
     let mut bytes_read = 0;
     while bytes_read < buf.len() {
         match reader.read(&mut buf[bytes_read..]) {
@@ -1932,7 +2093,7 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "unexpected EOF while reading BAM record block_size",
+                    format!("unexpected EOF while reading {what}"),
                 ));
             }
             Ok(n) => bytes_read += n,
@@ -1962,7 +2123,7 @@ fn write_bam_header<W: Write>(
         ));
     }
 
-    let text = header.text.as_bytes();
+    let text = header.text.as_slice();
     if header.l_text as usize > 0 && (header.l_text as usize) < text.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2044,7 +2205,12 @@ fn encode_bam_record_payload(record: &BamRecord, payload: &mut Vec<u8>) -> io::R
     }
 
     let l_read_name = if fixed.l_read_name == 0 {
-        (read_name.len() + 1) as u8
+        u8::try_from(read_name.len() + 1).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BAM read name is longer than 254 bytes",
+            )
+        })?
     } else {
         fixed.l_read_name
     };
@@ -2389,7 +2555,7 @@ mod bam_tests {
         let mut cloned = original.clone();
         assert_eq!(cloned, original);
 
-        cloned.header.text.push_str("@CO\tclone-only\n");
+        cloned.header.text.extend_from_slice(b"@CO\tclone-only\n");
         cloned.refs[0].name.push_str("_clone");
         cloned.records[0].variable.read_name.push_str("_clone");
 
@@ -2399,7 +2565,7 @@ mod bam_tests {
             original.records[0].read_name(),
             "2f890ab0-63b9-45f6-ba8d-3c367ca26a63"
         );
-        assert!(!original.header.text.contains("clone-only"));
+        assert!(!original.header.text_str().unwrap().contains("clone-only"));
     }
 
     #[test]
@@ -2900,7 +3066,7 @@ revstar\t16\tref\t1\t60\t9M\t*\t0\t0\tAACGRYKMN\t*\n";
     #[test]
     fn aligned_header_and_reference_match_samtools_metadata() {
         let reader = open_bam(ALIGNED_BAM);
-        let lines: Vec<&str> = reader.header.text.lines().collect();
+        let lines: Vec<&str> = reader.header.text_str().unwrap().lines().collect();
 
         assert_eq!(reader.header.magic, [0x42, 0x41, 0x4D, 0x01]);
         assert_eq!(reader.header.l_text, 568);
@@ -2923,7 +3089,7 @@ revstar\t16\tref\t1\t60\t9M\t*\t0\t0\tAACGRYKMN\t*\n";
     #[test]
     fn unaligned_header_matches_samtools_metadata() {
         let reader = open_bam(UNALIGNED_BAM);
-        let lines: Vec<&str> = reader.header.text.lines().collect();
+        let lines: Vec<&str> = reader.header.text_str().unwrap().lines().collect();
 
         assert_eq!(reader.header.magic, [0x42, 0x41, 0x4D, 0x01]);
         assert_eq!(reader.header.l_text, 960);

@@ -19,7 +19,7 @@
 
 use brust_core::{AtomicFile, Error, Format};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 /// Streaming FASTA parser over any readable byte stream.
@@ -72,10 +72,13 @@ impl<R: Read> FastaReader<R> {
 
     /// Reads the next FASTA record from the stream.
     ///
-    /// Lines before the next header are skipped. Returns `Ok(None)` when EOF is
-    /// reached before another header line begins. Sequence lines are
-    /// concatenated until the following header or EOF, with record line endings
-    /// removed.
+    /// Blank lines before a header are skipped; any other text before the first
+    /// header is an error. Returns `Ok(None)` when EOF is reached before another
+    /// header line begins. Sequence lines are concatenated until the following
+    /// header or EOF, with record line endings removed. Lines end in LF or
+    /// CRLF, and the last line may also end in a lone CR at the end of input;
+    /// a carriage return anywhere else, as in files with CR-only line endings,
+    /// is an error.
     pub fn read_record(&mut self) -> io::Result<Option<FastaRecord>> {
         let header_line = match self.pending_header.take() {
             Some(header) => header,
@@ -90,6 +93,7 @@ impl<R: Read> FastaReader<R> {
                     }
 
                     self.line_number += 1;
+                    check_line_ending(&line, self.line_number)?;
 
                     if line.trim_end().is_empty() {
                         continue;
@@ -143,6 +147,7 @@ impl<R: Read> FastaReader<R> {
             }
 
             self.line_number += 1;
+            check_line_ending(&line, self.line_number)?;
 
             if line.starts_with('>') {
                 self.pending_header = Some(line);
@@ -181,14 +186,16 @@ impl<R: Read> FastaReader<R> {
     }
 }
 
-impl FastaWriter<File> {
+impl FastaWriter<BufWriter<File>> {
     /// Creates or truncates a FASTA file at a filesystem path.
     ///
-    /// Use [`FastaWriter::from_path_atomic`] to keep an existing file intact until
-    /// the new one is complete.
+    /// Output is buffered. Call [`finish`](FastaWriter::finish) to write the
+    /// rest and see any error; dropping the writer writes the rest but ignores
+    /// errors. Use [`FastaWriter::from_path_atomic`] to keep an existing file
+    /// intact until the new one is complete.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::create(path)?;
-        Ok(Self::from_writer(file))
+        Ok(Self::from_writer(BufWriter::new(file)))
     }
 
     /// Creates or truncates a FASTA file at a filesystem path.
@@ -236,9 +243,27 @@ impl<W: Write> FastaWriter<W> {
     /// Writes one FASTA record.
     ///
     /// The record ID must be non-empty and contain no whitespace. IDs,
-    /// descriptions, and sequences must not contain line endings.
+    /// descriptions, and sequences must not contain line endings. So that the
+    /// record reads back unchanged, no written sequence line may start with `>`
+    /// or end with whitespace at the writer's line width. Wrapping counts
+    /// characters, not bytes, so no line splits a character.
     pub fn write_record(&mut self, record: &FastaRecord) -> io::Result<()> {
         validate_fasta_record(record)?;
+        // The reader takes a line starting with '>' as a header and trims
+        // trailing whitespace, so refuse a record that would read back changed.
+        let lines = WrappedLines::new(&record.sequence, self.line_width);
+        for line in lines.clone() {
+            if line.starts_with('>') {
+                return Err(invalid_data(
+                    "FASTA sequence line would start with >, which reads as a header",
+                ));
+            }
+            if line.ends_with(char::is_whitespace) {
+                return Err(invalid_data(
+                    "FASTA sequence line would end with whitespace, which is trimmed when read",
+                ));
+            }
+        }
 
         write!(self.writer, ">{}", record.id)?;
         if let Some(description) = &record.description
@@ -248,17 +273,9 @@ impl<W: Write> FastaWriter<W> {
         }
         self.writer.write_all(b"\n")?;
 
-        match self.line_width {
-            Some(width) => {
-                for chunk in record.sequence.as_bytes().chunks(width) {
-                    self.writer.write_all(chunk)?;
-                    self.writer.write_all(b"\n")?;
-                }
-            }
-            None => {
-                self.writer.write_all(record.sequence.as_bytes())?;
-                self.writer.write_all(b"\n")?;
-            }
+        for line in lines {
+            self.writer.write_all(line.as_bytes())?;
+            self.writer.write_all(b"\n")?;
         }
 
         Ok(())
@@ -286,7 +303,15 @@ impl<W: Write> FastaWriter<W> {
         self.writer.flush()
     }
 
-    /// Consumes this writer and returns the wrapped byte stream.
+    /// Flushes the wrapped writer and returns it, so buffered write errors
+    /// are reported here.
+    pub fn finish(mut self) -> io::Result<W> {
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
+
+    /// Consumes this writer and returns the wrapped byte stream without
+    /// flushing it. Prefer [`FastaWriter::finish`].
     pub fn into_inner(self) -> W {
         self.writer
     }
@@ -317,7 +342,7 @@ impl Fasta {
     pub fn to_path<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let mut writer = FastaWriter::from_path(path)?;
         writer.write_all(self)?;
-        writer.flush()
+        writer.finish().map(drop)
     }
 
     /// Writes this FASTA payload to a filesystem path atomically.
@@ -404,8 +429,71 @@ fn validate_fasta_record(record: &FastaRecord) -> io::Result<()> {
     if record.sequence.contains(['\r', '\n']) {
         return Err(invalid_data("FASTA sequence must not contain line endings"));
     }
-
     Ok(())
+}
+
+/// Rejects a carriage return anywhere but at the end of a line, either just
+/// before its LF or as the last byte of the input.
+///
+/// Files with CR-only (classic Mac) line endings would otherwise read as one
+/// long line, silently turning every record into one header.
+fn check_line_ending(line: &str, line_number: usize) -> io::Result<()> {
+    let content = line.strip_suffix('\n').unwrap_or(line);
+    let content = content.strip_suffix('\r').unwrap_or(content);
+    if content.contains('\r') {
+        return Err(invalid_data_at_line(
+            line_number,
+            "FASTA lines must end in LF or CRLF; CR-only line endings are not supported",
+        ));
+    }
+    Ok(())
+}
+
+/// The lines a sequence is written as: the whole sequence, or pieces of
+/// `width` characters.
+#[derive(Clone)]
+struct WrappedLines<'a> {
+    rest: &'a str,
+    width: Option<usize>,
+    // ASCII lets pieces be cut by byte count.
+    ascii: bool,
+    done: bool,
+}
+
+impl<'a> WrappedLines<'a> {
+    fn new(sequence: &'a str, width: Option<usize>) -> Self {
+        Self {
+            rest: sequence,
+            width,
+            ascii: sequence.is_ascii(),
+            done: false,
+        }
+    }
+}
+
+impl<'a> Iterator for WrappedLines<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        let Some(width) = self.width else {
+            // Unwrapped output is one line, even for an empty sequence.
+            return (!std::mem::replace(&mut self.done, true)).then_some(self.rest);
+        };
+        if self.rest.is_empty() {
+            return None;
+        }
+        let end = if self.ascii {
+            width.min(self.rest.len())
+        } else {
+            self.rest
+                .char_indices()
+                .nth(width)
+                .map_or(self.rest.len(), |(index, _)| index)
+        };
+        let (line, rest) = self.rest.split_at(end);
+        self.rest = rest;
+        Some(line)
+    }
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
