@@ -93,6 +93,12 @@ the parser can identify it, such as line and field details.
 BAM `validate` and `stats` (and the library's `validate_bam` and `bam_stats`) reject a BAM
 that doesn't end with the BGZF EOF block, as possibly truncated.
 
+SAM `validate` also checks that each record's RNAME and RNEXT are declared in an `@SQ`
+line when the header has any. BAM `validate` also checks that the header text is a valid SAM
+header and that every record makes a valid SAM line, so a BAM that validates converts with
+`bam-to-sam`. POD5 `validate` checks the file structure, the Run Info table and every read
+row; it does not decompress signal data.
+
 ### Statistics
 
 Statistics are streamed where possible and returned by the library as typed
@@ -119,6 +125,10 @@ Examples of reported values include:
 - BAM record block-size summaries and unavailable quality counts.
 - POD5 read counts, signal-row counts, run/channel summaries, sample totals,
   duration estimates, pore/end-reason counts, and scaling/calibration summaries.
+
+Duplicate IDs are counted from a 128-bit fingerprint of each ID, and length
+statistics come from a histogram, so memory stays small on large files. N50 and
+N90 are exact.
 
 ### Convert
 
@@ -148,6 +158,11 @@ brust convert sam-to-bam aligned.sam aligned.bam --threads 4
 
 Only the `*-to-bam` conversions take `--threads`. The default is 1, and the
 output is identical at any thread count.
+
+A FASTQ output ending in `.gz` is written as gzip. FASTA and SAM outputs ending
+in `.gz` are refused, since those writers don't compress. `bam-to-sam` checks the
+BAM header text as a SAM header, and adds `@SQ` lines from the BAM reference list
+when the text has none; header text that isn't UTF-8 is refused.
 
 Conversions stream records into a temporary file beside the target path. On success the file
 is synced to disk and renamed over the target, so readers and crashes never see a partial
@@ -243,7 +258,7 @@ fn main() -> brust::Result<()> {
         Some("example".to_string()),
         "ACGTACGT".to_string(),
     ))?;
-    writer.flush()?;
+    writer.finish()?;
 
     Ok(())
 }
@@ -372,8 +387,9 @@ Brust is structured around a few product-grade reliability choices:
 - The workspace has unit and integration tests across parsing, writing,
   validation, conversion, stats, and CLI behavior.
 
-The project is still early at version `0.3.1`, so users should validate behavior
-against their production data and report edge cases. The intended direction is a
+The project is still early at version `0.4.0`, so users should validate behavior
+against their production data and report edge cases. See
+[CHANGELOG.md](CHANGELOG.md) for what changed in each release. The intended direction is a
 robust, reliable bioinformatics toolkit that can serve both command-line and
 Rust application workflows.
 

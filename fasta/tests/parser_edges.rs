@@ -40,3 +40,35 @@ fn non_header_junk_before_first_record_is_rejected() {
         "invalid FASTA at line 1: FASTA data before first header line"
     );
 }
+
+#[test]
+fn cr_only_line_endings_are_rejected() {
+    // Read with LF splitting, the whole file would become one header line.
+    let error = Fasta::from_reader(&b">seq1\rACGT\r>seq2\rTTAA\r"[..]).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn lone_carriage_return_inside_a_sequence_line_is_rejected() {
+    let error = Fasta::from_reader(&b">seq1\nAC\rGT\n"[..]).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn crlf_line_endings_are_read() {
+    let fasta =
+        Fasta::from_reader(&b">seq1 description\r\nAC\r\nGT\r\n>seq2\r\nTTAA\r\n"[..]).unwrap();
+
+    assert_eq!(fasta.records[0].sequence, "ACGT");
+    assert_eq!(fasta.records[0].description.as_deref(), Some("description"));
+    assert_eq!(fasta.records[1].sequence, "TTAA");
+}
+
+#[test]
+fn carriage_return_ending_the_input_is_read() {
+    let fasta = Fasta::from_reader(&b">seq1\r\nAC\r\nGT\r"[..]).unwrap();
+
+    assert_eq!(fasta.records[0].sequence, "ACGT");
+}

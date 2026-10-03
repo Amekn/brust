@@ -25,7 +25,7 @@ use flate2::Compression as GzipLevel;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
@@ -184,7 +184,10 @@ impl<R: Read> FastqReader<R> {
     /// malformed or truncated record returns `InvalidData`. Sequence line
     /// endings are removed until a `+` separator line is reached, and quality
     /// line endings are removed until the accumulated quality length equals the
-    /// parsed sequence length.
+    /// parsed sequence length. A zero-length read is one blank (or absent)
+    /// sequence line followed by one blank quality line. Text after the `+`
+    /// must repeat the record's ID, optionally with its description, and
+    /// quality characters must be printable ASCII from `!` to `~`.
     pub fn read_record(&mut self) -> io::Result<Option<FastqRecord>> {
         let mut line = String::new();
         loop {
@@ -229,6 +232,9 @@ impl<R: Read> FastqReader<R> {
             .map(String::from);
 
         let mut sequence = String::new();
+        // A zero-length read is written with one blank sequence line; blank
+        // lines anywhere else in a sequence are errors.
+        let mut blank_sequence_line = None;
 
         loop {
             line.clear();
@@ -244,13 +250,40 @@ impl<R: Read> FastqReader<R> {
                 break;
             }
             let sequence_line = line.trim_end();
+            if let Some(blank_line) = blank_sequence_line {
+                return Err(invalid_data_at_line(
+                    blank_line,
+                    "FASTQ sequence line must not be blank",
+                ));
+            }
             if sequence_line.is_empty() {
+                if sequence.is_empty() {
+                    blank_sequence_line = Some(self.line_number);
+                    continue;
+                }
                 return Err(invalid_data_at_line(
                     self.line_number,
                     "FASTQ sequence line must not be blank",
                 ));
             }
             sequence.push_str(sequence_line);
+        }
+
+        // The separator may repeat the record's title: its ID, optionally
+        // followed by the description.
+        let separator_title = line[1..].trim();
+        if !separator_title.is_empty() {
+            let mut parts = separator_title.splitn(2, char::is_whitespace);
+            let separator_id = parts.next().unwrap_or("");
+            let separator_description = parts.next().map(str::trim).filter(|s| !s.is_empty());
+            if separator_id != id
+                || separator_description.is_some_and(|text| Some(text) != description.as_deref())
+            {
+                return Err(invalid_data_at_line(
+                    self.line_number,
+                    "FASTQ + line does not match the record header",
+                ));
+            }
         }
 
         let mut quality = String::new();
@@ -264,11 +297,31 @@ impl<R: Read> FastqReader<R> {
                 ));
             }
             self.line_number += 1;
-            let quality_line = line.trim_end();
+            // Only the line ending is removed: other trailing bytes are part of
+            // the quality string and must pass the character check.
+            let quality_line = strip_line_ending(&line);
+            if sequence.is_empty() {
+                if !quality_line.is_empty() {
+                    return Err(invalid_data_at_line(
+                        self.line_number,
+                        format!(
+                            "FASTQ quality length exceeds sequence length ({} > 0)",
+                            quality_line.len()
+                        ),
+                    ));
+                }
+                break;
+            }
             if quality_line.is_empty() {
                 return Err(invalid_data_at_line(
                     self.line_number,
                     "FASTQ quality line must not be blank",
+                ));
+            }
+            if !quality_line.bytes().all(is_quality_byte) {
+                return Err(invalid_data_at_line(
+                    self.line_number,
+                    "FASTQ quality characters must be printable ASCII from ! to ~",
                 ));
             }
             quality.push_str(quality_line);
@@ -303,8 +356,14 @@ impl<R: Read> FastqReader<R> {
     }
 
     /// Returns an iterator over records in the stream.
+    ///
+    /// The iterator ends after yielding its first error, since the reader may
+    /// then be part-way through a record or stuck on a repeating I/O error.
     pub fn records(&mut self) -> FastqRecords<'_, R> {
-        FastqRecords { reader: self }
+        FastqRecords {
+            reader: self,
+            failed: false,
+        }
     }
 
     /// Consumes this reader and materializes the entire FASTQ stream.
@@ -317,11 +376,15 @@ impl<R: Read> FastqReader<R> {
     }
 }
 
-impl FastqWriter<File> {
+impl FastqWriter<BufWriter<File>> {
     /// Creates or truncates a plain or gzip-compressed FASTQ path.
     ///
     /// A final `.gz` suffix selects streaming gzip compression. Other paths,
     /// including `.fq` and `.fastq`, remain plain text.
+    ///
+    /// Output is buffered. Call [`finish`](FastqWriter::finish) to write the
+    /// rest, including any gzip trailer, and see any error; dropping the
+    /// writer attempts the same but ignores errors.
     ///
     /// Use [`FastqWriter::from_path_atomic`] to keep an existing file intact until
     /// the new one is complete.
@@ -339,7 +402,10 @@ impl FastqWriter<File> {
         compression: Compression,
     ) -> io::Result<Self> {
         let file = File::create(path)?;
-        Ok(Self::from_writer_with_compression(file, compression))
+        Ok(Self::from_writer_with_compression(
+            BufWriter::new(file),
+            compression,
+        ))
     }
 
     /// Creates or truncates a FASTQ file at a filesystem path.
@@ -399,7 +465,10 @@ impl<W: Write> FastqWriter<W> {
     ///
     /// The record ID must be non-empty and contain no whitespace. IDs,
     /// descriptions, sequences, and qualities must not contain line endings,
-    /// and sequence and quality lengths must match.
+    /// and sequence and quality lengths must match. So that the record reads
+    /// back unchanged, the sequence must not start with `+`, the sequence and
+    /// quality must not end with whitespace, and quality characters must be
+    /// printable ASCII from `!` to `~`. Empty sequence and quality are allowed.
     pub fn write_record(&mut self, record: &FastqRecord) -> io::Result<()> {
         validate_fastq_record(record)?;
 
@@ -441,15 +510,21 @@ impl<W: Write> FastqWriter<W> {
 
     /// Finishes the stream and returns the wrapped writer.
     ///
-    /// For gzip output this writes and validates the stream trailer. For plain
-    /// output it flushes the wrapped writer.
+    /// For gzip output this writes the stream trailer; for both outputs it then
+    /// flushes the wrapped writer, so buffered write errors are reported here.
     pub fn finish(self) -> io::Result<W> {
         match self.writer {
             FastqOutput::Plain(mut writer) => {
                 writer.flush()?;
                 Ok(writer)
             }
-            FastqOutput::Gzip(writer) => writer.finish(),
+            FastqOutput::Gzip(writer) => {
+                // GzEncoder::finish writes the trailer but never flushes the
+                // stream it wraps, which may still be buffering it.
+                let mut writer = writer.finish()?;
+                writer.flush()?;
+                Ok(writer)
+            }
         }
     }
 
@@ -564,16 +639,25 @@ impl FastqRecord {
 /// Iterator over records from a [`FastqReader`].
 pub struct FastqRecords<'a, R: Read> {
     reader: &'a mut FastqReader<R>,
+    // After an error the reader may be part-way through a record, or stuck on
+    // an error that repeats forever, so iteration stops.
+    failed: bool,
 }
 
 impl<R: Read> Iterator for FastqRecords<'_, R> {
     type Item = io::Result<FastqRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
         match self.reader.read_record() {
             Ok(Some(record)) => Some(Ok(record)),
             Ok(None) => None,
-            Err(error) => Some(Err(error)),
+            Err(error) => {
+                self.failed = true;
+                Some(Err(error))
+            }
         }
     }
 }
@@ -608,8 +692,36 @@ fn validate_fastq_record(record: &FastqRecord) -> io::Result<()> {
             "FASTQ sequence and quality lengths must match",
         ));
     }
+    // Readers take a line starting with '+' as the separator and trim
+    // trailing whitespace, so such records would not read back as written.
+    if record.sequence.starts_with('+') {
+        return Err(invalid_data("FASTQ sequence must not start with +"));
+    }
+    if record.sequence.ends_with(char::is_whitespace)
+        || record.quality.ends_with(char::is_whitespace)
+    {
+        return Err(invalid_data(
+            "FASTQ sequence and quality must not end with whitespace",
+        ));
+    }
+    if !record.quality.bytes().all(is_quality_byte) {
+        return Err(invalid_data(
+            "FASTQ quality characters must be printable ASCII from ! to ~",
+        ));
+    }
 
     Ok(())
+}
+
+/// Returns `line` without its trailing LF or CRLF.
+fn strip_line_ending(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// Whether `byte` is a FASTQ quality character (Phred+33 range `!` to `~`).
+fn is_quality_byte(byte: u8) -> bool {
+    (b'!'..=b'~').contains(&byte)
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {

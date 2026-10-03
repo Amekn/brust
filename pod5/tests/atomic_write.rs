@@ -90,3 +90,42 @@ fn to_path_atomic_matches_to_path() {
     );
     assert_eq!(names(dir.path()), ["atomic.pod5", "plain.pod5"]);
 }
+
+#[test]
+fn writer_rejects_a_second_payload() {
+    // Each payload is a whole POD5 container; appending a second one used to
+    // corrupt the file while both calls returned Ok.
+    let payload = Pod5::from_path(FIXTURE).unwrap();
+    let mut single = Vec::new();
+    payload.to_writer(&mut single).unwrap();
+
+    let mut writer = Pod5Writer::from_writer(Vec::new());
+    writer.write_all(&payload).unwrap();
+    let error = writer.write_all(&payload).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(writer.into_inner(), single);
+}
+
+#[test]
+fn atomic_commit_without_a_payload_publishes_nothing() {
+    let dir = TempDir::new("writer-empty");
+    let writer = Pod5Writer::from_path_atomic(dir.join("out.pod5")).unwrap();
+
+    let error = writer.commit().unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(names(dir.path()).is_empty());
+}
+
+#[test]
+fn to_path_keeps_existing_file_when_payload_is_invalid() {
+    let dir = TempDir::new("to-path-invalid");
+    let target = dir.join("out.pod5");
+    fs::write(&target, b"old contents").unwrap();
+    let mut payload = Pod5::from_path(FIXTURE).unwrap();
+    payload.records[0].signal_rows = vec![payload.signals.len() as u64];
+
+    assert!(payload.to_path(&target).is_err());
+    assert_eq!(fs::read(&target).unwrap(), b"old contents");
+}

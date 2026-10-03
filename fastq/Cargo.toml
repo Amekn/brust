@@ -12,6 +12,6 @@ keywords = ["bioinformatics", "fastq", "sequencing", "phred", "gzip"]
 categories = ["science::bioinformatics", "science::bioinformatics::sequence-analysis", "parser-implementations"]
 
 [dependencies]
-brust-core = { path = "../brust-core", version = "0.3.1" }
-fasta = { package = "brust-fasta", path = "../fasta", version = "0.3.1" }
+brust-core = { path = "../brust-core", version = "0.4.0" }
+fasta = { package = "brust-fasta", path = "../fasta", version = "0.4.0" }
 flate2 = "1.1.9"

@@ -66,7 +66,8 @@ fn inspect(error: std::io::Error) {
 path only when `commit` succeeds. It writes to a hidden temporary file beside
 the target, then flushes, syncs, renames and (on Unix) syncs the folder.
 Dropping it without `commit` removes the temporary file and leaves any existing
-target unchanged.
+target unchanged. `create` refuses a target that is a folder, FIFO, socket or
+device, rather than replacing it.
 
 ```rust
 use brust_core::AtomicFile;

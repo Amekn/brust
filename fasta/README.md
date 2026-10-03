@@ -20,7 +20,10 @@ use brust_fasta::FastaReader;
 ## API
 
 - `FastaReader`: streaming parser over files or arbitrary readers.
-- `FastaWriter`: streaming writer with optional sequence line wrapping.
+- `FastaWriter`: streaming writer with optional sequence line wrapping. It
+  refuses records that would read back differently, such as a written line
+  starting with `>`. `FastaWriter::from_path` buffers its output; call `finish`
+  to write the rest and see any error.
 - `Fasta`: materialized FASTA collection with `from_path` and `to_path`.
 - `FastaRecord`: owned record with `id`, optional `description`, and
   `sequence`.
@@ -56,7 +59,7 @@ fn main() -> std::io::Result<()> {
         "ACGTACGT".to_string(),
     ))?;
 
-    writer.flush()
+    writer.finish().map(drop)
 }
 ```
 

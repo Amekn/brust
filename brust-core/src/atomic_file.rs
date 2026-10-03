@@ -1,5 +1,6 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
+use std::hash::BuildHasher;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -11,8 +12,11 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// when [`AtomicFile::commit`] succeeds.
 ///
 /// [`AtomicFile::create`] opens a hidden temporary file beside the target,
-/// named `.{pid}.{counter}.tmp.{file_name}`. The target is not opened or
-/// touched. Writes go through a `BufWriter`, and `flush` only pushes the buffer
+/// named `.{pid}.{counter}.tmp.{file_name}`, or `.{pid}.{counter}.tmp.{hash}`
+/// when that would be longer than 255 bytes. The target is not opened
+/// or touched, but an existing target that is not a regular file or symlink
+/// (a folder, FIFO, socket or device) is refused, since the rename would
+/// replace it. Writes go through a `BufWriter`, and `flush` only pushes the buffer
 /// to the temporary file; it does not sync it to disk.
 ///
 /// [`AtomicFile::commit`] runs in this order:
@@ -35,7 +39,8 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// panic that unwinds) removes the temporary file, so nothing appears at the
 /// target and an existing target is unchanged. A kill, Ctrl-C or power loss
 /// before `commit` leaves the temporary file behind; the target is still
-/// untouched, and the `.tmp.` in the name makes the leftover easy to spot.
+/// untouched, and the `.{pid}.{counter}.tmp` prefix makes the leftover easy to
+/// spot.
 ///
 /// Known limits:
 ///
@@ -65,9 +70,10 @@ pub struct AtomicFile {
 impl AtomicFile {
     /// Creates a temporary file beside `path`, ready for writing.
     ///
-    /// Returns `InvalidInput` when `path` has no file name, and the open error
-    /// (for example `NotFound` for a missing parent folder) otherwise. Nothing
-    /// is created on failure.
+    /// Returns `InvalidInput` when `path` has no file name or names an existing
+    /// folder, FIFO, socket or device, and the open error (for example
+    /// `NotFound` for a missing parent folder) otherwise. Nothing is created on
+    /// failure.
     pub fn create<P: AsRef<Path>>(path: P) -> io::Result<AtomicFile> {
         let target = path.as_ref();
         let file_name = target.file_name().ok_or_else(|| {
@@ -76,15 +82,25 @@ impl AtomicFile {
                 format!("output path {} must include a file name", target.display()),
             )
         })?;
+        // The rename would replace a folder, FIFO, socket or device with a
+        // regular file (or fail only after all the output was written).
+        if let Ok(metadata) = fs::symlink_metadata(target) {
+            let file_type = metadata.file_type();
+            if !file_type.is_file() && !file_type.is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "output path {} exists and is not a regular file",
+                        target.display()
+                    ),
+                ));
+            }
+        }
         let parent = parent_of(target);
 
         for _ in 0..100 {
             let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            // Keep the complete target name at the end so suffix checks such
-            // as `.gz` and `.bam` still work on the temporary path.
-            let mut temp_name = OsString::from(format!(".{}.{}.tmp.", process::id(), counter));
-            temp_name.push(file_name);
-            let temp_path = parent.join(temp_name);
+            let temp_path = parent.join(temp_file_name(file_name, counter));
 
             match OpenOptions::new()
                 .write(true)
@@ -165,6 +181,32 @@ impl AtomicFile {
     }
 }
 
+/// Longest file name, in bytes, that common filesystems accept.
+const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// Returns `.{pid}.{counter}.tmp.{file_name}`, or `.{pid}.{counter}.tmp.{hash}`
+/// when that would be longer than [`MAX_FILE_NAME_BYTES`].
+///
+/// A name that fits can't spell the target's own name on any filesystem: it is
+/// the target's name after a visible ASCII prefix. A shortened name could
+/// (case, Unicode normalisation, ignorable characters and Windows trailing
+/// dots all make different spellings one name), so a long name is replaced by
+/// 16 hex digits of a hash with a random per-process key, which no target
+/// name can be made to match.
+fn temp_file_name(file_name: &OsStr, counter: u64) -> OsString {
+    let mut name = OsString::from(format!(".{}.{counter}.tmp.", process::id()));
+    if name.len() + file_name.len() <= MAX_FILE_NAME_BYTES {
+        name.push(file_name);
+    } else {
+        name.push(format!("{:016x}", RANDOM_STATE.hash_one(file_name)));
+    }
+    name
+}
+
+/// Randomly keyed hasher for shortened temporary names.
+static RANDOM_STATE: std::sync::LazyLock<std::hash::RandomState> =
+    std::sync::LazyLock::new(std::hash::RandomState::new);
+
 /// The folder holding `path`, or `.` when the path has no parent part.
 fn parent_of(path: &Path) -> &Path {
     path.parent()
@@ -191,5 +233,55 @@ impl Drop for AtomicFile {
         if !self.published {
             let _ = fs::remove_file(&self.temp_path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 255-byte target name that starts with the temporary prefix for
+    /// `counter`, with the marker in the given case.
+    fn aliasing_name(counter: u64, marker: &str) -> String {
+        let prefix = format!(".{}.{counter}.{marker}.", process::id());
+        format!("{prefix}{}", "a".repeat(MAX_FILE_NAME_BYTES - prefix.len()))
+    }
+
+    #[test]
+    fn long_target_names_become_a_keyed_hash_in_temporary_names() {
+        // A shortened copy of a long name could spell the target's own name.
+        let prefix = format!(".{}.7.tmp.", process::id());
+        for marker in ["tmp", "TMP"] {
+            let name = aliasing_name(7, marker);
+            let temp = temp_file_name(OsStr::new(&name), 7).into_string().unwrap();
+            let hash = temp.strip_prefix(&prefix).unwrap();
+            assert_eq!(hash.len(), 16, "{temp}");
+            assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()), "{temp}");
+        }
+        let short = temp_file_name(OsStr::new("out.fastq.gz"), 7);
+        assert_eq!(short, OsString::from(format!("{prefix}out.fastq.gz")));
+    }
+
+    #[test]
+    fn output_never_appears_at_a_long_target_before_commit() {
+        // This is the only test in this binary that calls AtomicFile::create,
+        // so the counter it reads is the one create will use next.
+        let dir = std::env::temp_dir().join(format!("brust-core-alias-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join(aliasing_name(TEMP_COUNTER.load(Ordering::Relaxed), "tmp"));
+
+        let mut file = AtomicFile::create(&target).unwrap();
+        file.write_all(b"data").unwrap();
+        file.flush().unwrap();
+        let visible_early = target.exists();
+        file.commit().unwrap();
+        let contents = fs::read(&target).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            !visible_early,
+            "output appeared at the target before commit"
+        );
+        assert_eq!(contents, b"data");
     }
 }

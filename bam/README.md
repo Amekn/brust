@@ -26,11 +26,17 @@ cargo add brust-sam
 
 ## API
 
-- `BamReader`: reads BAM headers, reference dictionaries, and records.
+- `BamReader`: reads BAM headers, reference dictionaries, and records. As in
+  samtools, it rejects records whose reference IDs fall outside the reference
+  list, and mapped records with both a sequence and a CIGAR whose lengths
+  disagree.
+- `BamHeader`: the header text, kept byte for byte as `Vec<u8>`.
+  `BamHeader::text_str` returns it as `&str` when it is UTF-8.
 - `BamWriter`: writes BAM headers and records. `BamWriter::from_path` and
   `BamWriter::from_writer` compress on the calling thread;
   `BamWriter::from_path_with_threads` and `BamWriter::from_writer_with_threads`
-  compress on worker threads.
+  compress on worker threads. A writer holds one reference list: records must
+  use reference IDs from it, and a later payload must have the same list.
 - `Bam`: materialized BAM payload with `from_path`, `to_path`, and
   `from_sam`.
 - `BamRecord`: decoded fixed, variable, and auxiliary record fields.
@@ -39,6 +45,10 @@ cargo add brust-sam
   return the sequence and qualities in the original sequencing orientation:
   reverse-complemented and reversed for reverse-strand records (flag `0x10`),
   unchanged otherwise.
+  `BamRecord::cigar_ops` returns the real CIGAR, including for records with
+  more than 65,535 operations, which BAM stores in a `CG` tag (SAMv1 section
+  4.2.2). SAM conversion and statistics use it, and `SamToBamConverter` writes
+  long CIGARs that way.
 - `BamAuxValue` and `BamAuxArray`: parsed BAM auxiliary tags.
 - `BgzfVirtualOffset`: compressed/uncompressed BGZF virtual offset.
 - `BgzfWriter`: writes any byte stream as BGZF blocks, on the calling thread or

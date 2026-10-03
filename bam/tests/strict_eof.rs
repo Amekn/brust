@@ -196,3 +196,42 @@ fn strict_bgzf_rejects_final_empty_block_that_is_not_the_marker() {
     let error = read_to_end(&stream, true).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
+
+/// Yields `data`, but returns `WouldBlock` once when it reaches the end.
+struct BlockOnceAtEnd {
+    data: Vec<u8>,
+    position: usize,
+    blocked: bool,
+}
+
+impl Read for BlockOnceAtEnd {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.position == self.data.len() && !self.blocked {
+            self.blocked = true;
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let read = (&self.data[self.position..]).read(buf)?;
+        self.position += read;
+        Ok(read)
+    }
+}
+
+#[test]
+fn strict_check_still_runs_after_a_transient_error_at_the_end() {
+    // A transient error is not a failed block; a retry that then reaches the
+    // end without the EOF block must still be reported.
+    let mut reader = BgzfReader::new(BlockOnceAtEnd {
+        data: block(b"data"),
+        position: 0,
+        blocked: false,
+    });
+    reader.set_require_eof_block(true);
+    let mut out = Vec::new();
+
+    let first = reader.read_to_end(&mut out).unwrap_err();
+    assert_eq!(first.kind(), io::ErrorKind::WouldBlock);
+    let retry = reader.read_to_end(&mut out).unwrap_err();
+    assert_eq!(retry.kind(), io::ErrorKind::InvalidData);
+    assert!(retry.to_string().contains(MESSAGE), "{retry}");
+    assert_eq!(out, b"data");
+}

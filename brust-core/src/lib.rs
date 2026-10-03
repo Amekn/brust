@@ -15,8 +15,9 @@ pub use atomic_file::AtomicFile;
 
 /// Compression applied around a biological format stream.
 ///
-/// Path-based writers use [`Compression::from_path`] to select gzip for a
-/// final `.gz` suffix, including conventional `.fq.gz` and `.fastq.gz` files.
+/// Path-based FASTQ writers use [`Compression::from_path`] to select gzip for
+/// a final `.gz` suffix, including conventional `.fq.gz` and `.fastq.gz`
+/// files. Other text writers don't compress.
 /// Readers may additionally inspect stream magic bytes so renamed gzip files
 /// can still be decoded.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]

@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -141,19 +142,30 @@ fn main() -> ExitCode {
     }
 }
 
+/// Writes one line to stdout.
+///
+/// A closed stdout (`brust stats ... | head -1`) means the reader stopped
+/// listening, so it is not an error; `println!` would panic there instead.
+fn print_line(text: impl std::fmt::Display) -> std::result::Result<(), String> {
+    match writeln!(std::io::stdout(), "{text}") {
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => {
+            Err(format!("Failed to write output: {error}"))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn run(cli: Cli) -> std::result::Result<(), String> {
     match cli.command {
         Commands::Stats { format, input } => {
             let stats = brust::stats::stats(format.into(), &input)
                 .map_err(|error| format!("Stats failed for {}: {}", input.display(), error))?;
-            println!("{}", stats.display());
-            Ok(())
+            print_line(stats.display())
         }
         Commands::Validate { format, input } => {
             brust::validate::validate(format.into(), &input)
                 .map_err(|error| format!("Validation failed for {}: {}", input.display(), error))?;
-            println!("The {} file is valid.", input.display());
-            Ok(())
+            print_line(format_args!("The {} file is valid.", input.display()))
         }
         Commands::Convert { command } => {
             let (conversion, input, output, options) = command.into_parts();
@@ -168,12 +180,11 @@ fn run(cli: Cli) -> std::result::Result<(), String> {
                     )
                 },
             )?;
-            println!(
+            print_line(format_args!(
                 "Conversion completed: {} -> {}",
                 input.display(),
                 output.display()
-            );
-            Ok(())
+            ))
         }
     }
 }

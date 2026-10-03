@@ -12,7 +12,7 @@ keywords = ["bioinformatics", "bam", "bgzf", "alignment", "genomics"]
 categories = ["science::bioinformatics", "science::bioinformatics::genomics", "parser-implementations", "compression"]
 
 [dependencies]
-brust-core = { path = "../brust-core", version = "0.3.1" }
+brust-core = { path = "../brust-core", version = "0.4.0" }
 flate2 = "1.1.9"
-sam = { package = "brust-sam", path = "../sam", version = "0.3.1" }
-seq = { package = "brust-seq", path = "../seq", version = "0.3.1" }
+sam = { package = "brust-sam", path = "../sam", version = "0.4.0" }
+seq = { package = "brust-seq", path = "../seq", version = "0.4.0" }

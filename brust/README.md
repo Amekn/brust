@@ -54,7 +54,10 @@ brust validate pod5 reads.pod5
 ```
 
 BAM `validate` and `stats` (and the library's `validate_bam` and `bam_stats`) reject a BAM
-that doesn't end with the BGZF EOF block, as possibly truncated.
+that doesn't end with the BGZF EOF block, as possibly truncated. BAM `validate` also checks
+that the header text is a valid SAM header and that every record makes a valid SAM line, so
+a BAM that validates converts with `bam-to-sam`. SAM `validate` checks each record's RNAME
+and RNEXT against the `@SQ` lines when the header has any.
 
 Print human-readable statistics:
 
@@ -94,7 +97,9 @@ temporary file is deleted and an existing output is left untouched. A folder-syn
 the rename is reported, but the new file is already in place. BAM input must end with the BGZF
 EOF block; a BAM without it is rejected as possibly truncated.
 
-A `.gz` FASTQ target is written as gzip.
+A `.gz` FASTQ target is written as gzip. FASTA and SAM targets ending in `.gz` are refused,
+since those writers don't compress. `bam-to-sam` checks the BAM header text as a SAM header,
+and adds `@SQ` lines from the BAM reference list when the text has none.
 
 ## Public API
 
@@ -184,7 +189,7 @@ paths use underscores:
 
 ```toml
 [dependencies]
-brust-fasta = "0.3.1"
+brust-fasta = "0.4.0"
 ```
 
 ```rust

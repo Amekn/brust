@@ -10,9 +10,9 @@
 //! The parser supports SAM v1.6-style `@HD`, `@SQ`, `@RG`, `@PG`, and `@CO`
 //! header records, the 11 mandatory tab-delimited alignment fields, CIGAR
 //! parsing and length checks, and optional `TAG:TYPE:VALUE` fields for scalar,
-//! string, hex, and numeric-array values. The writer formats records and
-//! reparses them before emitting text, so the same validation is applied on
-//! output.
+//! string, hex, and numeric-array values. The writer checks each record with
+//! [`SamRecord::validate`], the same checks the parser applies, before
+//! emitting text.
 //!
 //! A plain-text file cut at a record boundary looks complete, so a truncated
 //! file like that can't be detected when read. For files you write, use
@@ -20,8 +20,9 @@
 
 use brust_core::{AtomicFile, Error, Format};
 use std::collections::HashSet;
+use std::fmt;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 /// A fully materialized SAM payload.
@@ -55,11 +56,14 @@ pub struct SamReader<R: Read = File> {
 /// Streaming SAM writer over any writable byte stream.
 ///
 /// `SamWriter` emits header records followed by alignment records. It validates
-/// headers before writing and validates alignment records by formatting and
-/// reparsing them. Use [`SamWriter::write_all`] for a materialized [`Sam`], or
-/// call [`SamWriter::write_header`] once before streaming records manually.
+/// headers before writing and checks alignment records with
+/// [`SamRecord::validate`]. Use [`SamWriter::write_all`] for a materialized
+/// [`Sam`], or call [`SamWriter::write_header`] once before streaming records
+/// manually.
 pub struct SamWriter<W: Write = File> {
     writer: W,
+    // Reused for each record's line.
+    line: String,
 }
 
 /// SAM header section in file order.
@@ -337,10 +341,84 @@ impl SamRecord {
     }
 
     /// Formats this record as one SAM alignment line without a trailing newline.
+    ///
+    /// The record is first checked with [`SamRecord::validate`], so the line
+    /// satisfies the parser's checks and keeps one field per record field.
     pub fn to_sam_line(&self) -> io::Result<String> {
-        let line = format_sam_record(self)?;
-        Self::parse(&line)?;
+        self.validate()?;
+        let mut line = String::new();
+        push_sam_record(&mut line, self);
         Ok(line)
+    }
+
+    /// Checks that this record can be written as a SAM line that reads back as
+    /// the same record.
+    ///
+    /// These are the checks [`SamReader`] applies to every alignment line once
+    /// its numbers and optional fields are parsed: QNAME, RNAME and RNEXT
+    /// characters, POS and PNEXT at most `i32::MAX`, CIGAR syntax and clipping,
+    /// SEQ and QUAL characters, CIGAR, SEQ and QUAL lengths agreeing, optional
+    /// field tags and `A` and `Z` characters, and no repeated tag. No field may
+    /// hold a tab or line break, since the checked characters exclude them.
+    /// Errors name the first field that fails, in column order.
+    pub fn validate(&self) -> io::Result<()> {
+        if !is_query_name(&self.qname) {
+            return Err(invalid_data("invalid QNAME"));
+        }
+        if self.rname != "*" && !is_reference_name(&self.rname) {
+            return Err(invalid_data("invalid RNAME"));
+        }
+        if self.pos > i32::MAX as u32 {
+            return Err(invalid_data("invalid POS"));
+        }
+        let cigar_ops = parse_cigar(&self.cigar)?;
+        if !(self.rnext == "*" || self.rnext == "=" || is_reference_name(&self.rnext)) {
+            return Err(invalid_data("invalid RNEXT"));
+        }
+        if self.pnext > i32::MAX as u32 {
+            return Err(invalid_data("invalid PNEXT"));
+        }
+        if !is_sequence(&self.seq) {
+            return Err(invalid_data("invalid SEQ"));
+        }
+        if !is_quality(&self.qual) {
+            return Err(invalid_data("invalid QUAL"));
+        }
+
+        if self.cigar != "*" && self.seq != "*" {
+            let query_len = cigar_ops
+                .iter()
+                .filter(|op| matches!(op.op, 'M' | 'I' | 'S' | '=' | 'X'))
+                .map(|op| u64::from(op.len))
+                .sum::<u64>();
+
+            if query_len != self.seq.len() as u64 {
+                return Err(invalid_data("SEQ length does not match CIGAR query length"));
+            }
+        }
+        if self.qual != "*" && self.seq == "*" {
+            return Err(invalid_data("QUAL is present while SEQ is unavailable"));
+        }
+        if self.qual != "*" && self.qual.len() != self.seq.len() {
+            return Err(invalid_data("QUAL length does not match SEQ length"));
+        }
+
+        // A linear scan is cheaper than hashing for the usual handful of tags.
+        let mut seen = (self.optional.len() > 16).then(HashSet::new);
+        for (index, field) in self.optional.iter().enumerate() {
+            field.validate()?;
+            let repeated = match &mut seen {
+                Some(seen) => !seen.insert(field.tag.as_str()),
+                None => self.optional[..index]
+                    .iter()
+                    .any(|other| other.tag == field.tag),
+            };
+            if repeated {
+                return Err(invalid_data("duplicate SAM optional field tag"));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -373,7 +451,7 @@ impl Sam {
     pub fn to_path<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let mut writer = SamWriter::from_path(path)?;
         writer.write_all(self)?;
-        writer.flush()
+        writer.finish().map(drop)
     }
 
     /// Writes this SAM payload to a filesystem path atomically.
@@ -513,14 +591,16 @@ impl<R: Read> SamReader<R> {
     }
 }
 
-impl SamWriter<File> {
+impl SamWriter<BufWriter<File>> {
     /// Creates or truncates a SAM file at a filesystem path.
     ///
-    /// Use [`SamWriter::from_path_atomic`] to keep an existing file intact until
-    /// the new one is complete.
+    /// Output is buffered. Call [`finish`](SamWriter::finish) to write the
+    /// rest and see any error; dropping the writer writes the rest but ignores
+    /// errors. Use [`SamWriter::from_path_atomic`] to keep an existing file
+    /// intact until the new one is complete.
     pub fn from_path<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::create(path)?;
-        Ok(Self::from_writer(file))
+        Ok(Self::from_writer(BufWriter::new(file)))
     }
 
     /// Creates or truncates a SAM file at a filesystem path.
@@ -552,7 +632,10 @@ impl SamWriter<AtomicFile> {
 impl<W: Write> SamWriter<W> {
     /// Creates a SAM writer from a writable byte stream.
     pub fn from_writer(writer: W) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            line: String::new(),
+        }
     }
 
     /// Writes a SAM header section.
@@ -571,15 +654,16 @@ impl<W: Write> SamWriter<W> {
 
     /// Writes one SAM alignment record.
     ///
-    /// The record is formatted to a SAM line and reparsed before any bytes are
-    /// written, ensuring writer output satisfies the same checks as parser
-    /// input.
+    /// The record is checked with [`SamRecord::validate`] before any bytes are
+    /// written, so writer output satisfies the same checks as parser input and
+    /// reads back as the same record (a tab inside a field, for example, would
+    /// split it).
     pub fn write_record(&mut self, record: &SamRecord) -> io::Result<()> {
-        let line = format_sam_record(record)?;
-        SamRecord::parse(&line)?;
-        self.writer.write_all(line.as_bytes())?;
-        self.writer.write_all(b"\n")?;
-        Ok(())
+        record.validate()?;
+        self.line.clear();
+        push_sam_record(&mut self.line, record);
+        self.line.push('\n');
+        self.writer.write_all(self.line.as_bytes())
     }
 
     /// Writes one SAM alignment record.
@@ -603,7 +687,15 @@ impl<W: Write> SamWriter<W> {
         self.writer.flush()
     }
 
-    /// Consumes this writer and returns the wrapped byte stream.
+    /// Flushes the wrapped writer and returns it, so buffered write errors
+    /// are reported here.
+    pub fn finish(mut self) -> io::Result<W> {
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
+
+    /// Consumes this writer and returns the wrapped byte stream without
+    /// flushing it. Prefer [`SamWriter::finish`].
     pub fn into_inner(self) -> W {
         self.writer
     }
@@ -758,6 +850,9 @@ impl SamHeaderRecord {
                 .strip_prefix("CO\t")
                 .map(str::to_string)
                 .unwrap_or_default();
+            if !is_comment(&comment) {
+                return Err(invalid_data("invalid @CO comment"));
+            }
             return Ok(Self::comment(comment));
         }
 
@@ -773,7 +868,7 @@ impl SamHeaderRecord {
                 return Err(invalid_data("invalid SAM header field tag"));
             }
 
-            if value.is_empty() || !is_printable_or_space_ascii(value) {
+            if !is_header_value(record_type, tag, value) {
                 return Err(invalid_data("invalid SAM header field value"));
             }
 
@@ -813,84 +908,25 @@ impl SamRecord {
             return Err(invalid_data("SAM alignment line has fewer than 11 fields"));
         }
 
-        let qname = fields[0];
-        if !is_query_name(qname) {
-            return Err(invalid_data("invalid QNAME"));
-        }
-
-        let flag = parse_u16(fields[1], "invalid FLAG")?;
-        let rname = fields[2];
-        if rname != "*" && !is_reference_name(rname) {
-            return Err(invalid_data("invalid RNAME"));
-        }
-
-        let pos = parse_u32_max_i32(fields[3], "invalid POS")?;
-        let mapq = parse_u8(fields[4], "invalid MAPQ")?;
-        let cigar = fields[5];
-        let cigar_ops = parse_cigar(cigar)?;
-        let rnext = fields[6];
-        if !(rnext == "*" || rnext == "=" || is_reference_name(rnext)) {
-            return Err(invalid_data("invalid RNEXT"));
-        }
-
-        let pnext = parse_u32_max_i32(fields[7], "invalid PNEXT")?;
-        let tlen = parse_i32(fields[8], "invalid TLEN")?;
-        let seq = fields[9];
-        let qual = fields[10];
-
-        if !is_sequence(seq) {
-            return Err(invalid_data("invalid SEQ"));
-        }
-
-        if !is_quality(qual) {
-            return Err(invalid_data("invalid QUAL"));
-        }
-
-        if cigar != "*" && seq != "*" {
-            let query_len = cigar_ops
+        let record = Self::new(
+            fields[0].to_string(),
+            parse_u16(fields[1], "invalid FLAG")?,
+            fields[2].to_string(),
+            parse_u32_max_i32(fields[3], "invalid POS")?,
+            parse_u8(fields[4], "invalid MAPQ")?,
+            fields[5].to_string(),
+            fields[6].to_string(),
+            parse_u32_max_i32(fields[7], "invalid PNEXT")?,
+            parse_i32(fields[8], "invalid TLEN")?,
+            fields[9].to_string(),
+            fields[10].to_string(),
+            fields[11..]
                 .iter()
-                .filter(|op| matches!(op.op, 'M' | 'I' | 'S' | '=' | 'X'))
-                .map(|op| u64::from(op.len))
-                .sum::<u64>();
-
-            if query_len != seq.len() as u64 {
-                return Err(invalid_data("SEQ length does not match CIGAR query length"));
-            }
-        }
-
-        if qual != "*" && seq == "*" {
-            return Err(invalid_data("QUAL is present while SEQ is unavailable"));
-        }
-
-        if qual != "*" && qual.len() != seq.len() {
-            return Err(invalid_data("QUAL length does not match SEQ length"));
-        }
-
-        let mut optional = Vec::new();
-        let mut seen_optional = HashSet::new();
-
-        for field in fields.iter().skip(11) {
-            let optional_field = SamOptionalField::parse(field)?;
-            if !seen_optional.insert(optional_field.tag.clone()) {
-                return Err(invalid_data("duplicate SAM optional field tag"));
-            }
-            optional.push(optional_field);
-        }
-
-        Ok(Self::new(
-            qname.to_string(),
-            flag,
-            rname.to_string(),
-            pos,
-            mapq,
-            cigar.to_string(),
-            rnext.to_string(),
-            pnext,
-            tlen,
-            seq.to_string(),
-            qual.to_string(),
-            optional,
-        ))
+                .map(|field| SamOptionalField::parse(field))
+                .collect::<io::Result<_>>()?,
+        );
+        record.validate()?;
+        Ok(record)
     }
 }
 
@@ -898,6 +934,23 @@ impl SamOptionalField {
     /// Creates a SAM optional field from parsed components.
     pub fn new(tag: String, value: SamOptionalValue) -> Self {
         Self { tag, value }
+    }
+
+    /// Checks the tag, and the characters of an `A` or `Z` value; other values
+    /// always format to text that parses back.
+    fn validate(&self) -> io::Result<()> {
+        if !is_optional_tag(&self.tag) {
+            return Err(invalid_data("invalid SAM optional field tag"));
+        }
+        match &self.value {
+            SamOptionalValue::Character(value) if !is_printable_ascii_char(*value) => {
+                Err(invalid_data("invalid A optional value"))
+            }
+            SamOptionalValue::String(value) if !is_printable_or_space_ascii(value) => {
+                Err(invalid_data("invalid Z optional value"))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn parse(field: &str) -> io::Result<Self> {
@@ -1005,7 +1058,8 @@ fn parse_cigar(cigar: &str) -> io::Result<Vec<SamCigarOp>> {
                     .ok_or_else(|| invalid_data("CIGAR operation length overflow"))?;
             }
             b'M' | b'I' | b'D' | b'N' | b'S' | b'H' | b'P' | b'=' | b'X' => {
-                if !saw_digit || len == 0 {
+                // Zero-length operations are allowed, as in SAMv1 and htslib.
+                if !saw_digit {
                     return Err(invalid_data("invalid CIGAR operation length"));
                 }
                 ops.push(SamCigarOp {
@@ -1062,7 +1116,14 @@ fn parse_optional_array(value: &str) -> io::Result<SamOptionalArray> {
         return Err(invalid_data("invalid B optional array type"));
     }
 
-    let parts = values.split(',').filter(|part| !part.is_empty());
+    // `i` alone is an empty array; otherwise every element must be present.
+    let parts = (!values.is_empty() || value.contains(','))
+        .then(|| values.split(','))
+        .into_iter()
+        .flatten();
+    if parts.clone().any(str::is_empty) {
+        return Err(invalid_data("B optional array has an empty element"));
+    }
 
     match array_type.as_bytes()[0] {
         b'c' => parts
@@ -1123,20 +1184,24 @@ fn parse_hex(value: &str) -> io::Result<Vec<u8>> {
         return Err(invalid_data("hex optional value has odd length"));
     }
 
-    let mut bytes = Vec::with_capacity(value.len() / 2);
-    for index in (0..value.len()).step_by(2) {
-        let byte = u8::from_str_radix(&value[index..index + 2], 16)
-            .map_err(|_| invalid_data("invalid hex optional value"))?;
-        bytes.push(byte);
-    }
+    // Decode byte pairs: slicing the string could split a character, and
+    // u8::from_str_radix would accept a '+' sign.
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Some(hex_digit(pair[0])? << 4 | hex_digit(pair[1])?))
+        .collect::<Option<Vec<u8>>>()
+        .ok_or_else(|| invalid_data("invalid hex optional value"))
+}
 
-    Ok(bytes)
+fn hex_digit(byte: u8) -> Option<u8> {
+    char::from(byte).to_digit(16).map(|digit| digit as u8)
 }
 
 fn format_sam_header_record(record: &SamHeaderRecord) -> io::Result<String> {
     if record.record_type == "CO" {
         let comment = record.comment.as_deref().unwrap_or_default();
-        if !is_printable_or_space_ascii(comment) {
+        if !is_comment(comment) {
             return Err(invalid_data("invalid @CO comment"));
         }
         return Ok(format!("@CO\t{comment}"));
@@ -1155,7 +1220,7 @@ fn format_sam_header_record(record: &SamHeaderRecord) -> io::Result<String> {
         if !is_header_tag(&field.tag) {
             return Err(invalid_data("invalid SAM header field tag"));
         }
-        if field.value.is_empty() || !is_printable_or_space_ascii(&field.value) {
+        if !is_header_value(&record.record_type, &field.tag, &field.value) {
             return Err(invalid_data("invalid SAM header field value"));
         }
         if !seen.insert(field.tag.as_str()) {
@@ -1170,91 +1235,80 @@ fn format_sam_header_record(record: &SamHeaderRecord) -> io::Result<String> {
     Ok(line)
 }
 
-fn format_sam_record(record: &SamRecord) -> io::Result<String> {
-    let mut fields = vec![
-        record.qname.clone(),
-        record.flag.to_string(),
-        record.rname.clone(),
-        record.pos.to_string(),
-        record.mapq.to_string(),
-        record.cigar.clone(),
-        record.rnext.clone(),
-        record.pnext.to_string(),
-        record.tlen.to_string(),
-        record.seq.clone(),
-        record.qual.clone(),
-    ];
+/// Appends `record` to `line` as one SAM line without a line ending.
+///
+/// Callers check the record with [`SamRecord::validate`] first.
+fn push_sam_record(line: &mut String, record: &SamRecord) {
+    use std::fmt::Write as _;
 
-    for optional in &record.optional {
-        fields.push(format_sam_optional_field(optional)?);
-    }
-
-    Ok(fields.join("\t"))
-}
-
-fn format_sam_optional_field(field: &SamOptionalField) -> io::Result<String> {
-    if !is_optional_tag(&field.tag) {
-        return Err(invalid_data("invalid SAM optional field tag"));
-    }
-
-    Ok(format!(
-        "{}:{}:{}",
-        field.tag,
-        field.value.value_type(),
-        format_sam_optional_value(&field.value)?
-    ))
-}
-
-fn format_sam_optional_value(value: &SamOptionalValue) -> io::Result<String> {
-    match value {
-        SamOptionalValue::Character(value) => {
-            if !is_printable_ascii_char(*value) {
-                return Err(invalid_data("invalid A optional value"));
+    // Formatting into a String cannot fail.
+    let _ = write!(
+        line,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        record.qname,
+        record.flag,
+        record.rname,
+        record.pos,
+        record.mapq,
+        record.cigar,
+        record.rnext,
+        record.pnext,
+        record.tlen,
+        record.seq,
+        record.qual,
+    );
+    for field in &record.optional {
+        let _ = write!(line, "\t{}:{}:", field.tag, field.value.value_type());
+        match &field.value {
+            SamOptionalValue::Character(value) => line.push(*value),
+            SamOptionalValue::Integer(value) => {
+                let _ = write!(line, "{value}");
             }
-            Ok(value.to_string())
-        }
-        SamOptionalValue::Integer(value) => Ok(value.to_string()),
-        SamOptionalValue::Float(value) => Ok(value.to_string()),
-        SamOptionalValue::String(value) => {
-            if !is_printable_or_space_ascii(value) {
-                return Err(invalid_data("invalid Z optional value"));
+            SamOptionalValue::Float(value) => {
+                let _ = write!(line, "{value}");
             }
-            Ok(value.clone())
+            SamOptionalValue::String(value) => line.push_str(value),
+            SamOptionalValue::Hex(value) => push_hex(line, value),
+            SamOptionalValue::Array(SamOptionalArray::Int8(values)) => {
+                push_array(line, 'c', values);
+            }
+            SamOptionalValue::Array(SamOptionalArray::UInt8(values)) => {
+                push_array(line, 'C', values);
+            }
+            SamOptionalValue::Array(SamOptionalArray::Int16(values)) => {
+                push_array(line, 's', values);
+            }
+            SamOptionalValue::Array(SamOptionalArray::UInt16(values)) => {
+                push_array(line, 'S', values);
+            }
+            SamOptionalValue::Array(SamOptionalArray::Int32(values)) => {
+                push_array(line, 'i', values);
+            }
+            SamOptionalValue::Array(SamOptionalArray::UInt32(values)) => {
+                push_array(line, 'I', values);
+            }
+            SamOptionalValue::Array(SamOptionalArray::Float(values)) => {
+                push_array(line, 'f', values);
+            }
         }
-        SamOptionalValue::Hex(value) => Ok(bytes_to_hex(value)),
-        SamOptionalValue::Array(value) => Ok(format_sam_optional_array(value)),
     }
 }
 
-fn format_sam_optional_array(value: &SamOptionalArray) -> String {
-    match value {
-        SamOptionalArray::Int8(values) => format_array_values('c', values),
-        SamOptionalArray::UInt8(values) => format_array_values('C', values),
-        SamOptionalArray::Int16(values) => format_array_values('s', values),
-        SamOptionalArray::UInt16(values) => format_array_values('S', values),
-        SamOptionalArray::Int32(values) => format_array_values('i', values),
-        SamOptionalArray::UInt32(values) => format_array_values('I', values),
-        SamOptionalArray::Float(values) => format_array_values('f', values),
-    }
-}
+fn push_array<T: fmt::Display>(line: &mut String, array_type: char, values: &[T]) {
+    use std::fmt::Write as _;
 
-fn format_array_values<T: ToString>(array_type: char, values: &[T]) -> String {
-    let mut output = array_type.to_string();
+    line.push(array_type);
     for value in values {
-        output.push(',');
-        output.push_str(&value.to_string());
+        let _ = write!(line, ",{value}");
     }
-    output
 }
 
-fn bytes_to_hex(bytes: &[u8]) -> String {
+fn push_hex(line: &mut String, bytes: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
+        line.push(HEX[(byte >> 4) as usize] as char);
+        line.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    output
 }
 
 fn parse_u8(value: &str, message: &'static str) -> io::Result<u8> {
@@ -1356,6 +1410,30 @@ fn is_printable_ascii_char(value: char) -> bool {
     value.is_ascii() && (33..=126).contains(&(value as u8))
 }
 
+/// Whether `comment` is allowed as `@CO` text: the rest of the line, tabs and
+/// UTF-8 included, but no line break or NUL (which samtools turns into one).
+fn is_comment(comment: &str) -> bool {
+    !comment.contains(['\r', '\n', '\0'])
+}
+
+/// Whether `value` is allowed for a header field.
+///
+/// SAMv1 allows UTF-8 in `@SQ DS`, `@RG DS`, `@PG CL` and `@PG DS`; other
+/// values are printable ASCII and spaces. No value may hold control
+/// characters, which include the tab that separates fields.
+fn is_header_value(record_type: &str, tag: &str, value: &str) -> bool {
+    let utf8 = matches!(
+        (record_type, tag),
+        ("SQ", "DS") | ("RG", "DS") | ("PG", "CL") | ("PG", "DS")
+    );
+    !value.is_empty()
+        && if utf8 {
+            !value.chars().any(char::is_control)
+        } else {
+            is_printable_or_space_ascii(value)
+        }
+}
+
 fn is_printable_or_space_ascii(value: &str) -> bool {
     value.bytes().all(|byte| (32..=126).contains(&byte))
 }
@@ -1384,6 +1462,358 @@ fn context_line(error: io::Error, line: usize) -> io::Error {
 #[cfg(test)]
 mod sam_tests {
     use super::*;
+
+    /// The line the writer built before `validate` existed: every field
+    /// formatted on its own and joined by tabs.
+    fn reference_line(record: &SamRecord) -> String {
+        fn array<T: ToString>(code: char, values: &[T]) -> String {
+            std::iter::once(code.to_string())
+                .chain(values.iter().map(ToString::to_string))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        let mut fields = vec![
+            record.qname.clone(),
+            record.flag.to_string(),
+            record.rname.clone(),
+            record.pos.to_string(),
+            record.mapq.to_string(),
+            record.cigar.clone(),
+            record.rnext.clone(),
+            record.pnext.to_string(),
+            record.tlen.to_string(),
+            record.seq.clone(),
+            record.qual.clone(),
+        ];
+        for field in &record.optional {
+            let value = match &field.value {
+                SamOptionalValue::Character(value) => value.to_string(),
+                SamOptionalValue::Integer(value) => value.to_string(),
+                SamOptionalValue::Float(value) => value.to_string(),
+                SamOptionalValue::String(value) => value.clone(),
+                SamOptionalValue::Hex(value) => value.iter().map(|b| format!("{b:02X}")).collect(),
+                SamOptionalValue::Array(SamOptionalArray::Int8(v)) => array('c', v),
+                SamOptionalValue::Array(SamOptionalArray::UInt8(v)) => array('C', v),
+                SamOptionalValue::Array(SamOptionalArray::Int16(v)) => array('s', v),
+                SamOptionalValue::Array(SamOptionalArray::UInt16(v)) => array('S', v),
+                SamOptionalValue::Array(SamOptionalArray::Int32(v)) => array('i', v),
+                SamOptionalValue::Array(SamOptionalArray::UInt32(v)) => array('I', v),
+                SamOptionalValue::Array(SamOptionalArray::Float(v)) => array('f', v),
+            };
+            fields.push(format!(
+                "{}:{}:{value}",
+                field.tag,
+                field.value.value_type()
+            ));
+        }
+        fields.join("\t")
+    }
+
+    /// The alignment-line parser as it was before `validate` existed, kept
+    /// so the test below compares against rules written independently of it.
+    fn old_parse(line: &str) -> io::Result<SamRecord> {
+        if line.is_empty() {
+            return Err(invalid_data("empty SAM alignment line"));
+        }
+
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 11 {
+            return Err(invalid_data("SAM alignment line has fewer than 11 fields"));
+        }
+
+        let qname = fields[0];
+        if !is_query_name(qname) {
+            return Err(invalid_data("invalid QNAME"));
+        }
+
+        let flag = parse_u16(fields[1], "invalid FLAG")?;
+        let rname = fields[2];
+        if rname != "*" && !is_reference_name(rname) {
+            return Err(invalid_data("invalid RNAME"));
+        }
+
+        let pos = parse_u32_max_i32(fields[3], "invalid POS")?;
+        let mapq = parse_u8(fields[4], "invalid MAPQ")?;
+        let cigar = fields[5];
+        let cigar_ops = parse_cigar(cigar)?;
+        let rnext = fields[6];
+        if !(rnext == "*" || rnext == "=" || is_reference_name(rnext)) {
+            return Err(invalid_data("invalid RNEXT"));
+        }
+
+        let pnext = parse_u32_max_i32(fields[7], "invalid PNEXT")?;
+        let tlen = parse_i32(fields[8], "invalid TLEN")?;
+        let seq = fields[9];
+        let qual = fields[10];
+
+        if !is_sequence(seq) {
+            return Err(invalid_data("invalid SEQ"));
+        }
+
+        if !is_quality(qual) {
+            return Err(invalid_data("invalid QUAL"));
+        }
+
+        if cigar != "*" && seq != "*" {
+            let query_len = cigar_ops
+                .iter()
+                .filter(|op| matches!(op.op, 'M' | 'I' | 'S' | '=' | 'X'))
+                .map(|op| u64::from(op.len))
+                .sum::<u64>();
+
+            if query_len != seq.len() as u64 {
+                return Err(invalid_data("SEQ length does not match CIGAR query length"));
+            }
+        }
+
+        if qual != "*" && seq == "*" {
+            return Err(invalid_data("QUAL is present while SEQ is unavailable"));
+        }
+
+        if qual != "*" && qual.len() != seq.len() {
+            return Err(invalid_data("QUAL length does not match SEQ length"));
+        }
+
+        let mut optional = Vec::new();
+        let mut seen_optional = HashSet::new();
+
+        for field in fields.iter().skip(11) {
+            let optional_field = SamOptionalField::parse(field)?;
+            if !seen_optional.insert(optional_field.tag.clone()) {
+                return Err(invalid_data("duplicate SAM optional field tag"));
+            }
+            optional.push(optional_field);
+        }
+
+        Ok(SamRecord::new(
+            qname.to_string(),
+            flag,
+            rname.to_string(),
+            pos,
+            mapq,
+            cigar.to_string(),
+            rnext.to_string(),
+            pnext,
+            tlen,
+            seq.to_string(),
+            qual.to_string(),
+            optional,
+        ))
+    }
+
+    /// Whether the writer used to accept `record`: its line kept one field
+    /// per record field, and the parser of the time took it.
+    fn reference_line_reads_back(record: &SamRecord) -> bool {
+        let line = reference_line(record);
+        line.split('\t').count() == 11 + record.optional.len() && old_parse(&line).is_ok()
+    }
+
+    type Mutation = Box<dyn Fn(&mut SamRecord)>;
+
+    fn record_mutations() -> Vec<Mutation> {
+        fn optional(tag: &str, value: SamOptionalValue) -> Mutation {
+            let field = SamOptionalField::new(tag.to_string(), value);
+            Box::new(move |record: &mut SamRecord| record.optional.push(field.clone()))
+        }
+        let mut mutations: Vec<Mutation> = Vec::new();
+        let long = "x".repeat(254);
+        let too_long = "x".repeat(255);
+        for value in [
+            "", "r", "*", "@r", "r\t1", "r 1", "r\n", "\u{e9}", "r1:2", &long, &too_long,
+        ] {
+            let value = value.to_string();
+            mutations.push(Box::new(move |record| record.qname = value.clone()));
+        }
+        for value in [
+            "*", "=", "", "chr\t1", "chr 1", "*1", "=1", "chr1", "chr,1", "{a}",
+        ] {
+            let value = value.to_string();
+            mutations.push(Box::new(move |record| record.rname = value.clone()));
+        }
+        for value in ["*", "=", "", "chr1", "=chr1", "chr\t1", "chr 1"] {
+            let value = value.to_string();
+            mutations.push(Box::new(move |record| record.rnext = value.clone()));
+        }
+        for value in [0, 1, i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
+            mutations.push(Box::new(move |record| record.pos = value));
+            mutations.push(Box::new(move |record| record.pnext = value));
+        }
+        for value in [0, 4, 0x900, u16::MAX] {
+            mutations.push(Box::new(move |record| record.flag = value));
+        }
+        for value in [i32::MIN, 0, i32::MAX] {
+            mutations.push(Box::new(move |record| record.tlen = value));
+        }
+        mutations.push(Box::new(|record| record.mapq = 255));
+        for value in [
+            "*",
+            "",
+            "4M",
+            "0M4M",
+            "2S2M",
+            "1M2S1M",
+            "1H4M1H",
+            "1M1H3M",
+            "4X",
+            "4",
+            "M",
+            "4M\t",
+            "4294967296M",
+            "4294967295M",
+            "2M2I",
+            "3M",
+            "2M2N",
+            "2=2X",
+            "4m",
+        ] {
+            let value = value.to_string();
+            mutations.push(Box::new(move |record| record.cigar = value.clone()));
+        }
+        for value in [
+            "*",
+            "",
+            "ACGT",
+            "acgt",
+            "AC T",
+            "AC\tG",
+            "ACG=",
+            "ACG.",
+            "ACGU",
+            "NNNN",
+            "ACG\u{e9}",
+            "ACGTA",
+            "AC*T",
+        ] {
+            let value = value.to_string();
+            mutations.push(Box::new(move |record| record.seq = value.clone()));
+        }
+        for value in [
+            "*",
+            "",
+            "IIII",
+            "II I",
+            "!!!!",
+            "~~~~",
+            "\x7f\x7f\x7f\x7f",
+            "III",
+            "IIIII",
+            "II\tI",
+        ] {
+            let value = value.to_string();
+            mutations.push(Box::new(move |record| record.qual = value.clone()));
+        }
+        for value in [' ', '\t', '\u{e9}', '~', '!', ':'] {
+            mutations.push(optional("XA", SamOptionalValue::Character(value)));
+        }
+        for value in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -0.0,
+            1e-45,
+            f32::MAX,
+        ] {
+            mutations.push(optional("XF", SamOptionalValue::Float(value)));
+            mutations.push(optional(
+                "XG",
+                SamOptionalValue::Array(SamOptionalArray::Float(vec![value, 1.5])),
+            ));
+        }
+        for value in ["", "a\tb", "\u{e9}", " lead ", "a\nb", "a:b:c", "~"] {
+            mutations.push(optional("XZ", SamOptionalValue::String(value.to_string())));
+        }
+        mutations.push(optional("XI", SamOptionalValue::Integer(i64::MIN)));
+        mutations.push(optional("XH", SamOptionalValue::Hex(vec![])));
+        mutations.push(optional("XH", SamOptionalValue::Hex(vec![0, 255])));
+        mutations.push(optional(
+            "XB",
+            SamOptionalValue::Array(SamOptionalArray::Int8(vec![])),
+        ));
+        mutations.push(optional(
+            "XB",
+            SamOptionalValue::Array(SamOptionalArray::UInt32(vec![u32::MAX])),
+        ));
+        for tag in ["", "1A", "A", "ABC", "A:", "aZ", "NM", "X\t", "Z9"] {
+            mutations.push(optional(tag, SamOptionalValue::Integer(1)));
+        }
+        mutations.push(Box::new(|record| record.optional.clear()));
+        // More than 16 tags are checked for repeats with a hash set.
+        mutations.push(Box::new(|record| {
+            for number in 0..20 {
+                record.optional.push(SamOptionalField::new(
+                    format!("Y{}", char::from(b'A' + number)),
+                    SamOptionalValue::Integer(i64::from(number)),
+                ));
+            }
+        }));
+        mutations.push(Box::new(|record| {
+            let first = record.optional.first().cloned();
+            record.optional.extend(first);
+        }));
+        mutations
+    }
+
+    fn mutable_record() -> SamRecord {
+        let optional = |tag: &str, value| SamOptionalField::new(tag.to_string(), value);
+        SamRecord::new(
+            "r1".to_string(),
+            0,
+            "chr1".to_string(),
+            10,
+            60,
+            "2S2M".to_string(),
+            "=".to_string(),
+            20,
+            30,
+            "ACGT".to_string(),
+            "IIII".to_string(),
+            vec![
+                optional("NM", SamOptionalValue::Integer(1)),
+                optional("XS", SamOptionalValue::Float(1.5)),
+                optional("RG", SamOptionalValue::String("rg1".to_string())),
+                optional("tp", SamOptionalValue::Character('P')),
+                optional("ZH", SamOptionalValue::Hex(vec![0xab])),
+                optional(
+                    "ML",
+                    SamOptionalValue::Array(SamOptionalArray::UInt8(vec![1, 2])),
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn validate_accepts_exactly_the_records_whose_line_reads_back() {
+        let mutations = record_mutations();
+        let mut state = 0x853c_49e6_748f_ea9b_u64;
+        let mut random = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let mut cases = (0..mutations.len())
+            .map(|index| vec![index])
+            .collect::<Vec<_>>();
+        for _ in 0..20_000 {
+            let count = 2 + random(3);
+            cases.push((0..count).map(|_| random(mutations.len())).collect());
+        }
+
+        let mut accepted = 0;
+        for case in cases {
+            let mut record = mutable_record();
+            for &index in &case {
+                mutations[index](&mut record);
+            }
+            let expected = reference_line_reads_back(&record);
+            assert_eq!(record.validate().is_ok(), expected, "{case:?} {record:?}");
+            if expected {
+                accepted += 1;
+                assert_eq!(record.to_sam_line().unwrap(), reference_line(&record));
+            }
+        }
+        assert!(accepted > 1_000, "{accepted}");
+    }
 
     const ALIGNED_SAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/aligned.sam");
     const UNALIGNED_SAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/unaligned.sam");

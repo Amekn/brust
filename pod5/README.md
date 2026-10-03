@@ -20,10 +20,19 @@ use brust_pod5::Pod5;
 ## API
 
 - `Pod5Reader`: streams POD5 read rows and can load referenced signal rows.
-- `Pod5Writer`: writes materialized POD5 payloads.
+  Each signal row is read from the Arrow batch that holds it, so reads can be
+  asked for in any order without reading the batches before them.
+- `Pod5Writer`: writes materialized POD5 payloads. The payload is checked
+  before anything is written (sample counts, signal-row ownership, version and
+  file identifier formats, end reasons). The Signal table is then streamed to
+  the output in batches of 100 rows, as official POD5 writers do, so writing
+  needs little memory beyond the payload. Files that declare POD5 version
+  0.3.30 or later (the default is 0.3.34) include the `open_pore_level` column
+  that official pod5 and dorado require.
 - `Pod5`: materialized container with reads, signals, run metadata, summaries,
   and signal lookup helpers.
 - `Pod5Record`: one read row plus metadata and signal-row references.
+- `Pod5RunInfo`: one Run Info row with all 20 columns.
 - `Pod5Signal`: signal row with VBZ compression helpers.
 - `Pod5SignalCache`: caches decompressed signal rows for repeated lookup.
 - `Pod5Summary`, `Pod5ChannelSummary`, and `Pod5RunInfoSummary`: metadata

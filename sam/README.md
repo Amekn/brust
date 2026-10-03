@@ -20,9 +20,13 @@ use brust_sam::SamReader;
 
 - `SamReader`: validates the header, then streams alignment records.
 - `SamWriter`: writes headers and records, validating output before emission.
+  `SamWriter::from_path` buffers its output; call `finish` to write the rest
+  and see any error.
 - `Sam`: materialized SAM payload with header and records.
 - `SamHeader`, `SamHeaderRecord`, `SamHeaderField`: parsed header data.
 - `SamRecord`: mandatory fields plus parsed optional fields.
+  `SamRecord::validate` checks a record against the rules the reader applies,
+  so it can be written and read back unchanged.
   `SamRecord::original_seq` and `SamRecord::original_qual` return SEQ and QUAL
   in the original sequencing orientation: reverse-complemented and reversed for
   reverse-strand records (flag `0x10`), unchanged otherwise.
